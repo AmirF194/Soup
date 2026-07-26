@@ -49,25 +49,27 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.71.41 — `soup reward stress`: is your reward verifier gameable?** Turn the reward-hacking
-detector on the verifier *itself*. `soup reward synth` (v0.71.40) proves a verifier can tell your
-references from friendly bad answers; `stress` asks the adversarial question a reward-hacking model
-asks at train time — *does it pay out for degenerate junk?* Nothing in TRL / Unsloth / Axolotl tests
-a verifier for gameability.
+**v0.72.0 — Layer streaming (BETA).** Fine-tune models that don't fit in your card. The frozen
+base streams from CPU RAM one decoder layer at a time into a small pool of VRAM buffers while the
+LoRA adapters stay resident, so peak VRAM is bounded by one layer rather than the whole model.
+**Qwen2.5-3B trains in 2.15 GB on a 4 GB card, where a resident run OOMs.**
 
-- **Four attacks, scored against the real gold.** Empty, length-padded, repetition, and
-  sentinel-spam completions are fed to the verifier; any it **accepts** is a false positive. A
-  per-attack accept-rate table plus one **robust / GAMEABLE** verdict — exit 0 / 2 (1 on error).
-- **Probes a synth `.py` or a builtin.** `soup reward stress reward.py --references golds.jsonl`,
-  or `soup reward stress verifiable --verifiable-domain math --references golds.jsonl`. A
-  gold-requiring verifier probed with no `--references` is a hard error, never a false "robust".
-- **Tune the strictness.** `--attacks`, `--sentinel`, `--threshold`, `--max-gameable`,
-  `--output-report`. Pure, offline, no new deps.
+- **`training.stream_layers: true`** — a config key, not a CLI flag. Tune with
+  `stream_source` (`ram` in v0.72.0; `disk` is v0.72.2) and `stream_buffers` (2–8, default 2).
+- **Measured on a 4 GB RTX 3050 Laptop** (batch 1, gradient checkpointing on): 0.5B at
+  978.6 tok/s / 1.47 GB, 1.5B at 525.0 tok/s / 1.82 GB, 3B at 143.1 tok/s / 2.15 GB.
+- **Honest cost: 1.43× slower than resident**, measured at 0.5B — the only apples-to-apples
+  comparison available on that box, because 1.5B and above cannot run resident there at all.
+- **Proof-of-mechanism at 3B.** Nothing above 3B was measured; no 8B/14B claim is supported.
+  Scope: RAM tier, bf16, `task: sft`, Llama/Qwen, batch size 1, no gradient accumulation, no
+  `--resume`. 4-bit (NF4) streaming is **v0.72.1** and is refused with a clear message today.
 
-```bash
-# probe a verifier you synthesized (or a builtin) for gameability
-soup reward stress reward.py --references golds.jsonl --output-report stress.json
-#   exit 0 = robust · 2 = gameable · 1 = error
+```yaml
+# soup.yaml — then just `soup train --config soup.yaml`
+training:
+  stream_layers: true      # base streams from RAM; only the adapter trains
+  batch_size: 1
+  quantization: none       # NF4 streaming lands in v0.72.1
 ```
 
 <details>

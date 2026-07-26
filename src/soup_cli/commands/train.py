@@ -94,6 +94,14 @@ def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
     statically predictable, so CI and small runs are unaffected. Honors the
     documented ``--allow-oom-attempt`` opt-out.
     """
+    # v0.72.0 — layer streaming bounds peak VRAM by ONE decoder layer, so the
+    # resident prediction (full weights + optimizer + grads on the card) is the
+    # wrong model entirely: it refuses exactly the runs streaming exists to
+    # enable. The streaming path runs its own pre-flight instead (RAM-tier fit
+    # + the plan panel in _setup_streaming_transformers).
+    if getattr(cfg.training, "stream_layers", False):
+        return
+
     total_bytes = 0
     try:
         total_bytes = int(gpu_info.get("memory_total_bytes", 0) or 0)
@@ -521,6 +529,17 @@ def train(
     except Exception as exc:  # noqa: BLE001 — pydantic ValidationError et al.
         console.print(f"[red]{markup_escape(str(exc))}[/]")
         raise typer.Exit(code=2) from exc
+
+    # --- v0.72.0 BETA — layer streaming does not support resume yet ---
+    # Silently ignoring --resume would restart from scratch and look like it
+    # worked, so refuse before any heavy work happens.
+    if resume and cfg.training.stream_layers:
+        console.print(
+            "[red]--resume is not supported with training.stream_layers in "
+            "v0.72.0[/] — checkpoint/resume for layer streaming lands in "
+            "v0.72.2. Drop --resume, or set stream_layers: false."
+        )
+        raise typer.Exit(code=2)
 
     # --- RA-DIT generator-stage auto-link (v0.71.10 #200) ---
     # When a generator stage has no retriever model set, splice in the latest

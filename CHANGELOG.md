@@ -12,6 +12,73 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-07-26
+
+**Layer streaming (BETA) — fine-tune models that don't fit in your card.** The
+frozen base lives in CPU RAM and is streamed into two pre-allocated VRAM buffers
+one decoder layer at a time, so peak VRAM is bounded by the size of *one layer*
+instead of the whole model. Only the LoRA adapters, their gradients and
+optimizer state stay resident. Slower than resident training — but these models
+did not run on the card at all.
+
+Measured on the development box (**RTX 3050 Laptop 4 GB**, Windows 11, 16.9 GB
+RAM), batch 1, gradient checkpointing on, 50 steps after 10 warm-up:
+
+| Model | S | tok/s | GPU util | Peak VRAM |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 512 | 978.6 | 91.4% | 1.47 GB |
+| Qwen2.5-1.5B | 512 | 525.0 | 96.8% | 1.82 GB |
+| Qwen2.5-1.5B | 1024 | 487.6 | 96.7% | 2.96 GB |
+| Qwen2.5-3B | 512 | 143.1 | 79.3% | **2.15 GB** |
+
+**Qwen2.5-3B trains in 2.15 GB on a 4 GB card where a resident run OOMs.** The
+honest cost: **1.43× slower than resident**, measured at 0.5B — the only
+apples-to-apples comparison available on this box, because 1.5B and above cannot
+run resident here at all.
+
+### Added
+
+- **`training.stream_layers: true`** — stream the frozen base layer-by-layer
+  from CPU RAM. `training.stream_source` (`auto`/`ram`/`disk`) and
+  `training.stream_buffers` (2–8, default 2 = double buffering) tune it.
+- `soup_cli/utils/layer_stream.py` — tier choice, pinned-vs-pageable decision,
+  architecture allowlist, VRAM/throughput arithmetic (no torch import).
+- `soup_cli/utils/layer_shard.py` — rewrites an HF checkpoint into one
+  safetensors shard per decoder layer, one tensor at a time, so sharding a model
+  that does not fit never needs it to fit.
+- `soup_cli/utils/layer_stream_runtime.py` — buffer pool, CPU-RAM weight source,
+  prefetch scheduler on a dedicated CUDA stream, and the streamed layer wrapper.
+- Shards are cached under `~/.soup/layer-stream/` (override with
+  `SOUP_LAYER_STREAM_CACHE_DIR`) and keyed to the source checkpoint's
+  fingerprint, so a base retrained in place re-shards instead of silently
+  training against stale weights.
+- When the base cannot be page-locked, the RAM store falls back to pageable
+  memory **and says so**, including the measured cost (GPU utilisation
+  ~97% → ~79%).
+
+### Changed
+
+- The pre-flight hardware-fit gate is skipped for streaming runs: it models a
+  resident run and would otherwise refuse exactly the runs streaming enables.
+- Gradient checkpointing is handled per-layer by the streamer; the HF Trainer's
+  own is left off so layers are not recomputed twice.
+
+### Known limitations
+
+- **BETA, and proof-of-mechanism at 3B.** Nothing above 3B was measured. No
+  8B/14B claim is supported.
+- Scope: RAM tier, bf16, `task: sft`, Llama/Qwen, batch size 1, no gradient
+  accumulation, no `--resume`. Every refusal names the release that lifts it.
+- 4-bit (NF4) streaming is **v0.72.1** — NF4 weights carry a quantisation state
+  and cannot be byte-copied into a plain buffer.
+- The disk overflow tier, larger batches, gradient accumulation and
+  checkpoint/resume are **v0.72.2**.
+- The 3B number used a **pageable** store (this box cannot page-lock 5.55 GB),
+  so it is a lower bound.
+- `expandable_segments:True` is silently ignored on Windows; Soup detects this
+  and does not claim it is active.
+- Numbers are Windows/WDDM and therefore systematically pessimistic vs Linux.
+
 ## [0.71.41] - 2026-07-19
 
 **`soup reward stress`: is your reward verifier gameable?** Turn the reward-hacking

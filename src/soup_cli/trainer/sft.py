@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -200,10 +201,18 @@ class SFTTrainerWrapper:
 
         use_audio = cfg.modality == "audio"
 
+        # v0.72.0 BETA — layer streaming replaces the model-load path entirely
+        # (meta skeleton, never a resident load), so it dispatches ahead of the
+        # backend branches. The schema already rejects streaming + unsloth/mlx
+        # and streaming + vision/audio.
+        use_streaming = bool(getattr(tcfg, "stream_layers", False))
+
         if use_vision:
             self._setup_vision_transformers(cfg, tcfg)
         elif use_audio:
             self._setup_audio_transformers(cfg, tcfg)
+        elif use_streaming:
+            self._setup_streaming_transformers(cfg, tcfg)
         elif use_unsloth:
             self._setup_unsloth(cfg, tcfg)
         else:
@@ -385,7 +394,19 @@ class SFTTrainerWrapper:
             console.print("[green]torch.compile enabled on FSDP2[/]")
 
         # Gradient checkpointing — tiered (v0.28.0): bool or tier string.
-        if tcfg.gradient_checkpointing:
+        # v0.72.0: layer streaming checkpoints every layer itself, so enabling
+        # HF's too would double-recompute silently (see layer_stream).
+        from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
+
+        hf_grad_ckpt = should_enable_hf_gradient_checkpointing(
+            tcfg.gradient_checkpointing, stream_layers=tcfg.stream_layers
+        )
+        if tcfg.gradient_checkpointing and not hf_grad_ckpt:
+            console.print(
+                "[dim]Gradient checkpointing: handled per-layer by layer "
+                "streaming (HF's own is left off to avoid double recompute)[/]"
+            )
+        if hf_grad_ckpt:
             from soup_cli.utils.gpu import get_gpu_info
             from soup_cli.utils.gradient_ckpt import (
                 describe_tier,
@@ -935,6 +956,162 @@ class SFTTrainerWrapper:
             apply_router_only_freeze_if_configured(self.model, tcfg, console)
 
         self._apply_quantization_aware(tcfg)
+
+    def _setup_streaming_transformers(self, cfg, tcfg):
+        """v0.72.0 BETA — layer streaming. The resident base load NEVER happens.
+
+        Builds the skeleton on ``meta`` (``accelerate.init_empty_weights``),
+        materialises only embeddings / final norm / LoRA, and streams each
+        decoder layer from CPU RAM into a small pool of pre-allocated VRAM
+        buffers. Peak VRAM becomes the size of ONE layer instead of the model.
+        """
+        from peft import LoraConfig, TaskType
+        from transformers import AutoConfig, AutoTokenizer
+
+        from soup_cli.utils.layer_shard import (
+            resolve_shard_dir,
+            shard_checkpoint,
+            source_weight_bytes,
+        )
+        from soup_cli.utils.layer_stream import (
+            RAM_TIER_HEADROOM,
+            TIER_RAM,
+            build_stream_plan,
+            dtype_bytes,
+            free_ram_bytes,
+            render_stream_panel,
+            stream_arch_of,
+        )
+        from soup_cli.utils.layer_stream_runtime import (
+            RamSource,
+            build_streamed_model,
+            probe_expandable_segments,
+        )
+        from soup_cli.utils.spectrum_scan import resolve_model_weights
+
+        console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.base, trust_remote_code=self._trust_remote_code
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        model_config = AutoConfig.from_pretrained(
+            cfg.base, trust_remote_code=self._trust_remote_code
+        )
+        # Allowlist, not a heuristic — a half-supported architecture streams
+        # weights into the wrong module and mis-trains silently.
+        arch = stream_arch_of(model_config)
+
+        on_cuda = str(self.device).startswith("cuda")
+        dtype = "bfloat16" if on_cuda else "float32"
+
+        weights_dir = resolve_model_weights(cfg.base)
+        shard_dir = resolve_shard_dir(cfg.base)
+
+        # Cheap size probe BEFORE sharding: re-writing a checkpoint we are
+        # about to refuse for not fitting in RAM costs minutes of disk I/O.
+        early_free_ram = free_ram_bytes()
+        if early_free_ram is not None:
+            source_bytes = source_weight_bytes(weights_dir)
+            if source_bytes >= early_free_ram * RAM_TIER_HEADROOM:
+                raise ValueError(
+                    f"layer streaming needs the base to fit in RAM: {cfg.base} is "
+                    f"{source_bytes / 1e9:.1f} GB on disk and only "
+                    f"{early_free_ram / 1e9:.1f} GB of RAM is free. The disk "
+                    f"overflow tier lands in v0.72.2 — free RAM or pick a "
+                    f"smaller base."
+                )
+
+        console.print(f"[dim]Preparing layer shards -> {shard_dir}[/]")
+        index = shard_checkpoint(weights_dir, shard_dir, dtype=dtype, arch=arch)
+
+        spec = RamSource.spec_from_shard(shard_dir, index)
+        bytes_per = dtype_bytes(dtype)
+        layer_params = sum(
+            math.prod(shape) for shape, _dtype in spec.values()
+        )
+        layer_bytes = layer_params * bytes_per
+        embed_bytes = max(
+            0, (index.total_params - layer_params * index.n_layers) * bytes_per
+        )
+
+        free_ram = free_ram_bytes()
+        if free_ram is None:
+            console.print(
+                "[yellow]psutil unavailable — cannot size the RAM tier; "
+                "proceeding and letting the allocation fail loudly if it must[/]"
+            )
+            free_ram = (layer_bytes * index.n_layers + embed_bytes) * 10
+
+        plan = build_stream_plan(
+            arch=arch,
+            n_layers=index.n_layers,
+            layer_bytes=layer_bytes,
+            embed_bytes=embed_bytes,
+            available_ram_bytes=free_ram,
+            # The page-locked ceiling is a property of the box, not of free RAM;
+            # rather than probe it destructively we attempt the pinned store and
+            # fall back loudly (see layer_stream_runtime._build_source).
+            pinned_limit_bytes=None,
+            buffers=tcfg.stream_buffers,
+            disk_kind="nvme",
+        )
+        if plan.tier != TIER_RAM:
+            raise ValueError(
+                f"layer streaming needs the base to fit in RAM: it is "
+                f"{(layer_bytes * index.n_layers + embed_bytes) / 1e9:.1f} GB and only "
+                f"{free_ram / 1e9:.1f} GB is free. The disk overflow tier lands "
+                f"in v0.72.2 — free RAM or pick a smaller base."
+            )
+        console.print(render_stream_panel(plan))
+        console.print(
+            "[yellow]Layer streaming is BETA:[/] slower than resident training, "
+            "but this model may not run resident on this card at all."
+        )
+        if on_cuda and not probe_expandable_segments():
+            console.print(
+                "[dim]expandable_segments allocator hint is unavailable on this "
+                "platform (silently ignored on Windows) — not enabled[/]"
+            )
+
+        target_modules = tcfg.lora.target_modules
+        if target_modules == "auto":
+            target_modules = None
+        lora_config = LoraConfig(
+            r=tcfg.lora.r,
+            lora_alpha=tcfg.lora.alpha,
+            lora_dropout=tcfg.lora.dropout,
+            target_modules=target_modules,
+            task_type=TaskType.CAUSAL_LM,
+            bias="none",
+            use_dora=tcfg.lora.use_dora,
+            use_rslora=tcfg.lora.use_rslora,
+        )
+
+        model, runtime = build_streamed_model(
+            model_id=cfg.base,
+            shard_dir=shard_dir,
+            index=index,
+            lora_config=lora_config,
+            device=self.device,
+            dtype=dtype,
+            buffers=tcfg.stream_buffers,
+            pin=plan.pinned and on_cuda,
+            seed=tcfg.seed if getattr(tcfg, "seed", None) is not None else 0,
+            trust_remote_code=self._trust_remote_code,
+            console=console,
+        )
+        self.model = model
+        self._stream_runtime = runtime
+        stats = runtime.stats()
+        console.print(
+            f"[green]Layer streaming ready:[/] {stats['n_layers']} layers, "
+            f"{stats['store_bytes'] / 1e9:.2f} GB "
+            f"{'pinned' if stats['pinned'] else 'pageable'} RAM store, "
+            f"{stats['buffers']} x {stats['buffer_bytes'] / stats['buffers'] / 1e6:.0f} MB "
+            f"VRAM buffers"
+        )
 
     def _apply_quantization_aware(self, tcfg) -> None:
         """Apply quantization-aware training post-LoRA (shared text/vision).

@@ -5,6 +5,14 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# Buffer bounds live with the streaming planner so the schema bound and the
+# runtime validator's message can never disagree (layer_stream has no torch).
+from soup_cli.utils.layer_stream import (
+    DEFAULT_STREAM_BUFFERS,
+    MAX_STREAM_BUFFERS,
+    MIN_STREAM_BUFFERS,
+)
+
 # v0.39.0 Part C — per-pattern LoRA rank/alpha bounds
 _MAX_LORA_RANK_PATTERN_KEYS = 256
 _MAX_LORA_RANK_PATTERN_VALUE = 1024
@@ -2903,6 +2911,48 @@ class TrainingConfig(BaseModel):
             raise ValueError("LISA integer fields must be int, not bool")
         return v
 
+    # v0.72.0 BETA — Layer streaming. The frozen base lives in CPU RAM and is
+    # streamed into a small pool of pre-allocated VRAM buffers one decoder
+    # layer at a time, so peak VRAM is bounded by ONE layer instead of the
+    # whole model. Only the LoRA adapters, their grads and optimizer state stay
+    # resident. See soup_cli.utils.layer_stream.
+    stream_layers: bool = Field(
+        default=False,
+        description=(
+            "BETA — stream the frozen base layer-by-layer from CPU RAM so a "
+            "model larger than VRAM can be fine-tuned. sft + transformers + "
+            "text + quantization=none only; batch_size 1, no gradient "
+            "accumulation. Slower than resident training, but these models did "
+            "not run on the card at all."
+        ),
+    )
+    stream_source: Literal["auto", "ram", "disk"] = Field(
+        default="auto",
+        description=(
+            "Where the streamed base lives. 'ram' (the only tier implemented in "
+            "v0.72.0) pins the base in CPU RAM; 'disk' is the v0.72.2 overflow "
+            "tier; 'auto' picks per free RAM."
+        ),
+    )
+    stream_buffers: int = Field(
+        default=DEFAULT_STREAM_BUFFERS,
+        ge=MIN_STREAM_BUFFERS,
+        le=MAX_STREAM_BUFFERS,
+        description=(
+            "Pre-allocated VRAM layer buffers. 2 = double buffering, which is "
+            "what lets the next layer load while the current one computes. A "
+            "single buffer cannot overlap load with compute."
+        ),
+    )
+
+    @field_validator("stream_buffers", mode="before")
+    @classmethod
+    def _validate_stream_buffers_int(cls, v: Any) -> Any:
+        """v0.72.0 — reject bool-as-int (bool subclasses int)."""
+        if isinstance(v, bool):
+            raise ValueError("training.stream_buffers must be an int, not bool")
+        return v
+
     # Sample packing — pack multiple short samples into one sequence
     packing: bool = Field(
         default=False,
@@ -4585,6 +4635,123 @@ class SoupConfig(BaseModel):
                 f"training.lisa_enabled (LISA full fine-tuning, LoRA off) is "
                 f"mutually exclusive with LoRA features: "
                 f"{', '.join(lora_conflicts)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_stream_layers_compat(self) -> "SoupConfig":
+        """v0.72.0 BETA — layer-streaming compatibility gates.
+
+        Scope is deliberately narrow for the first cut: RAM tier, bf16, sft,
+        Llama/Qwen, batch 1, no gradient accumulation. Every refusal names the
+        release that lifts it, so a rejected config tells the user what to wait
+        for rather than just saying no.
+        """
+        tcfg = self.training
+        if not tcfg.stream_layers:
+            # Footgun: a non-default stream_* while streaming is off almost
+            # certainly means the user forgot stream_layers=true.
+            if tcfg.stream_source != "auto" or tcfg.stream_buffers != 2:
+                raise ValueError(
+                    "training.stream_source / training.stream_buffers set but "
+                    "stream_layers is false — set stream_layers=true to stream "
+                    "the base layer-by-layer."
+                )
+            return self
+        if self.task != "sft":
+            raise ValueError(
+                f"training.stream_layers requires task='sft' in v0.72.0; got "
+                f"task={self.task!r}. Preference losses (DPO/ORPO/SimPO/KTO) "
+                f"land in v0.72.3."
+            )
+        if self.backend != "transformers":
+            raise ValueError(
+                f"training.stream_layers requires backend='transformers'; got "
+                f"backend={self.backend!r}. Streaming replaces the model load "
+                f"path, which unsloth and mlx own themselves."
+            )
+        if self.modality != "text":
+            raise ValueError(
+                f"training.stream_layers requires modality='text'; got "
+                f"modality={self.modality!r}."
+            )
+        if tcfg.quantization != "none":
+            raise ValueError(
+                f"training.stream_layers requires quantization='none' in "
+                f"v0.72.0 (got {tcfg.quantization!r}). NF4 weights carry a "
+                f"quant_state and cannot be byte-copied into a plain buffer; "
+                f"NF4 streaming lands in v0.72.1."
+            )
+        if tcfg.stream_source == "disk":
+            raise ValueError(
+                "training.stream_source='disk' is not implemented in v0.72.0 — "
+                "the disk overflow tier lands in v0.72.2. Use 'ram' or 'auto'."
+            )
+        if tcfg.batch_size != 1:
+            raise ValueError(
+                f"training.stream_layers requires batch_size=1 in v0.72.0 (got "
+                f"{tcfg.batch_size!r}); larger batches land in v0.72.2."
+            )
+        if tcfg.gradient_accumulation_steps != 1:
+            raise ValueError(
+                f"training.stream_layers requires gradient_accumulation_steps=1 "
+                f"(got {tcfg.gradient_accumulation_steps}); every micro-batch "
+                f"re-reads the entire base, so accumulation multiplies streaming "
+                f"IO linearly. Accumulation lands in v0.72.2."
+            )
+        if tcfg.lora.r < 1:
+            raise ValueError(
+                "training.stream_layers requires LoRA (training.lora.r >= 1) — "
+                "the streamed base is frozen, so with no adapter there is "
+                "nothing trainable and the run is a no-op."
+            )
+        # LoRA variants that READ the real base weight during
+        # get_peft_model() cannot work against a meta skeleton: DoRA computes a
+        # weight norm, PiSSA/OLoRA take an SVD of it, VeRA shares projections
+        # sized from it. Refuse by name rather than let torch raise an opaque
+        # "Fan in and fan out can not be computed" from the meta tensor.
+        if tcfg.lora.use_dora:
+            raise ValueError(
+                "training.stream_layers is incompatible with lora.use_dora: "
+                "DoRA initialises from the base weight's norm, but the "
+                "streamed base is on the meta device at adapter-build time. "
+                "Use plain LoRA (lora.use_rslora is fine)."
+            )
+        if tcfg.lora.use_vera:
+            raise ValueError(
+                "training.stream_layers is incompatible with lora.use_vera: "
+                "VeRA's shared projections are built from the materialised "
+                "base weights, which streaming keeps on the meta device."
+            )
+        if getattr(tcfg.lora, "init_strategy", "random") != "random":
+            raise ValueError(
+                f"training.stream_layers requires lora.init_strategy='random' "
+                f"(got {tcfg.lora.init_strategy!r}): PiSSA/OLoRA/LoftQ "
+                f"initialise the adapter from an SVD of the base weight, which "
+                f"is on the meta device under streaming."
+            )
+        conflicts = []
+        if tcfg.unfrozen_parameters:
+            conflicts.append("unfrozen_parameters")
+        if tcfg.lisa_enabled:
+            conflicts.append("lisa_enabled")
+        if tcfg.packing:
+            conflicts.append("packing")
+        if tcfg.multipack:
+            conflicts.append("multipack")
+        if tcfg.use_fsdp2_compile:
+            conflicts.append("use_fsdp2_compile")
+        if tcfg.train_router_only:
+            conflicts.append("train_router_only")
+        if tcfg.expand_layers is not None:
+            conflicts.append("expand_layers")
+        if conflicts:
+            raise ValueError(
+                f"training.stream_layers is mutually exclusive with "
+                f"{', '.join(conflicts)}: streaming owns the model-construction "
+                f"path (meta skeleton + per-layer weight substitution) and "
+                f"cannot share it with a feature that rewrites or re-freezes "
+                f"the same layers."
             )
         return self
 

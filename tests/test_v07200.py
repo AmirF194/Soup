@@ -637,13 +637,21 @@ class TestShardCacheDir:
         got = os.path.realpath(resolve_shard_dir("m"))
         assert got.startswith(os.path.realpath(default_layer_stream_cache_dir()))
 
-    def test_control_chars_in_override_rejected(self, monkeypatch):
+    def test_control_chars_in_override_rejected(self, tmp_path, monkeypatch):
+        """ESC, not NUL: a NUL byte cannot live in an environment variable at
+        all (POSIX putenv and CPython >= 3.11 both reject it outright), so a
+        NUL-based test only ever passed on one platform/interpreter pair.
+
+        The override here is otherwise VALID — a real path under $TMPDIR — so
+        the control character is the ONLY reason it can be refused. Drop the
+        `ord(ch) < 0x20` guard and this test goes red.
+        """
         from soup_cli.utils.layer_shard import (
             default_layer_stream_cache_dir,
             resolve_shard_dir,
         )
 
-        monkeypatch.setenv("SOUP_LAYER_STREAM_CACHE_DIR", "/tmp/a\x00b")
+        monkeypatch.setenv("SOUP_LAYER_STREAM_CACHE_DIR", str(tmp_path / "cache") + "\x1b")
         got = os.path.realpath(resolve_shard_dir("m"))
         assert got.startswith(os.path.realpath(default_layer_stream_cache_dir()))
 
@@ -874,6 +882,26 @@ def _cuda_available():
         import torch
 
         return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _mps_is_the_accelerator():
+    """True on an Apple-Silicon runner with no CUDA.
+
+    transformers picks `mps` as its default device there, while this suite
+    builds the streamed model on `cpu` — the two then disagree and any real
+    training step raises "found at least two devices". v0.72.0 measured CUDA
+    and CPU only; MPS is untested, so the step test is skipped rather than
+    making an unverified claim about it.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return False
+        backend = getattr(torch.backends, "mps", None)
+        return bool(backend is not None and backend.is_available())
     except Exception:
         return False
 
@@ -1932,6 +1960,10 @@ class TestStreamingEndToEndSetup:
         wrapper.setup(dataset)
         assert wrapper.trainer.args.gradient_checkpointing is False
 
+    @pytest.mark.skipif(
+        _mps_is_the_accelerator(),
+        reason="MPS is untested in v0.72.0 (measured on CUDA + CPU only)",
+    )
     def test_one_training_step_actually_runs(self, tmp_path, monkeypatch):
         """Forward + backward + optimizer step through the streamed layers."""
         wrapper, dataset = self._wrapper(tmp_path, monkeypatch)

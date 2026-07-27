@@ -2930,7 +2930,7 @@ class TrainingConfig(BaseModel):
         default="auto",
         description=(
             "Where the streamed base lives. 'ram' (the only tier implemented in "
-            "v0.72.0) pins the base in CPU RAM; 'disk' is the v0.72.2 overflow "
+            "v0.72.0) pins the base in CPU RAM; 'disk' is the v0.72.3 overflow "
             "tier; 'auto' picks per free RAM."
         ),
     )
@@ -4662,7 +4662,7 @@ class SoupConfig(BaseModel):
             raise ValueError(
                 f"training.stream_layers requires task='sft' in v0.72.0; got "
                 f"task={self.task!r}. Preference losses (DPO/ORPO/SimPO/KTO) "
-                f"land in v0.72.3."
+                f"land in v0.72.4."
             )
         if self.backend != "transformers":
             raise ValueError(
@@ -4680,24 +4680,24 @@ class SoupConfig(BaseModel):
                 f"training.stream_layers requires quantization='none' in "
                 f"v0.72.0 (got {tcfg.quantization!r}). NF4 weights carry a "
                 f"quant_state and cannot be byte-copied into a plain buffer; "
-                f"NF4 streaming lands in v0.72.1."
+                f"NF4 streaming lands in v0.72.2."
             )
         if tcfg.stream_source == "disk":
             raise ValueError(
                 "training.stream_source='disk' is not implemented in v0.72.0 — "
-                "the disk overflow tier lands in v0.72.2. Use 'ram' or 'auto'."
+                "the disk overflow tier lands in v0.72.3. Use 'ram' or 'auto'."
             )
         if tcfg.batch_size != 1:
             raise ValueError(
                 f"training.stream_layers requires batch_size=1 in v0.72.0 (got "
-                f"{tcfg.batch_size!r}); larger batches land in v0.72.2."
+                f"{tcfg.batch_size!r}); larger batches land in v0.72.3."
             )
         if tcfg.gradient_accumulation_steps != 1:
             raise ValueError(
                 f"training.stream_layers requires gradient_accumulation_steps=1 "
                 f"(got {tcfg.gradient_accumulation_steps}); every micro-batch "
                 f"re-reads the entire base, so accumulation multiplies streaming "
-                f"IO linearly. Accumulation lands in v0.72.2."
+                f"IO linearly. Accumulation lands in v0.72.3."
             )
         if tcfg.lora.r < 1:
             raise ValueError(

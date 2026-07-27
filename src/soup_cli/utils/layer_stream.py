@@ -39,7 +39,7 @@ DEFAULT_STREAM_BUFFERS = 2
 #: the base is frozen). Streaming always checkpoints, so this is never 4.
 FLOPS_PER_PARAM_PER_TOKEN = 6
 
-#: v0.72.0 scope. Breadth (Mistral / Gemma / Phi) is v0.72.2.
+#: v0.72.0 scope. Breadth (Mistral / Gemma / Phi) is v0.72.3.
 SUPPORTED_STREAM_ARCHS = ("llama", "qwen2", "qwen3")
 
 _DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
@@ -84,7 +84,7 @@ def stream_arch_of(config: Any) -> str:
         raise ValueError(
             f"layer streaming does not support model_type={family!r} in "
             f"v0.72.0. Supported: {', '.join(SUPPORTED_STREAM_ARCHS)}. "
-            f"More architectures land in v0.72.2."
+            f"More architectures land in v0.72.3."
         )
     return family
 
@@ -313,7 +313,7 @@ def build_stream_plan(
     notes = []
     if tier == TIER_DISK:
         notes.append(
-            "base does not fit in RAM — the disk tier lands in v0.72.2; "
+            "base does not fit in RAM — the disk tier lands in v0.72.3; "
             "v0.72.0 supports stream_source='ram' only"
         )
     decision = decide_pinning(store_bytes, pinned_limit_bytes)

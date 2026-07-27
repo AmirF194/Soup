@@ -1019,7 +1019,7 @@ class SFTTrainerWrapper:
                     f"layer streaming needs the base to fit in RAM: {cfg.base} is "
                     f"{source_bytes / 1e9:.1f} GB on disk and only "
                     f"{early_free_ram / 1e9:.1f} GB of RAM is free. The disk "
-                    f"overflow tier lands in v0.72.2 — free RAM or pick a "
+                    f"overflow tier lands in v0.72.3 — free RAM or pick a "
                     f"smaller base."
                 )
 
@@ -1062,7 +1062,7 @@ class SFTTrainerWrapper:
                 f"layer streaming needs the base to fit in RAM: it is "
                 f"{(layer_bytes * index.n_layers + embed_bytes) / 1e9:.1f} GB and only "
                 f"{free_ram / 1e9:.1f} GB is free. The disk overflow tier lands "
-                f"in v0.72.2 — free RAM or pick a smaller base."
+                f"in v0.72.3 — free RAM or pick a smaller base."
             )
         console.print(render_stream_panel(plan))
         console.print(

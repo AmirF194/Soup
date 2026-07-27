@@ -278,6 +278,50 @@ def _build_streamed_layer_class():
 
             return super()._apply(_skip_meta, recurse=recurse)
 
+        def state_dict(
+            self,
+            *args: Any,
+            destination: Any = None,
+            prefix: str = "",
+            keep_vars: bool = False,
+        ) -> Any:
+            # v0.72.1 — serialise as though this wrapper were not in the tree.
+            #
+            # The wrapper holds the real layer as a child named `inner`, so
+            # every adapter parameter would otherwise be written as
+            # `...layers.0.inner.self_attn.q_proj.lora_A.weight`. That file
+            # loads as ZERO tensors into any normal model — PEFT reports the
+            # keys as missing and returns the untuned base, with no exception.
+            # Every adapter artifact (the final `trainer.save_model()`, each
+            # `save_steps` checkpoint, and therefore everything downstream:
+            # `soup merge` / `serve` / `chat` / `adapters *` / the Registry)
+            # reaches disk through this method, so delegating at OUR prefix is
+            # what makes a streamed adapter indistinguishable from a normal
+            # LoRA run.
+            #
+            # Serialisation-only, deliberately: the forward path is untouched,
+            # so v0.72.0's bit-exactness gates remain valid. The cost is that
+            # `named_parameters()` still shows `.inner.`, i.e. loading INTO a
+            # streamed model stays unsupported (`--resume` is refused; the
+            # checkpoint/resume slot is v0.72.3).
+            #
+            # The wrapper owns no parameters or buffers of its own — they all
+            # live on `inner` — so nothing is lost by not serialising it. It
+            # also means bypassing nn.Module.state_dict skips only hooks
+            # registered on the WRAPPER itself, of which there are none (the
+            # prefetch hook lives on the decoder container, not here).
+            if args:
+                # torch's legacy positional form: (destination, prefix, keep_vars)
+                if destination is None:
+                    destination = args[0]
+                if len(args) > 1 and prefix == "":
+                    prefix = args[1]
+                if len(args) > 2 and keep_vars is False:
+                    keep_vars = args[2]
+            return self.inner.state_dict(
+                destination=destination, prefix=prefix, keep_vars=keep_vars
+            )
+
         def __getattr__(self, name: str) -> Any:
             # transformers reads contract attributes straight off the layer
             # object (this version reads `decoder_layer.attention_type`). The

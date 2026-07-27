@@ -233,7 +233,7 @@ Stream frozen base-model decoder layers ONE at a time from CPU RAM into small VR
 ```yaml
 training:
   stream_layers: true          # Enable layer streaming
-  stream_source: auto          # 'auto' (same-host RAM), 'ram', 'disk' (v0.72.2)
+  stream_source: auto          # 'auto' (same-host RAM), 'ram', 'disk' (v0.72.3)
   stream_buffers: 2            # Double-buffering; range [2, 8]
 ```
 
@@ -259,20 +259,20 @@ The tradeoff: **1.43× slower than resident training**, measured at 0.5B — the
 
 **Honest scope (v0.72.0 = proof-of-mechanism):**
 - **Models measured:** Qwen2.5-0.5B, 1.5B and 3B, plus a live `soup train` on SmolLM2-135M. **Nothing above 3B was measured, and no 8B / 14B / 70B claim is supported.**
-- **RAM tier only.** `stream_source: ram` (`auto` resolves to it). The disk overflow tier ships in **v0.72.2**.
+- **RAM tier only.** `stream_source: ram` (`auto` resolves to it). The disk overflow tier ships in **v0.72.3**.
 - **Llama / Qwen only**, `task: sft`, `backend: transformers`, `modality: text`.
-- **`batch_size: 1`**, no gradient accumulation, no `--resume` — all ship in **v0.72.2**.
-- **bf16 base; `quantization: none` is required.** 4-bit (NF4) weights carry a quantisation state and cannot be byte-copied into a plain buffer, so NF4 streaming is **v0.72.1**. A `4bit` config is refused today with a message saying exactly that.
+- **`batch_size: 1`**, no gradient accumulation, no `--resume` — all ship in **v0.72.3**.
+- **bf16 base; `quantization: none` is required.** 4-bit (NF4) weights carry a quantisation state and cannot be byte-copied into a plain buffer, so NF4 streaming is **v0.72.2**. A `4bit` config is refused today with a message saying exactly that.
 - **The 3B throughput is a LOWER BOUND.** The reference box could not page-lock the 5.55 GB base (its measured page-locked ceiling is 7.65 GB, and a CUDA context plus the model skeleton did not leave room), so that run fell back to a pageable store. Pageable memory makes the host-to-device copy synchronous, which costs overlap — visible as the GPU-utilisation drop from 96.8% (1.5B, pinned) to 79.3% (3B, pageable). Soup does this fallback automatically **and prints the cost** rather than absorbing it silently.
 - Numbers are Windows/WDDM and therefore systematically pessimistic versus Linux. `expandable_segments:True` is silently ignored on Windows; Soup detects that and does not claim it is active.
 
 **Rejected at config load (each names the release that lifts it):**
-- `stream_source: disk` → the disk tier is v0.72.2
-- `quantization` other than `none` → NF4 streaming is v0.72.1
+- `stream_source: disk` → the disk tier is v0.72.3
+- `quantization` other than `none` → NF4 streaming is v0.72.2
 - `backend: unsloth` / `backend: mlx` → streaming replaces the model-load path those backends own
-- `task` other than `sft` → preference losses are v0.72.3
-- `gradient_accumulation_steps > 1` → every micro-batch re-reads the whole base, so accumulation multiplies streaming IO linearly (v0.72.2)
-- `batch_size` other than `1` → v0.72.2
+- `task` other than `sft` → preference losses are v0.72.4
+- `gradient_accumulation_steps > 1` → every micro-batch re-reads the whole base, so accumulation multiplies streaming IO linearly (v0.72.3)
+- `batch_size` other than `1` → v0.72.3
 - `lora.use_dora` / `lora.use_vera` / `lora.init_strategy` other than `random` → these initialise from the real base weight, which is on the meta device under streaming
 - `unfrozen_parameters`, `lisa_enabled`, `packing`, `multipack`, `use_fsdp2_compile`, `train_router_only`, `expand_layers` → each independently rewrites or re-freezes the same layers
 - `stream_source` / `stream_buffers` set while `stream_layers: false` → a footgun, refused
@@ -294,12 +294,12 @@ data:
 training:
   epochs: 3
   lr: 2e-5
-  batch_size: 1           # required; larger batches in v0.72.2
-  gradient_accumulation_steps: 1   # required; accumulation in v0.72.2
-  quantization: none      # required; NF4 streaming is v0.72.1
+  batch_size: 1           # required; larger batches in v0.72.3
+  gradient_accumulation_steps: 1   # required; accumulation in v0.72.3
+  quantization: none      # required; NF4 streaming is v0.72.2
   gradient_checkpointing: true     # handled per-layer by the streamer
   stream_layers: true     # Enable layer streaming
-  stream_source: auto     # RAM-based (disk in v0.72.2)
+  stream_source: auto     # RAM-based (disk in v0.72.3)
   stream_buffers: 2       # double-buffering
   lora:
     r: 64
@@ -313,16 +313,25 @@ output: ./output
 - The 1.5B runs sit at ~97% GPU utilisation, i.e. compute-bound: with a page-locked store the layer loads hide almost completely behind compute. The 3B run's 79.3% is **not** a model-size effect — it is the cost of the pageable-store fallback on that particular box.
 - Correctness is not a tradeoff: streamed and resident forward passes were verified **bit-exact**, and a 100-step streamed loss curve matched resident exactly. Streaming substitutes the same weight bytes into the same kernels.
 
+> **v0.72.0 adapters are unloadable — re-run them on v0.72.1.** In v0.72.0 a streamed run saved every adapter tensor under a key carrying an extra `.inner.` segment, so `soup merge`, `soup serve`, `soup chat` and `PeftModel.from_pretrained` loaded **zero** tensors and silently returned the untuned base (PEFT emitted only a `UserWarning`). The training itself was correct — only the saved file was affected. Check with:
+>
+> ```bash
+> python -c "from safetensors.torch import load_file; \
+> print([k for k in load_file('adapter_model.safetensors') if '.inner.' in k][:3])"
+> ```
+>
+> If that prints anything, the adapter is affected. From v0.72.1 a streamed adapter is byte-for-byte in the same layout as an ordinary LoRA run.
+
 **Troubleshooting:**
-- **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Free RAM or pick a smaller base; the disk overflow tier is v0.72.2.
+- **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Free RAM or pick a smaller base; the disk overflow tier is v0.72.3.
 - **"could not page-lock the base … falling back to a PAGEABLE RAM store"** — expected on a busy machine. Training continues, more slowly. Close other applications to keep the pinned store.
 - **"layer streaming does not support model_type=…"** — v0.72.0 covers Llama and Qwen only.
 - **Slower than you expected** — layer streaming trades time for memory. If the model already fits resident on your card, do not enable it.
 
 **Roadmap (each refusal names its release):**
-- 4-bit (NF4) streaming — **v0.72.1**, the first genuinely useful capability jump
-- Disk overflow tier, batch size > 1, gradient accumulation, checkpoint/resume, more architectures (Mistral / Gemma / Phi) — **v0.72.2**
-- Preference losses (DPO / ORPO / SimPO / KTO) — **v0.72.3**. GRPO and PPO are explicitly **not** planned: rollouts need generation, which re-reads the model per token
+- 4-bit (NF4) streaming — **v0.72.2**, the first genuinely useful capability jump
+- Disk overflow tier, batch size > 1, gradient accumulation, checkpoint/resume, more architectures (Mistral / Gemma / Phi) — **v0.72.3**
+- Preference losses (DPO / ORPO / SimPO / KTO) — **v0.72.4**. GRPO and PPO are explicitly **not** planned: rollouts need generation, which re-reads the model per token
 - A published 14B-on-8 GB reference benchmark — hardware-blocked; it needs an 8 GB card and 32 GB of RAM, which the development box does not have
 
 **Shard cache.** The first streaming run rewrites the checkpoint into one safetensors shard per decoder layer under `~/.soup/layer-stream/` (override with `SOUP_LAYER_STREAM_CACHE_DIR`). That costs disk space roughly equal to the base. The cache is keyed to a fingerprint of the source checkpoint, so a base retrained in place re-shards instead of silently training against stale weights.

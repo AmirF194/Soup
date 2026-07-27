@@ -50,7 +50,7 @@ class TestStreamArchAllowlist:
             stream_arch_of(_Cfg("gpt2"))
 
     def test_mistral_is_rejected_in_v0720(self):
-        """Mistral is v0.72.2 breadth — it must not silently half-work."""
+        """Mistral is v0.72.3 breadth — it must not silently half-work."""
         from soup_cli.utils.layer_stream import stream_arch_of
 
         with pytest.raises(ValueError, match="mistral"):
@@ -776,13 +776,13 @@ class TestStreamTaskAndBackendGates:
 
 
 class TestStreamScopeGates:
-    def test_quantization_rejected_and_names_v0721(self):
-        """NF4 streaming is the v0.72.1 slot — say so instead of half-working."""
-        with pytest.raises(ValueError, match="v0.72.1"):
+    def test_quantization_rejected_and_names_nf4_slot(self):
+        """NF4 streaming is the v0.72.2 slot — say so instead of half-working."""
+        with pytest.raises(ValueError, match="v0.72.2"):
             _load(_stream_yaml(training={"quantization": "4bit"}))
 
-    def test_disk_source_rejected_and_names_v0722(self):
-        with pytest.raises(ValueError, match="v0.72.2"):
+    def test_disk_source_rejected_and_names_breadth_slot(self):
+        with pytest.raises(ValueError, match="v0.72.3"):
             _load(_stream_yaml(training={"stream_source": "disk"}))
 
     def test_batch_size_above_one_rejected(self):

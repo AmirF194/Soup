@@ -12,7 +12,57 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.72.1] - 2026-07-27
+
+**Fixed — layer-streaming adapters were saved in an unloadable form.** If you
+trained with `stream_layers: true` on v0.72.0, the adapter that run wrote is
+**inert**: every tensor was saved under a key containing an extra `.inner.`
+segment, so `soup merge`, `soup serve`, `soup chat` and
+`PeftModel.from_pretrained` all loaded **zero** adapter tensors and silently
+returned the untuned base model. PEFT emitted only a `UserWarning`, so nothing
+failed and nothing looked wrong.
+
+The training itself was correct — the streamed run's numerics are unaffected,
+and v0.72.0's bit-exactness results still stand. Only the saved file was
+affected.
+
+**If you have a v0.72.0 streamed adapter: re-save or re-run it on v0.72.1.**
+There is no way to recover the original file's association with the base model
+beyond renaming its keys; re-running is the reliable path. A quick check —
+if `adapter_model.safetensors` contains keys with `.inner.` in them, it is
+affected:
+
+```bash
+python -c "from safetensors.torch import load_file; \
+print([k for k in load_file('adapter_model.safetensors') if '.inner.' in k][:3])"
+```
+
+Streamed adapters now save byte-for-byte in the same layout as an ordinary LoRA
+run, and are portable to any tool that has never heard of layer streaming.
+
+**Also fixed — `--hf-resume` bypassed the streaming resume refusal.** The guard
+only tested `--resume`, but `--hf-resume` reaches `resume_from` through a
+different branch. That combination previously appeared to work by accident
+(checkpoint and live model shared the same key shape); once adapters are saved
+canonically it would instead have matched *nothing* and continued with a
+freshly initialised adapter, silently. Both flags are now refused for streaming
+runs, naming v0.72.3.
+
+Also in this release: every "this lands in vX.Y.Z" refusal message was corrected
+after the v0.72.x roadmap was renumbered (NF4 streaming is now v0.72.2; the disk
+tier, wider architectures, larger batches, gradient accumulation and
+checkpoint/resume are v0.72.3; preference losses are v0.72.4).
+
+**Known limitation:** in memory the streamed model's `named_parameters()` still
+carries the wrapper segment, so loading *into* a streaming run (`--resume`)
+remains unsupported and is refused with a message naming v0.72.3.
+
 ## [0.72.0] - 2026-07-26
+
+> **Superseded by v0.72.1 — adapters saved by this version load as zero
+> tensors.** The entry below is left as published; the defect and the fix are
+> described under [0.72.1]. Version numbers named as "upcoming" below were also
+> renumbered there (NF4 is v0.72.2, not v0.72.1).
 
 **Layer streaming (BETA) — fine-tune models that don't fit in your card.** The
 frozen base lives in CPU RAM and is streamed into two pre-allocated VRAM buffers

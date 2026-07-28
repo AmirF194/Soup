@@ -86,6 +86,14 @@ def test_probe_would_catch_a_regression():
         "soup_cli.utils.reward_synth",
         "soup_cli.utils.ship_verdict",
         "soup_cli.utils.layer_stream",
+        # Light cores that a command body imports lazily, so neither the startup
+        # assertion nor a `--help` invocation reaches them. `soup mcp serve`
+        # blocks (it is a stdio server), so its registry is covered here rather
+        # than as an invocation.
+        "soup_cli.mcp_server.registry",
+        "soup_cli.utils.advise",
+        "soup_cli.eval.gate_suites",
+        "soup_cli.recipes.catalog",
     ],
 )
 def test_documented_light_module_stays_light(module: str):

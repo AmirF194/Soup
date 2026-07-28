@@ -4682,23 +4682,30 @@ class SoupConfig(BaseModel):
                 f"store weights in formats that cannot be streamed into a "
                 f"pooled buffer."
             )
-        if tcfg.stream_source == "disk":
+        # v0.72.3: the disk overflow tier is live. It is still NVMe-only —
+        # `choose_tier` refuses spinning disks, where each step costs two seeks
+        # per layer (plan P11) and the run thrashes rather than merely running
+        # slower. `soup doctor` reports the detected media type.
+        # v0.72.3: any concrete batch size is supported — bigger batches are
+        # where streaming PAYS OFF, since one weight read is amortised over more
+        # tokens. "auto" is still refused: it resolves by OOM-probing a resident
+        # model, and under streaming that model never loads, so the probe would
+        # measure something that does not exist.
+        if tcfg.batch_size == "auto":
             raise ValueError(
-                "training.stream_source='disk' is not implemented yet — "
-                "the disk overflow tier lands in v0.72.3. Use 'ram' or 'auto'."
+                "training.stream_layers cannot use batch_size='auto': the probe "
+                "sizes a RESIDENT model, which a streaming run never loads. Set "
+                "a concrete batch_size — the pre-flight predicts peak VRAM for "
+                "it and refuses the run if it will not fit."
             )
-        if tcfg.batch_size != 1:
-            raise ValueError(
-                f"training.stream_layers requires batch_size=1 (got "
-                f"{tcfg.batch_size!r}); larger batches land in v0.72.3."
-            )
-        if tcfg.gradient_accumulation_steps != 1:
-            raise ValueError(
-                f"training.stream_layers requires gradient_accumulation_steps=1 "
-                f"(got {tcfg.gradient_accumulation_steps}); every micro-batch "
-                f"re-reads the entire base, so accumulation multiplies streaming "
-                f"IO linearly. Accumulation lands in v0.72.3."
-            )
+        # v0.72.3: accumulation is supported. Measured on this box, it is
+        # per-TOKEN I/O-neutral — layer reads per 1k tokens held constant across
+        # accum 1/2/4 — because N micro-batches read the base N times but also
+        # process N times the tokens. Its cost is opportunity cost: reaching the
+        # same effective batch by raising batch_size was 2.52x faster. The
+        # pre-flight says so rather than the schema refusing it, because
+        # accumulation is the ONLY way to raise effective batch once the VRAM
+        # budget is exhausted (peak moved 0.842 -> 0.846 GB across accum 1->4).
         if tcfg.lora.r < 1:
             raise ValueError(
                 "training.stream_layers requires LoRA (training.lora.r >= 1) — "

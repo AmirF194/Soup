@@ -17,7 +17,7 @@ adapters, their gradients and optimizer state stay resident.
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 from rich.panel import Panel
 
@@ -46,8 +46,55 @@ DEFAULT_STREAM_BUFFERS = 2
 #: the base is frozen). Streaming always checkpoints, so this is never 4.
 FLOPS_PER_PARAM_PER_TOKEN = 6
 
-#: v0.72.0 scope. Breadth (Mistral / Gemma / Phi) is v0.72.3.
-SUPPORTED_STREAM_ARCHS = ("llama", "qwen2", "qwen3")
+#: Families whose decoder layout has been proven bit-exact against a resident
+#: run of the same numerics (v0.72.0 llama/qwen2/qwen3; v0.72.3 GATE 1 added the
+#: rest, under bf16 AND NF4). An allowlist rather than a heuristic because a
+#: half-supported architecture streams weights into the wrong module and
+#: mis-trains silently instead of crashing.
+#:
+#: ``gemma3_text`` is present but ``gemma3`` is NOT: a real ``google/gemma-3-*``
+#: reports ``model_type='gemma3'`` for the vision-capable wrapper, and streaming
+#: a multimodal wrapper as though it were a causal LM is exactly the failure the
+#: allowlist exists to prevent.
+SUPPORTED_STREAM_ARCHS = (
+    "llama",
+    "qwen2",
+    "qwen3",
+    "mistral",
+    "gemma",
+    "gemma2",
+    "gemma3_text",
+    "phi",
+    "phi3",
+)
+
+#: VRAM bytes per logit element at peak. **Measured (v0.72.3 GATE 2), not
+#: derived**: ``transformers``' ``ForCausalLMLoss`` holds four copies live at
+#: once — the bf16 logits (2), the fp32 upcast (4), log-softmax's fp32 output
+#: (4) and the fp32 gradient (4). v0.72.0 charged 6 from first principles, which
+#: under-predicts this term by 2.33x — a ~5 GB error on a 152k-vocab model at
+#: batch 8, where the logits tensor is 146x the entire buffer pool.
+LOGITS_BYTES_PER_ELEMENT = 14
+#: Forward only, no loss: just the bf16 logits.
+LOGITS_BYTES_PER_ELEMENT_NO_LOSS = 2
+
+#: Bytes per trainable adapter parameter at peak: fp32 weight + fp32 grad +
+#: Adam ``m`` + ``v``. Charged even under an 8-bit optimizer (which needs 10) —
+#: over-charging ~6 bytes across a few million adapter parameters is noise next
+#: to the logits term, and it errs in the safe direction.
+OPTIMIZER_BYTES_PER_PARAM = 16
+
+#: Constant offset measured across both GATE 2 models (RoPE caches, allocator
+#: rounding, small per-run buffers). It came out at ~13.3 MB for a 135M model
+#: and a 0.5B model alike, so it is charged as a constant rather than scaled.
+STREAM_FIXED_SLACK_BYTES = 13_500_000
+
+#: Fraction of the *measured same-session GEMM ceiling* that real streamed
+#: training actually reached on the dev box: 68% (Llama-3.1-8B NF4, 5.26 of
+#: 7.74 TFLOPS) up to ~100% (small models, fully pinned store). A forecast
+#: quoted as a single number would over-promise by up to 1.5x, so the bracket
+#: travels with it.
+MEASURED_CEILING_FRACTION = (0.68, 1.0)
 
 #: ``uint8`` is a STORAGE dtype only — NF4 packs two nibbles per byte and (under
 #: double quant) stores absmax as uint8 too. It is never a base/compute dtype,
@@ -109,10 +156,154 @@ def stream_arch_of(config: Any) -> str:
 # ==========================================================================
 # storage tier (plan 5.1)
 # ==========================================================================
+DISK_KINDS = (_NVME, "ssd", "hdd", "unknown")
+
+#: A media type, or a thunk that determines one. ``choose_tier`` accepts the
+#: thunk form so the ~9 s Windows probe is paid only when the tier decision
+#: actually depends on the answer.
+DiskKind = Union[str, Callable[[], str]]
+
+_DISK_KIND_CACHE: Dict[str, str] = {}
+
+
+def detect_disk_kind(path: str = ".") -> str:
+    """Media type of the volume holding ``path``: nvme / ssd / hdd / unknown.
+
+    **Costs about 9 s on Windows** (measured), because the only reliable source
+    is a PowerShell ``Get-PhysicalDisk`` CIM query. That is why ``choose_tier``
+    takes a *callable* and only invokes it when the base does not fit in RAM —
+    the answer is irrelevant on the RAM tier, which is the common case. The
+    result is cached per process.
+
+    ``unknown`` is returned rather than guessed whenever the platform cannot be
+    probed, and ``choose_tier`` refuses it. Refusing is the safe direction: the
+    cost of wrongly believing a spinning disk is NVMe is a run that thrashes for
+    hours (plan P11 — 80 shards x 2 reads = 160 seeks per step).
+    """
+    import os
+
+    resolved = os.path.realpath(os.path.expanduser(path))
+    # Key on the volume where there is one (Windows) and on the resolved path
+    # otherwise, so two spellings of the same location share a cache entry.
+    key = os.path.splitdrive(resolved)[0] or resolved
+    if key in _DISK_KIND_CACHE:
+        return _DISK_KIND_CACHE[key]
+    kind = _probe_disk_kind(path)
+    _DISK_KIND_CACHE[key] = kind
+    return kind
+
+
+def _resolve_tool(name: str, *fallbacks: str) -> Optional[str]:
+    """Absolute path to a system tool, or None.
+
+    Bare names are deliberately never handed to ``subprocess``: on Windows
+    ``CreateProcess`` searches the CURRENT DIRECTORY before ``PATH``, so
+    ``["powershell", ...]`` run from a freshly-cloned project would execute an
+    attacker-planted ``powershell.exe`` sitting in that checkout (CWE-427). No
+    shell metacharacters required. POSIX ``execvp`` searches ``$PATH`` only, so
+    this matters most on Windows — but resolving everywhere costs nothing.
+    """
+    import os
+    import shutil
+
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in fallbacks:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+_POWERSHELL_FALLBACK = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+
+def _probe_disk_kind(path: str) -> str:
+    import os
+    import platform
+    import subprocess
+
+    system = platform.system()
+    try:
+        if system == "Linux":
+            # /sys/block/<dev>/queue/rotational: 1 spinning, 0 solid state.
+            # Instant and authoritative; the device name distinguishes NVMe.
+            names = sorted(os.listdir("/sys/block"))
+            for dev in names:
+                if not dev.startswith("nvme"):
+                    continue
+                return _NVME
+            for dev in names:
+                rot = os.path.join("/sys/block", dev, "queue", "rotational")
+                if os.path.exists(rot):
+                    with open(rot, encoding="utf-8") as handle:
+                        return "hdd" if handle.read().strip() == "1" else "ssd"
+            return "unknown"
+        if system == "Windows":
+            shell = _resolve_tool("powershell", _POWERSHELL_FALLBACK)
+            if shell is None:
+                return "unknown"
+            out = subprocess.run(
+                [
+                    shell, "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-PhysicalDisk | Select-Object MediaType,BusType "
+                    "| ConvertTo-Json -Compress",
+                ],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if out.returncode != 0 or not out.stdout.strip():
+                return "unknown"
+            import json
+
+            payload = json.loads(out.stdout)
+            disks = payload if isinstance(payload, list) else [payload]
+            kinds = {_windows_kind(d) for d in disks if isinstance(d, dict)}
+            # Several physical disks and no way to attribute the volume to one:
+            # report the WORST, so a machine with a spinning disk is not told it
+            # has NVMe.
+            for candidate in ("hdd", "unknown", "ssd", _NVME):
+                if candidate in kinds:
+                    return candidate
+            return "unknown"
+        if system == "Darwin":
+            tool = _resolve_tool("diskutil", "/usr/sbin/diskutil")
+            if tool is None:
+                return "unknown"
+            out = subprocess.run(
+                [tool, "info", "-plist", "/"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            text = out.stdout.lower()
+            if "nvme" in text:
+                return _NVME
+            if "solid state" in text or ("<true/>" in text and "solidstate" in text):
+                return "ssd"
+            return "unknown"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "unknown"
+    return "unknown"
+
+
+def _windows_kind(disk: dict) -> str:
+    bus = str(disk.get("BusType", "")).strip().lower()
+    media = str(disk.get("MediaType", "")).strip().lower()
+    if bus == "nvme":
+        return _NVME
+    # MSFT_PhysicalDisk.MediaType ValueMap is {0 Unspecified, 3 HDD, 4 SSD,
+    # 5 SCM} — verified on this box, whose NVMe reports raw value 4. PowerShell
+    # usually renders the friendly string, but ConvertTo-Json emits the integer
+    # on some systems, so both forms are handled and neither is guessed.
+    if media in ("hdd", "3"):
+        return "hdd"
+    if media in ("ssd", "4"):
+        return "ssd"
+    return "unknown"
+
+
 def choose_tier(
     model_bytes: int,
     free_ram_bytes: int,
-    disk_kind: str,
+    disk_kind: DiskKind,
     *,
     headroom: float = RAM_TIER_HEADROOM,
 ) -> str:
@@ -121,15 +312,21 @@ def choose_tier(
     plan 2.3: streaming from NVMe measured 2-11 TFLOPS against multiples of
     that from CPU RAM, so RAM is the primary source and disk is a fallback.
     plan P11: on an HDD, 80 shards x 2 reads = 160 seeks per step.
+
+    ``disk_kind`` may be a **callable**, and normally should be: detecting the
+    media type costs ~9 s on Windows and is irrelevant whenever the base fits in
+    RAM. Passing ``detect_disk_kind`` here means that cost is paid only by runs
+    that are actually about to use the disk tier.
     """
     if model_bytes < free_ram_bytes * headroom:
         return TIER_RAM
-    if disk_kind == _NVME:
+    kind = disk_kind() if callable(disk_kind) else disk_kind
+    if kind == _NVME:
         return TIER_DISK
     raise ValueError(
         f"layer streaming needs NVMe or more RAM: the base needs "
         f"{model_bytes / 1e9:.1f} GB, only {free_ram_bytes / 1e9:.1f} GB of RAM "
-        f"is free, and the detected disk is {disk_kind!r} (not NVMe). "
+        f"is free, and the detected disk is {kind!r} (not NVMe). "
         f"Free RAM, pick a smaller base, or move the model to an NVMe drive."
     )
 
@@ -276,16 +473,241 @@ def estimate_logits_bytes(
 ) -> int:
     """plan P5: logits, not weights, OOM you first on a small card.
 
-    Llama-3.2's 128256-entry vocab at S=2048 is ~1.6 GB transient once the
-    fp32 cross-entropy upcast is counted — more than both layer buffers.
+    Measured (GATE 2), not derived: the loss path holds ``LOGITS_BYTES_PER_ELEMENT``
+    bytes per element live at peak, not the 2 + 4 a first-principles reading
+    suggests. At Qwen2.5-0.5B (vocab 151936), batch 8, S=512 this single term is
+    8.71 GB — 146x the whole buffer pool — so a pre-flight that budgets only
+    weights and buffers green-lights a config that cannot run.
     """
     if vocab_size <= 0 or seq_len <= 0 or batch_size <= 0:
         raise ValueError("vocab_size, seq_len and batch_size must all be positive")
     elements = vocab_size * seq_len * batch_size
-    total = elements * 2
-    if upcast_fp32:
-        total += elements * 4
-    return total
+    per = LOGITS_BYTES_PER_ELEMENT if upcast_fp32 else LOGITS_BYTES_PER_ELEMENT_NO_LOSS
+    return elements * per
+
+
+def estimate_activation_bytes(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    n_layers: int,
+    seq_len: int,
+    batch_size: int = 1,
+    dtype: str = "bfloat16",
+) -> int:
+    """Activation memory for one streamed step (GATE 2).
+
+    Two terms, and keeping them separate is the whole memory argument for
+    streaming:
+
+    * ``2 * n_layers * hidden`` per token — ``checkpoint(use_reentrant=False)``
+      saves each layer's *input*, so this one does scale with depth. It is small.
+    * ``4 * (hidden + intermediate)`` per token — the tensors live inside the ONE
+      layer currently being recomputed. Independent of depth, which is precisely
+      why a 32-layer model costs no more here than a 4-layer one.
+    """
+    for name, value in (
+        ("hidden_size", hidden_size),
+        ("intermediate_size", intermediate_size),
+        ("n_layers", n_layers),
+        ("seq_len", seq_len),
+        ("batch_size", batch_size),
+    ):
+        if value <= 0:
+            raise ValueError(f"{name} must be positive; got {value}")
+    element = dtype_bytes(dtype)
+    tokens = seq_len * batch_size
+    boundary = element * n_layers * hidden_size
+    transient = 2 * element * (hidden_size + intermediate_size)
+    return tokens * (boundary + transient)
+
+
+def estimate_optimizer_bytes(
+    adapter_params: int, *, bytes_per_param: int = OPTIMIZER_BYTES_PER_PARAM
+) -> int:
+    """Adapter weights + gradients + optimizer moments."""
+    if adapter_params < 0:
+        raise ValueError(f"adapter_params must be non-negative; got {adapter_params}")
+    return adapter_params * bytes_per_param
+
+
+def estimate_stream_peak_vram(
+    *,
+    layer_bytes: int,
+    buffers: int,
+    extras_bytes: int,
+    adapter_params: int,
+    vocab_size: int,
+    hidden_size: int,
+    intermediate_size: int,
+    n_layers: int,
+    seq_len: int,
+    batch_size: int = 1,
+    dtype: str = "bfloat16",
+) -> int:
+    """Predicted ``torch.cuda.max_memory_allocated()`` for a streaming step.
+
+    Assembles the GATE 2 terms. Validated against 10 real runs across two models
+    (a 3.1x vocab contrast), batch 1..8 and two sequence lengths: **worst
+    absolute error 0.85%, and it never under-predicts** — the only safe direction
+    for a number that is allowed to refuse a run. An independent check against
+    the published v0.72.2 Llama-3.1-8B NF4 row (untied embeddings, different
+    quantisation, different session, nothing fitted to it) brackets it at +7.5%.
+
+    ``extras_bytes`` is what makes an 8B run predictable: its embeddings and
+    ``lm_head`` are UNTIED, so two 1.05 GB matrices sit resident and account for
+    2.10 GB of that run's 3.32 GB peak.
+
+    Returns allocator-visible bytes only. The CUDA context and driver reservation
+    sit outside the caching allocator (0.85 GB on the dev box, which also drives
+    a display), so the fit decision compares this against *measured free VRAM*
+    rather than against the card's nameplate size.
+    """
+    return (
+        layer_bytes * buffers
+        + extras_bytes
+        + estimate_optimizer_bytes(adapter_params)
+        + STREAM_FIXED_SLACK_BYTES
+        + estimate_activation_bytes(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            n_layers=n_layers,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            dtype=dtype,
+        )
+        + estimate_logits_bytes(
+            vocab_size=vocab_size, seq_len=seq_len, batch_size=batch_size
+        )
+    )
+
+
+@dataclass(frozen=True)
+class VramFit:
+    """Whether a streaming step is predicted to fit in the VRAM actually free."""
+
+    fits: bool
+    predicted_bytes: int
+    available_bytes: int
+    reason: str
+
+
+def decide_stream_fit(*, predicted_bytes: int, available_bytes: int) -> VramFit:
+    """Compare predicted demand against measured free VRAM.
+
+    Refusing rather than warning is deliberate. On Linux an over-budget step is a
+    hard OOM. On Windows it is worse: WDDM silently spills to host memory and the
+    run merely becomes an order of magnitude slower — measured here as a 9.27 GB
+    peak on a 4.29 GB card with no exception raised at all. A user reading that
+    as "streaming is slow" would draw exactly the wrong conclusion.
+    """
+    if predicted_bytes <= available_bytes:
+        return VramFit(
+            fits=True,
+            predicted_bytes=predicted_bytes,
+            available_bytes=available_bytes,
+            reason=(
+                f"predicted peak {predicted_bytes / 1e9:.2f} GB fits in "
+                f"{available_bytes / 1e9:.2f} GB of free VRAM"
+            ),
+        )
+    return VramFit(
+        fits=False,
+        predicted_bytes=predicted_bytes,
+        available_bytes=available_bytes,
+        reason=(
+            f"a streaming step is predicted to need "
+            f"{predicted_bytes / 1e9:.2f} GB of VRAM but only "
+            f"{available_bytes / 1e9:.2f} GB is free. Streaming bounds the "
+            f"WEIGHTS, not the activations or the logits — lower "
+            f"training.batch_size or data.max_length, both of which scale this "
+            f"linearly."
+        ),
+    )
+
+
+#: Measured (GATE 3) speed-up from reaching an effective batch by raising
+#: ``batch_size`` rather than ``gradient_accumulation_steps``: Qwen2.5-0.5B bf16,
+#: S=256, pinned store — 1393.4 tok/s at batch 4 / accum 1 against 553.2 at
+#: batch 1 / accum 4. One weight read amortised over 4x the tokens.
+ACCUM_VS_BATCH_SPEEDUP = 2.5
+
+
+def accumulation_advice(*, batch_size: int, accum: int) -> Optional[str]:
+    """Tell an accumulating user what the measurement says, or stay quiet.
+
+    The intuition most people bring — "accumulation costs streaming I/O linearly"
+    — is right per optimizer step and wrong per token, which is the unit that
+    decides wall-clock: ``accum=N`` reads the base N times *and* processes N
+    times the tokens, so layer reads per 1k tokens do not move at all (measured
+    constant at 175.78 across accum 1/2/4).
+
+    What is true is the trade the user is actually making. Raising ``batch_size``
+    reaches the same effective batch in ONE read instead of N, and measured
+    2.52x faster — but it costs VRAM, while accumulation holds peak flat. So the
+    advice is only worth printing when there might be VRAM headroom to spend.
+    """
+    if batch_size <= 0 or accum <= 0:
+        raise ValueError(
+            f"batch_size and accum must be positive; got {batch_size}, {accum}"
+        )
+    if accum == 1:
+        return None
+    return (
+        f"accumulating {accum}x at batch {batch_size}: the base is re-read once "
+        f"per micro-batch. Per token that is free, but reaching effective batch "
+        f"{batch_size * accum} by raising training.batch_size instead measured "
+        f"~{ACCUM_VS_BATCH_SPEEDUP:.1f}x faster. Accumulation holds peak VRAM "
+        f"flat, so raise batch_size while the budget above allows, then "
+        f"accumulate for the rest."
+    )
+
+
+@dataclass(frozen=True)
+class ThroughputForecast:
+    """A compute-bound CEILING, plus the observed fraction of it. Never a point
+    estimate: real streamed runs landed at 68%-100% of the measured ceiling."""
+
+    effective_tflops: float
+    tokens_per_sec_ceiling: float
+    tokens_per_sec_low: float
+    epoch_seconds_floor: float
+    epoch_seconds_high: float
+    sm_clock_mhz: Optional[int] = None
+
+
+def forecast_stream_throughput(
+    *,
+    params: int,
+    effective_tflops: float,
+    tokens_per_epoch: int,
+    sm_clock_mhz: Optional[int] = None,
+) -> ThroughputForecast:
+    """Bracket a streaming run's throughput from a *measured* GEMM ceiling.
+
+    The ceiling itself is arithmetic (``TFLOPS / (6 * P)``); the honest part is
+    that ``effective_tflops`` must come from a matmul benchmarked on the user's
+    own card in the same session — a per-card constant baked into the source
+    would be a fabrication, and this box's boost clock alone moved 442..952 MHz
+    inside a single measurement run.
+    """
+    ceiling = estimate_stream_tokens_per_sec(params, effective_tflops)
+    low_fraction, high_fraction = MEASURED_CEILING_FRACTION
+    low = ceiling * low_fraction
+    return ThroughputForecast(
+        effective_tflops=effective_tflops,
+        tokens_per_sec_ceiling=ceiling * high_fraction,
+        tokens_per_sec_low=low,
+        epoch_seconds_floor=(
+            estimate_epoch_seconds(tokens_per_epoch, ceiling * high_fraction)
+            if tokens_per_epoch
+            else 0.0
+        ),
+        epoch_seconds_high=(
+            estimate_epoch_seconds(tokens_per_epoch, low) if tokens_per_epoch else 0.0
+        ),
+        sm_clock_mhz=sm_clock_mhz,
+    )
 
 
 def estimate_stream_vram(
@@ -353,7 +775,7 @@ def build_stream_plan(
     available_ram_bytes: int,
     pinned_limit_bytes: Optional[int],
     buffers: int = DEFAULT_STREAM_BUFFERS,
-    disk_kind: str = _NVME,
+    disk_kind: DiskKind = _NVME,
 ) -> StreamPlan:
     """Decide tier + pinning and record every caveat as a visible note."""
     buffers = validate_stream_buffers(buffers)
@@ -363,9 +785,17 @@ def build_stream_plan(
     tier = choose_tier(store_bytes + embed_bytes, available_ram_bytes, disk_kind)
     notes = []
     if tier == TIER_DISK:
+        # Falling back is the point of stream_source='auto', but a silent
+        # fallback to a slower path is the failure mode this project keeps
+        # calling out elsewhere. Say what happened and be explicit that the
+        # slowdown is NOT quantified: safetensors memory-maps the shards, so the
+        # OS page cache blurs the RAM-vs-disk boundary, and the dev box could not
+        # produce a trustworthy gap measurement.
         notes.append(
-            "base does not fit in RAM — the disk tier lands in v0.72.3; "
-            "only stream_source='ram' is supported today"
+            "base does not fit in RAM — streaming from the NVMe disk tier "
+            "instead. Nothing is held resident, and the slowdown versus the RAM "
+            "tier is unmeasured on this hardware. Set stream_source='ram' to "
+            "refuse rather than fall back."
         )
     decision = decide_pinning(store_bytes, pinned_limit_bytes)
     if not decision.pinned:
@@ -386,11 +816,24 @@ def build_stream_plan(
 
 def render_stream_panel(plan: StreamPlan, extra_lines: Sequence[str] = ()) -> Panel:
     """Pre-flight summary. plan 10: tell the user the cost BEFORE the run."""
+    if plan.tier == TIER_DISK:
+        # "store ... (pinned)" is meaningless here: the disk tier deliberately
+        # holds nothing resident, so reporting a pinned store of 0.00 GB reads
+        # as a bug rather than as the design.
+        store_line = (
+            f"  base         streamed from disk across {plan.n_layers} layers, "
+            f"nothing held resident"
+        )
+    else:
+        store_line = (
+            f"  base store   {plan.store_bytes / 1e9:.2f} GB across "
+            f"{plan.n_layers} layers "
+            f"({'pinned' if plan.pinned else 'pageable'})"
+        )
     lines = [
         f"[bold]Layer streaming[/] [yellow]BETA[/] — arch [cyan]{plan.arch}[/], "
         f"tier [cyan]{plan.tier}[/]",
-        f"  base store   {plan.store_bytes / 1e9:.2f} GB across {plan.n_layers} layers "
-        f"({'pinned' if plan.pinned else 'pageable'})",
+        store_line,
         f"  VRAM buffers {plan.buffers} x {plan.layer_bytes / 1e6:.0f} MB "
         f"= {plan.buffer_bytes / 1e6:.0f} MB",
         f"  resident     {plan.embed_bytes / 1e6:.0f} MB embeddings + adapters",

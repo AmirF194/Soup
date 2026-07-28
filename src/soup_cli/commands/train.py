@@ -530,23 +530,13 @@ def train(
         console.print(f"[red]{markup_escape(str(exc))}[/]")
         raise typer.Exit(code=2) from exc
 
-    # --- v0.72.0 BETA — layer streaming does not support resume yet ---
-    # Silently ignoring a resume would restart from scratch and look like it
-    # worked, so refuse before any heavy work happens.
-    #
-    # v0.72.1: --hf-resume must be covered too. It sets resume_from through a
-    # different branch (see prepare_hf_resume below), so a guard on --resume
-    # alone let it through. That mattered more after the adapter-key fix: the
-    # pushed checkpoint now carries canonical keys while a live streamed model
-    # is still `.inner.`-shaped, so PEFT's strict=False load would match
-    # NOTHING and silently continue with a freshly initialised adapter.
-    if (resume or hf_resume) and cfg.training.stream_layers:
-        console.print(
-            "[red]--resume / --hf-resume are not supported with "
-            "training.stream_layers[/] — checkpoint/resume for layer streaming "
-            "lands in v0.72.3. Drop the flag, or set stream_layers: false."
-        )
-        raise typer.Exit(code=2)
+    # v0.72.3 — --resume / --hf-resume now work with layer streaming. v0.72.0-.2
+    # refused them because a streamed model's `named_parameters()` carry an
+    # `.inner.` segment that `load_state_dict` narrows away, so PEFT matched
+    # NOTHING and silently continued with a freshly initialised adapter (measured:
+    # 0 of 12 tensors, and a resumed loss curve byte-identical to a from-scratch
+    # one). `StreamedDecoderLayer` now redirects canonical keys at load time,
+    # mirroring the v0.72.1 save-side delegation.
 
     # --- RA-DIT generator-stage auto-link (v0.71.10 #200) ---
     # When a generator stage has no retriever model set, splice in the latest

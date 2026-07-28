@@ -1377,7 +1377,10 @@ class TestPreflightUsesTheStreamedSize:
     its bf16 files are 16 GB on disk. Unit-testing the arithmetic alone would
     not catch a regression that simply stops passing ``quant=`` through."""
 
-    def _run(self, tmp_path, monkeypatch, *, quantization, free_ram, on_disk):
+    def _run(
+        self, tmp_path, monkeypatch, *, quantization, free_ram, on_disk,
+        stream_source="auto", disk_kind="nvme",
+    ):
         from soup_cli.config.loader import load_config_from_string
         from soup_cli.trainer.sft import SFTTrainerWrapper
 
@@ -1394,6 +1397,12 @@ class TestPreflightUsesTheStreamedSize:
         monkeypatch.setattr(
             "soup_cli.utils.layer_shard.source_weight_bytes", lambda *_a, **_k: on_disk
         )
+        # Pinned, not probed: the real media type differs between the dev box
+        # (NVMe) and a CI runner (often "unknown"), and an environment-dependent
+        # tier decision would make these assertions flaky rather than wrong.
+        monkeypatch.setattr(
+            "soup_cli.utils.layer_stream.detect_disk_kind", lambda *_a, **_k: disk_kind
+        )
         cfg = load_config_from_string(
             f"""
 base: {weights}
@@ -1408,6 +1417,7 @@ training:
   gradient_accumulation_steps: 1
   quantization: {quantization}
   stream_layers: true
+  stream_source: {stream_source}
   lora:
     r: 4
     target_modules: [q_proj, v_proj]
@@ -1432,6 +1442,7 @@ training:
             quantization="4bit",
             free_ram=self.FREE_RAM,
             on_disk=self.ON_DISK,
+            stream_source="ram",
         )
         assert wrapper.model.is_loaded_in_4bit is True
 
@@ -1439,20 +1450,32 @@ training:
         self, tmp_path, monkeypatch
     ):
         """Without this control the test above proves nothing — a pre-flight
-        that never refuses anything would satisfy it."""
-        with pytest.raises(ValueError, match="fit in RAM"):
+        that never refuses anything would satisfy it.
+
+        Scoped to `stream_source: ram` from v0.72.3 on, because that is where
+        the early size probe is decisive: under the new `auto` default a base
+        too large for RAM becomes a tier decision rather than an error. The
+        property under test is unchanged — the probe applies `quant=`.
+        """
+        with pytest.raises(ValueError, match="stream_source='ram'"):
             self._run(
                 tmp_path,
                 monkeypatch,
                 quantization="none",
                 free_ram=self.FREE_RAM,
                 on_disk=self.ON_DISK,
+                stream_source="ram",
             )
 
     def test_nf4_still_refuses_when_even_quantised_it_will_not_fit(
         self, tmp_path, monkeypatch
     ):
-        """And the NF4 branch must not become a blanket bypass."""
+        """And the NF4 branch must not become a blanket bypass.
+
+        Asserted through `stream_source: ram`, because under v0.72.3's default
+        `auto` a base too large for RAM is a tier decision rather than an error.
+        The property being pinned is unchanged: the estimate is applied to the
+        NF4 size, it is not skipped."""
         with pytest.raises(ValueError, match="once quantised to NF4"):
             self._run(
                 tmp_path,
@@ -1460,6 +1483,7 @@ training:
                 quantization="4bit",
                 free_ram=self.FREE_RAM,
                 on_disk=self.ON_DISK * 20,
+                stream_source="ram",
             )
 
 

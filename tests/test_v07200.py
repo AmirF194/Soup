@@ -49,12 +49,18 @@ class TestStreamArchAllowlist:
         with pytest.raises(ValueError, match="llama"):
             stream_arch_of(_Cfg("gpt2"))
 
-    def test_mistral_is_rejected_in_v0720(self):
-        """Mistral is v0.72.3 breadth — it must not silently half-work."""
+    def test_multimodal_gemma3_is_rejected_while_gemma3_text_is_not(self):
+        """v0.72.3 added the Gemma family, but ``gemma3`` and ``gemma3_text`` are
+        NOT the same thing: a real ``google/gemma-3-*`` reports ``gemma3`` for its
+        vision-capable wrapper. Streaming that as a causal LM is exactly the
+        silent mis-train the allowlist exists to prevent, so the pair is pinned
+        together — the accepted half is the control that makes the refusal
+        meaningful rather than a spelling accident."""
         from soup_cli.utils.layer_stream import stream_arch_of
 
-        with pytest.raises(ValueError, match="mistral"):
-            stream_arch_of(_Cfg("mistral"))
+        assert stream_arch_of(_Cfg("gemma3_text")) == "gemma3_text"
+        with pytest.raises(ValueError, match="gemma3"):
+            stream_arch_of(_Cfg("gemma3"))
 
     def test_missing_model_type_raises(self):
         from soup_cli.utils.layer_stream import stream_arch_of
@@ -233,13 +239,18 @@ class TestVramEstimate:
         three = estimate_stream_vram(layer_bytes=100, buffers=3, embed_bytes=0, workspace_bytes=0)
         assert three - two == 100
 
-    def test_logits_budget_includes_the_fp32_upcast(self):
-        """plan P5: logits, not weights, OOM you first on a small card."""
+    def test_logits_budget_includes_the_whole_loss_path(self):
+        """plan P5: logits, not weights, OOM you first on a small card.
+
+        v0.72.0 charged 2 + 4 here (bf16 logits + fp32 upcast) from first
+        principles. v0.72.3 GATE 2 measured the real peak: 14 bytes per element,
+        because ``ForCausalLMLoss`` also holds log-softmax's fp32 output and the
+        fp32 gradient live at the same time. The old figure under-predicted this
+        term by 2.33x — ~5 GB on a 152k-vocab model at batch 8."""
         from soup_cli.utils.layer_stream import estimate_logits_bytes
 
-        # vocab 151936, seq 512, batch 1: bf16 155.6 MB + fp32 upcast 311.2 MB
         got = estimate_logits_bytes(vocab_size=151936, seq_len=512, batch_size=1)
-        assert got == 512 * 151936 * 2 + 512 * 151936 * 4
+        assert got == 512 * 151936 * 14
 
     def test_logits_budget_without_upcast(self):
         from soup_cli.utils.layer_stream import estimate_logits_bytes
@@ -786,23 +797,36 @@ class TestStreamScopeGates:
         with pytest.raises(ValueError, match="stream_layers"):
             _load(_stream_yaml(training={"quantization": "8bit"}))
 
-    def test_disk_source_rejected_and_names_breadth_slot(self):
-        with pytest.raises(ValueError, match="v0.72.3"):
-            _load(_stream_yaml(training={"stream_source": "disk"}))
+    def test_disk_source_accepted_in_v0723(self):
+        """The disk overflow tier shipped in v0.72.3. It stays NVMe-only —
+        `choose_tier` refuses spinning disks (plan P11) — but that is a runtime
+        decision about the machine, not a schema refusal about the config."""
+        cfg = _load(_stream_yaml(training={"stream_source": "disk"}))
+        assert cfg.training.stream_source == "disk"
 
-    def test_batch_size_above_one_rejected(self):
-        with pytest.raises(ValueError, match="batch_size"):
-            _load(_stream_yaml(training={"batch_size": 2}))
+    def test_batch_size_above_one_accepted_in_v0723(self):
+        """Lifted in v0.72.3. Bigger batches are where streaming pays off — one
+        weight read amortised over more tokens — and the v0.72.2 refusal already
+        named this slot, so leaving it would have shipped a lie."""
+        assert _load(_stream_yaml(training={"batch_size": 4})).training.batch_size == 4
 
     def test_auto_batch_size_rejected(self):
+        """Still refused, and for a reason that does not expire: "auto" sizes a
+        RESIDENT model by OOM-probing it, and a streaming run never loads one."""
         with pytest.raises(ValueError, match="batch_size"):
             _load(_stream_yaml(training={"batch_size": "auto"}))
 
-    def test_gradient_accumulation_rejected(self):
-        """plan P9: accumulation multiplies IO linearly — every micro-batch
-        re-reads the whole model."""
-        with pytest.raises(ValueError, match="gradient_accumulation_steps"):
-            _load(_stream_yaml(training={"gradient_accumulation_steps": 4}))
+    def test_gradient_accumulation_accepted_in_v0723(self):
+        """Lifted in v0.72.3, and plan P9's premise turned out to be half wrong.
+        Accumulation does re-read the base per micro-batch, but it also processes
+        that many more tokens, so layer reads per 1k tokens are UNCHANGED
+        (measured constant at 175.78 across accum 1/2/4). The real cost is
+        opportunity cost against raising batch_size — 2.52x at matched effective
+        batch — which is advice for the pre-flight, not grounds for a refusal:
+        accumulation is the only way to raise effective batch once VRAM is
+        spent."""
+        cfg = _load(_stream_yaml(training={"gradient_accumulation_steps": 4}))
+        assert cfg.training.gradient_accumulation_steps == 4
 
     def test_lora_disabled_is_a_no_op_and_rejected(self):
         """Streaming a frozen base with nothing trainable trains nothing."""
@@ -1613,11 +1637,14 @@ class TestStreamingSetupIntegration:
         assert torch  # keep the import meaningful
 
 
-class TestStreamingResumeRefused:
-    """Scope freeze: no resume in v0.72.0. A silently-ignored --resume would
-    restart training from scratch and look like it worked."""
+class TestStreamingResumeAccepted:
+    """v0.72.0-.2 refused --resume: a streamed model's named_parameters() carry
+    an `.inner.` segment that load_state_dict narrows away, so a canonical
+    checkpoint matched NOTHING and training silently continued from scratch.
+    v0.72.3 redirects canonical keys at load time; the refusal is gone and the
+    round-trip is pinned in test_v07203.py."""
 
-    def test_train_refuses_resume_with_streaming(self, tmp_path, monkeypatch):
+    def test_train_accepts_resume_with_streaming(self, tmp_path, monkeypatch):
         import json as _json
 
         import yaml
@@ -1652,9 +1679,8 @@ class TestStreamingResumeRefused:
         result = CliRunner().invoke(
             app, ["train", "--config", "soup.yaml", "--resume", "latest", "--yes"]
         )
-        assert result.exit_code != 0, result.output
-        lowered = result.output.lower()
-        assert "resume" in lowered and "stream" in lowered, result.output
+        assert "are not supported with" not in result.output, result.output
+        assert "lands in v0.72.3" not in result.output, result.output
 
 
 class TestRegressionTrainerConstructsWithoutMovingMetaWeights:

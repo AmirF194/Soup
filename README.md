@@ -49,31 +49,34 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.72.2 — NF4 layer streaming: fine-tune Llama-3.1-8B on a 4 GB laptop GPU.** Layer
-streaming keeps the frozen base in CPU RAM and feeds it to the GPU one decoder layer at a time.
-Quantising that base to NF4 shrinks it ~4×, which is what puts an 8B model within reach of a
-card that cannot hold even a quarter of it.
+**v0.72.3 — layer streaming grows up: more models, bigger batches, resume, and a disk
+tier.** Layer streaming keeps the frozen base out of VRAM and feeds it to the GPU one
+decoder layer at a time. v0.72.0–.2 kept the scope deliberately tiny to prove it worked;
+this release removes the training wheels.
 
-- **Measured on a 4 GB RTX 3050 Laptop** (batch 1, S=512, gradient checkpointing, 50 steps
-  after 10 warm-up): **Llama-3.1-8B-Instruct at 119.6 tok/s, peak VRAM 3.32 GB**, base
-  page-locked at 3.60 GB, GPU 100% busy. Qwen2.5-3B: 264.2 tok/s, 1.76 GB.
-- **Just add `quantization: 4bit`** to a streaming config. The base is quantised once, offline,
-  and cached; the cache re-shards by itself if the checkpoint changes underneath it.
-- **Correctness is not traded away.** A streamed NF4 run is **bit-exact** against a resident
-  NF4 run — same quantised bytes, same bitsandbytes kernels — and that is a CI test, not a
-  one-off measurement.
-- **Why 3B got 1.85× faster too** (264.2 vs 143.1 tok/s in bf16): not arithmetic. A 1.43 GB
-  store page-locks where a 5.55 GB one did not, which restores asynchronous copies and takes
-  GPU utilisation from 79.3% to 100%.
-- Still BETA, and the scope is unchanged: RAM tier, `task: sft`, Llama/Qwen, batch size 1, no
-  gradient accumulation, no `--resume`. Every refusal names the release that lifts it.
+- **Six more model families** — Mistral, Gemma / Gemma 2 / Gemma 3, and Phi / Phi-3 — each
+  verified **bit-exact** against the same checkpoint loaded resident, in bf16 *and* NF4.
+- **`batch_size` above 1, gradient accumulation, and `--resume`** all work now.
+- **A pre-flight that predicts peak VRAM and refuses a run that will not fit.** Streaming
+  bounds the *weights*; the logits tensor is not bounded by it and scales with
+  `batch × seq`. On a 152k-vocab model at batch 8 that single tensor measured **8.71 GB —
+  146× the entire layer-buffer pool.** The prediction was fitted to ten real runs and
+  never under-predicts any of them.
+- **A throughput forecast measured on your card, in your session**, quoted as a range
+  next to the SM clock it was taken at — not a number compiled into the source.
+- **A disk overflow tier.** When the base will not fit in RAM, `stream_source: auto`
+  streams it from NVMe instead of refusing. Honest caveat: its *correctness* is verified
+  bit-exact against the RAM tier, but **how much slower it is has not been measured** on
+  the development hardware, and no figure is claimed.
+- Still BETA.
 
 ```yaml
 # soup.yaml — then just `soup train --config soup.yaml`
 training:
-  stream_layers: true      # base streams from RAM; only the adapter trains
+  stream_layers: true      # base streams out of VRAM; only the adapter trains
   quantization: 4bit       # NF4 — ~4x smaller store, so 8B fits a 4 GB card
-  batch_size: 1
+  batch_size: 4            # v0.72.3: bigger batches amortise the weight read
+  stream_source: auto      # RAM when it fits, NVMe disk when it does not
 ```
 
 > **Trained with `stream_layers: true` on v0.72.0?** That adapter is inert — its tensors were

@@ -297,28 +297,32 @@ class TestLoadingIntoAStreamedModelStaysUnsupported:
         """Fix A is serialisation-only, by design.
 
         In memory the wrapper is still a real module, so ``named_parameters()``
-        and ``state_dict()`` disagree. That is why loading INTO a streamed model
-        (i.e. ``--resume``) stays refused; this documents the asymmetry instead
-        of leaving it to be discovered.
+        and ``state_dict()`` disagree. v0.72.1 handled that by refusing to load
+        INTO a streamed model at all; v0.72.3 instead redirects canonical keys at
+        load time, which closes ``--resume`` while leaving this asymmetry — and
+        therefore v0.72.0's bit-exactness gates — untouched.
         """
         model, _, _ = _build_streamed_cpu(tmp_path)
         live = [n for n, _ in model.named_parameters() if "lora_" in n]
         assert live
         assert any(".inner." in n for n in live)
 
-    def test_hf_resume_with_streaming_exits_before_training(self, tmp_path, monkeypatch):
-        """--hf-resume takes a DIFFERENT branch to resume_from.
+    def test_hf_resume_with_streaming_is_no_longer_refused(self, tmp_path, monkeypatch):
+        """v0.72.1 refused BOTH resume flags; v0.72.3 lifts both.
 
-        A guard on ``--resume`` alone let ``--hf-resume`` through. Before the
-        adapter-key fix that combination happened to work (checkpoint and live
-        model were both ``.inner.``-shaped, so the keys matched by accident);
-        after it, the pushed checkpoint is canonical while the live streamed
-        model is not, so PEFT's ``strict=False`` load matches nothing and
-        training silently continues with a freshly initialised adapter. The
-        guard has to cover both flags or the fix makes that path worse.
+        The refusal existed because a streamed model's ``named_parameters()``
+        carry an ``.inner.`` segment that ``load_state_dict`` narrows away, so a
+        canonical checkpoint matched NOTHING and training silently continued
+        with a freshly initialised adapter (measured: 0 of 12 tensors, and a
+        resumed loss curve byte-identical to a from-scratch one).
+        ``StreamedDecoderLayer`` now redirects canonical keys at load time,
+        mirroring the save-side delegation this release added.
 
-        Asserted behaviourally — a source grep would break on a harmless
-        refactor and pass on a guard that had been moved into dead code.
+        Kept as the ``--hf-resume`` case specifically, because that flag reaches
+        ``resume_from`` through a different branch and was the one a guard on
+        ``--resume`` alone let slip through. Asserted behaviourally — a source
+        grep would break on a harmless refactor and pass on a guard moved into
+        dead code.
         """
         from typer.testing import CliRunner
 
@@ -345,9 +349,8 @@ class TestLoadingIntoAStreamedModelStaysUnsupported:
             ["train", "--config", str(config), "--yes",
              "--push-as", "someone/somewhere", "--hf-resume"],
         )
-        assert result.exit_code == 2, (result.output, repr(result.exception))
-        assert "--hf-resume" in result.output
-        assert "v0.72.3" in result.output, "the refusal must name the slot that lifts it"
+        assert "are not supported with" not in result.output, result.output
+        assert "lands in v0.72.3" not in result.output, result.output
 
 
 # --------------------------------------------------------------------------
@@ -472,22 +475,20 @@ def _stream_yaml(**training):
 
 
 class TestRefusalsNameThePostRenumberSlot:
-    @pytest.mark.parametrize(
-        "field,value,slot",
-        [
-            # NF4 ("quantization", "4bit") was here and named v0.72.2 — that
-            # slot shipped, so the refusal is gone. See test_v07202.py.
-            ("stream_source", "disk", "v0.72.3"),        # disk tier
-            ("batch_size", "2", "v0.72.3"),              # larger batches
-            ("gradient_accumulation_steps", "4", "v0.72.3"),
-        ],
-    )
-    def test_gate_names_the_right_release(self, field, value, slot):
+    def test_shipped_slots_no_longer_refuse(self):
+        """Refusals are deleted as their slot ships, so this shrinks rather than
+        grows. NF4 went in v0.72.2; larger batches, gradient accumulation,
+        resume, the architecture allowlist and the disk tier all went in
+        v0.72.3. What remains is the pair that has NOT shipped, below."""
         from soup_cli.config.loader import load_config_from_string
 
-        yaml_text = _stream_yaml(**{field: value})
-        with pytest.raises(ValueError, match=slot):
-            load_config_from_string(yaml_text)
+        for field, value in (
+            ("stream_source", "disk"),
+            ("batch_size", "2"),
+            ("gradient_accumulation_steps", "4"),
+            ("quantization", "4bit"),
+        ):
+            load_config_from_string(_stream_yaml(**{field: value}))
 
     def test_preference_losses_name_v0724(self):
         from soup_cli.config.loader import load_config_from_string

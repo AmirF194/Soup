@@ -288,6 +288,88 @@ class RamSource:
         return self.store[idx][name]
 
 
+class DiskSource:
+    """Tier 2 — the base stays on disk and each layer is read on demand.
+
+    Same interface as :class:`RamSource` (``get(idx, name)`` + ``nbytes``), so
+    the buffer pool, the prefetcher and the layer wrapper are untouched: the
+    only thing that changes is where the bytes come from. That is what lets the
+    disk tier inherit v0.72.0's correctness gates rather than needing new ones
+    for the scheduler.
+
+    Handles are opened ONCE and held. safetensors memory-maps them, so the
+    operating system's page cache — not this class — decides what stays
+    resident. Two honest consequences:
+
+    * On a machine with spare RAM the "disk" tier is partly a RAM tier, because
+      the pages survive between steps. That makes a like-for-like RAM-vs-disk
+      comparison hard to construct, and it is why this release publishes the
+      code path but no gap measurement (see the v0.72.3 gate notes).
+    * ``nbytes`` is 0: nothing is deliberately held resident. The on-disk size
+      is reported separately so the pre-flight can still show the operator what
+      the model costs.
+
+    NVMe only — ``choose_tier`` refuses spinning disks, where each step costs
+    two seeks per layer (plan P11) and the run thrashes rather than merely
+    running slower.
+    """
+
+    def __init__(
+        self,
+        shard_dir: str,
+        n_layers: int,
+        spec: Mapping[str, Tuple[Tuple[int, ...], str]],
+    ):
+        import contextlib
+
+        from safetensors import safe_open
+
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        self._stack = contextlib.ExitStack()
+        # ExitStack, not a comprehension of __enter__(): if shard N fails to
+        # open, everything opened before it must still be closed.
+        try:
+            self._handles = [
+                self._stack.enter_context(
+                    safe_open(layer_shard_path(shard_dir, idx), framework="pt")
+                )
+                for idx in range(n_layers)
+            ]
+        except BaseException:
+            self._stack.close()
+            raise
+        self.nbytes = 0  # nothing is held resident by design
+        self.disk_bytes = sum(
+            math.prod(shape) * _dtype_size(dtype) for shape, dtype in spec.values()
+        ) * n_layers
+        self.pinned = False
+
+    def get(self, idx: int, name: str):
+        return self._handles[idx].get_tensor(name)
+
+    def close(self) -> None:
+        """Release every shard handle. Idempotent — ``ExitStack.close`` is."""
+        self._stack.close()
+        self._handles = []
+
+    def __del__(self) -> None:
+        # Backstop only. The trainer closes the runtime explicitly; this exists
+        # so a caller that drops the source without doing so still releases one
+        # file handle per decoder layer (80+ on a large model) rather than
+        # holding them until the process exits.
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 — never raise from a finaliser
+            pass
+
+
+def _dtype_size(name: str) -> int:
+    from soup_cli.utils.layer_stream import dtype_bytes
+
+    return dtype_bytes(name)
+
+
 def extras_resident_bytes(shard_dir: str) -> int:
     """Bytes the non-layer weights occupy on the GPU (embeddings, final norm,
     an untied head). Read from the extras header — no tensor is materialised.
@@ -466,6 +548,61 @@ def _build_streamed_layer_class():
             self.use_checkpoint = bool(use_checkpoint)
             self.quant_specs = dict(quant_specs or {})
             self.codes = dict(codes or {})
+            # v0.72.3 — the mirror of the state_dict() override below.
+            self._register_load_state_dict_pre_hook(self._redirect_canonical_keys)
+
+        def _redirect_canonical_keys(
+            self, state_dict, prefix, *_args: Any, **_kwargs: Any
+        ) -> None:
+            # v0.72.1 made SAVING canonical; this makes LOADING accept the same
+            # keys, which is what `--resume` needs.
+            #
+            # ``nn.Module.load_state_dict`` narrows the dict by CHILD NAME as it
+            # descends: at this wrapper it keeps only keys under `<prefix>`, then
+            # recurses into each child with `<prefix><child>.`. Our sole child is
+            # `inner`, so a canonical `...layers.0.self_attn...` key matches no
+            # child prefix and is silently dropped. Measured before this hook:
+            # `load_adapter` landed **0 of 12** tensors, PEFT emitted only a
+            # UserWarning, and the resumed loss curve was byte-identical to a
+            # from-scratch one.
+            #
+            # This pre-hook runs at the START of our own `_load_from_state_dict`
+            # and may mutate `state_dict` in place; the child loop reads that
+            # same object afterwards, so the redirected copies are visible when
+            # torch descends into `inner`. Nothing is deleted (the originals
+            # match no child and are inert) and nothing is double-added.
+            #
+            # Deliberately load-side only. It redirects keys rather than
+            # re-parenting the module tree, so the forward path is untouched and
+            # v0.72.0's bit-exactness gates remain valid without being re-run.
+            #
+            # The original key is MOVED, not copied. Leaving it behind makes
+            # this wrapper's own strict scan flag it `unexpected` — `self_attn`
+            # is not one of our children, only `inner` is — so a caller passing
+            # ``strict=True`` would get "Unexpected key(s)" on a load that in
+            # fact succeeded. (PEFT always loads with ``strict=False`` and never
+            # inspects the list, so this was inert in practice; it is still a
+            # landmine for any direct caller.) Moving is safe: torch rebuilds a
+            # fresh filtered dict at every recursion level, so the dict mutated
+            # here is an intermediate one, never the caller's own.
+            inner_prefix = prefix + "inner."
+            for key in [
+                k
+                for k in state_dict
+                if k.startswith(prefix) and not k.startswith(inner_prefix)
+            ]:
+                redirected = inner_prefix + key[len(prefix):]
+                value = state_dict.pop(key)
+                if redirected in state_dict:
+                    # A checkpoint carrying BOTH spellings of one weight is
+                    # malformed, and silently keeping one would load a tensor
+                    # the file does not unambiguously specify.
+                    raise ValueError(
+                        f"checkpoint contains both {key!r} and {redirected!r} "
+                        f"for the same weight — it is malformed; re-save the "
+                        f"adapter"
+                    )
+                state_dict[redirected] = value
 
         def _apply(self, fn: Any, recurse: bool = True) -> Any:
             # `.to(device)` / `.to(dtype)` walk the module tree via _apply. The
@@ -606,6 +743,110 @@ StreamedDecoderLayer = _StreamedDecoderLayerProxy()
 # ==========================================================================
 # allocator
 # ==========================================================================
+@dataclass(frozen=True)
+class GemmCeiling:
+    """A dense bf16 GEMM rate measured on THIS card, in THIS session."""
+
+    tflops: float
+    sm_clock_mhz: Optional[int]
+    size: int
+
+
+def sm_clock_mhz() -> Optional[int]:
+    """Current SM clock, or None when it cannot be read.
+
+    Quoted next to every throughput number: a fraction-of-ceiling without a
+    stated clock is meaningless, and this box's boost clock moved 442..952 MHz
+    inside one measurement run.
+    """
+    import subprocess
+
+    from soup_cli.utils.layer_stream import _resolve_tool
+
+    # Absolute path, never the bare name: on Windows CreateProcess searches the
+    # CURRENT DIRECTORY before PATH, so a planted nvidia-smi.exe in a cloned
+    # project would run instead of the real one (CWE-427).
+    tool = _resolve_tool("nvidia-smi")
+    if tool is None:
+        return None
+    try:
+        out = subprocess.run(
+            [tool, "--query-gpu=clocks.sm", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        return int(out.stdout.strip().splitlines()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+#: 4096^3 per matmul (~137 GFLOP, ~20 ms here) and best-of-3. Both were measured,
+#: not chosen for tidiness: at 2048 the same probe spread **38%** across five
+#: repeats and ramped monotonically upward (3.19 -> 4.41 TFLOPS) because the
+#: sample is too short for the boost clock to engage; at 4096 the spread fell to
+#: 9%. Taking the BEST repeat is not cherry-picking — a ceiling's noise is
+#: one-sided, since contention, a cold clock and thermal throttling can only ever
+#: make an achievable rate look slower than it is.
+_GEMM_SIZE = 4096
+_GEMM_REPS = 3
+_GEMM_ITERS = 8
+
+
+def measure_gemm_tflops(
+    device: str = "cuda",
+    *,
+    size: int = _GEMM_SIZE,
+    iters: int = _GEMM_ITERS,
+    reps: int = _GEMM_REPS,
+) -> Optional[GemmCeiling]:
+    """Benchmark a dense bf16 matmul to get this card's achievable rate.
+
+    Returns None off CUDA rather than inventing a number — the forecast rests
+    entirely on a measurement, so there is nothing honest to return when no
+    measurement is possible. A per-card constant compiled into the source would
+    be a fabrication: this box alone produced 3.5 and 6.75 TFLOPS in two sessions
+    at the same *reported* clock, which is precisely why the number is taken now
+    and quoted as a bound rather than a promise.
+
+    Costs ~0.7 s and ~100 MB, once, before the model is built.
+    """
+    if not str(device).startswith("cuda"):
+        return None
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a [train] extra
+        return None
+    if not torch.cuda.is_available():
+        return None
+    best = 0.0
+    try:
+        left = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+        right = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+        for _ in range(max(1, reps)):
+            for _ in range(3):  # warm up: the first matmul pays kernel selection
+                left @ right
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                left @ right
+            end.record()
+            torch.cuda.synchronize()
+            seconds = start.elapsed_time(end) / 1000.0
+            if seconds > 0:
+                best = max(best, 2.0 * (size**3) * iters / seconds / 1e12)
+        del left, right
+        torch.cuda.empty_cache()
+    except (RuntimeError, torch.cuda.OutOfMemoryError):
+        return None
+    if best <= 0:
+        return None
+    return GemmCeiling(tflops=best, sm_clock_mhz=sm_clock_mhz(), size=size)
+
+
 def probe_expandable_segments() -> bool:
     """Attempt ``expandable_segments:True`` (plan P7) and report whether it took.
 
@@ -866,9 +1107,25 @@ class StreamRuntime:
     pinned: bool
     device: str
     hook: Any = None
+    #: "ram" or "disk" — which weight source is feeding the buffer pool.
+    tier: str = "ram"
     #: True source parameter count, from the shard index. PEFT's own total
     #: is ~6.5x too high for a streamed NF4 model (see trainer/sft.py).
     total_params: int = 0
+
+    def close(self) -> None:
+        """Release the weight source and detach the prefetch hook.
+
+        The disk tier holds one open shard handle per decoder layer, so a run
+        that finishes without closing leaks 80+ descriptors on a large model.
+        A no-op for the RAM tier, which owns no handles.
+        """
+        source_close = getattr(self.source, "close", None)
+        if callable(source_close):
+            source_close()
+        if self.hook is not None:
+            self.hook.remove()
+            self.hook = None
 
     def stats(self) -> Dict[str, Any]:
         return {
@@ -877,6 +1134,8 @@ class StreamRuntime:
             "buffer_bytes": self.pool.nbytes,
             "store_bytes": self.source.nbytes,
             "pinned": self.pinned,
+            "tier": self.tier,
+            "disk_bytes": getattr(self.source, "disk_bytes", 0),
             "layer_loads": self.pool.loads,
             "device": self.device,
             "total_params": self.total_params,
@@ -922,6 +1181,7 @@ def install_streaming(
     device: str = "cuda",
     console: Any = None,
     codes: Optional[Mapping[str, Any]] = None,
+    tier: str = "ram",
 ) -> StreamRuntime:
     """Wrap every decoder layer and wire the buffer pool + prefetch scheduler."""
     import torch
@@ -976,7 +1236,7 @@ def install_streaming(
             validate_quant_shape(ckpt, spec_q, shard_spec)
     spec = needed
 
-    source, pinned = _build_source(shard_dir, n_layers, spec, pin, console)
+    source, pinned = _build_source(shard_dir, n_layers, spec, pin, console, tier)
     pool = LayerBufferPool(spec, n_buffers=buffers, device=device)
     stream = torch.cuda.Stream() if str(device).startswith("cuda") else None
     prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
@@ -1011,16 +1271,20 @@ def install_streaming(
         device=str(device),
         hook=handle,
         total_params=int(getattr(index, "total_params", 0) or 0),
+        tier=tier,
     )
 
 
-def _build_source(shard_dir, n_layers, spec, pin, console):
-    """Build the RAM store, falling back to pageable and SAYING SO.
+def _build_source(shard_dir, n_layers, spec, pin, console, tier="ram"):
+    """Build the weight source for the chosen tier.
 
-    Page-locking is bounded by the box, not by free RAM: the dev box topped out
-    at 7.12 GB with 9.1 GB "available". Falling back is correct; hiding the
-    ~97% -> ~79% GPU-utilisation cost is not.
+    On the RAM tier, page-locking is bounded by the box rather than by free RAM
+    (the dev box topped out at 7.12 GB with 9.1 GB "available"). Falling back to
+    a pageable store is correct; hiding the ~97% -> ~79% GPU-utilisation cost is
+    not, so the fallback says so out loud.
     """
+    if tier == "disk":
+        return DiskSource(shard_dir, n_layers, spec), False
     if not pin:
         return RamSource(shard_dir, n_layers, spec, pin=False), False
     try:
@@ -1055,6 +1319,7 @@ def build_streamed_model(
     console: Any = None,
     quant: str = "none",
     double_quant: bool = True,
+    tier: str = "ram",
 ) -> Tuple[Any, StreamRuntime]:
     """Meta skeleton -> extras -> LoRA -> streaming. No resident base load."""
     from peft import get_peft_model
@@ -1080,5 +1345,6 @@ def build_streamed_model(
         device=device,
         console=console,
         codes=extras.codes,
+        tier=tier,
     )
     return model, runtime

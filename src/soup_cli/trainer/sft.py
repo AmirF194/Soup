@@ -974,6 +974,8 @@ class SFTTrainerWrapper:
         decoder layer from CPU RAM into a small pool of pre-allocated VRAM
         buffers. Peak VRAM becomes the size of ONE layer instead of the model.
         """
+        from dataclasses import replace
+
         from peft import LoraConfig, TaskType
         from transformers import AutoConfig, AutoTokenizer
 
@@ -986,8 +988,10 @@ class SFTTrainerWrapper:
         )
         from soup_cli.utils.layer_stream import (
             RAM_TIER_HEADROOM,
+            TIER_DISK,
             TIER_RAM,
             build_stream_plan,
+            detect_disk_kind,
             dtype_bytes,
             estimate_stream_store_bytes,
             free_ram_bytes,
@@ -1041,18 +1045,21 @@ class SFTTrainerWrapper:
             store_estimate = estimate_stream_store_bytes(
                 source_bytes, dtype=dtype, quant=quant
             )
-            if store_estimate >= early_free_ram * RAM_TIER_HEADROOM:
+            if (
+                store_estimate >= early_free_ram * RAM_TIER_HEADROOM
+                and tcfg.stream_source == "ram"
+            ):
                 as_streamed = (
                     ""
                     if quant == QUANT_NONE
                     else f" ({store_estimate / 1e9:.1f} GB once quantised to NF4)"
                 )
                 raise ValueError(
-                    f"layer streaming needs the base to fit in RAM: {cfg.base} is "
+                    f"training.stream_source='ram' but {cfg.base} is "
                     f"{source_bytes / 1e9:.1f} GB on disk{as_streamed} and only "
-                    f"{early_free_ram / 1e9:.1f} GB of RAM is free. The disk "
-                    f"overflow tier lands in v0.72.3 — free RAM or pick a "
-                    f"smaller base."
+                    f"{early_free_ram / 1e9:.1f} GB of RAM is free. Set "
+                    f"stream_source='auto' to fall back to the NVMe disk tier, "
+                    f"free RAM, or pick a smaller base."
                 )
 
         # The authoritative list of weights to quantise is whatever
@@ -1105,6 +1112,18 @@ class SFTTrainerWrapper:
             )
             free_ram = (layer_bytes * index.n_layers + embed_bytes) * 10
 
+        store_total = layer_bytes * index.n_layers + embed_bytes
+        # Checked BEFORE build_stream_plan so a `ram`-only run is refused with
+        # the message about stream_source rather than choose_tier's generic
+        # "needs NVMe or more RAM" — and without paying the ~9 s disk probe for
+        # an answer that cannot change the outcome.
+        if tcfg.stream_source == "ram" and store_total >= free_ram * RAM_TIER_HEADROOM:
+            raise ValueError(
+                f"training.stream_source='ram' but the base is "
+                f"{store_total / 1e9:.1f} GB and only {free_ram / 1e9:.1f} GB of "
+                f"RAM is free. Set stream_source='auto' to fall back to the NVMe "
+                f"disk tier, free RAM, or pick a smaller base."
+            )
         plan = build_stream_plan(
             arch=arch,
             n_layers=index.n_layers,
@@ -1116,16 +1135,51 @@ class SFTTrainerWrapper:
             # fall back loudly (see layer_stream_runtime._build_source).
             pinned_limit_bytes=None,
             buffers=tcfg.stream_buffers,
-            disk_kind="nvme",
+            # v0.72.3: the REAL media type, not a constant. Passed as a callable
+            # because probing costs ~9 s on Windows and the answer only matters
+            # when the base does not fit in RAM.
+            disk_kind=lambda: detect_disk_kind(shard_dir),
         )
-        if plan.tier != TIER_RAM:
-            raise ValueError(
-                f"layer streaming needs the base to fit in RAM: it is "
-                f"{(layer_bytes * index.n_layers + embed_bytes) / 1e9:.1f} GB and only "
-                f"{free_ram / 1e9:.1f} GB is free. The disk overflow tier lands "
-                f"in v0.72.3 — free RAM or pick a smaller base."
+        # v0.72.3 — the disk overflow tier is live, so a base that does not fit
+        # in RAM is no longer fatal. `stream_source` decides: 'ram' insists,
+        # 'disk' forces, 'auto' (the default) takes RAM when it fits and falls
+        # back to disk when it does not. build_stream_plan already refused a
+        # non-NVMe disk, so reaching here with tier='disk' means NVMe.
+        tier = TIER_DISK if tcfg.stream_source == "disk" else plan.tier
+        if tier != plan.tier:
+            # The panel is rendered from `plan`, so a forced tier has to be
+            # reflected there or the pre-flight reports "tier ram" immediately
+            # before the runtime announces it is streaming from disk. Every
+            # field that describes the RAM store is corrected with it, so no
+            # consumer can read a stale value.
+            plan = replace(
+                plan,
+                tier=tier,
+                store_bytes=0,
+                pinned=False,
+                notes=plan.notes
+                + (
+                    "streaming from disk because stream_source='disk' was set, "
+                    "not because RAM was short. Nothing is held resident, and "
+                    "the slowdown versus the RAM tier is unmeasured on this "
+                    "hardware.",
+                ),
             )
-        console.print(render_stream_panel(plan))
+        # v0.72.3 — VRAM pre-flight. Streaming bounds the WEIGHTS; activations
+        # and the logits tensor are untouched by it and both scale with batch x
+        # seq. On a large-vocab model the logits term alone dwarfs the buffer
+        # pool (measured: 146x at batch 8), so a plan that reports only tier and
+        # buffer sizes will happily green-light a config that cannot run.
+        forecast_lines = self._stream_budget_lines(
+            cfg,
+            tcfg,
+            model_config=model_config,
+            layer_bytes=layer_bytes,
+            embed_bytes=embed_bytes,
+            index=index,
+            on_cuda=on_cuda,
+        )
+        console.print(render_stream_panel(plan, forecast_lines))
         console.print(
             "[yellow]Layer streaming is BETA:[/] slower than resident training, "
             "but this model may not run resident on this card at all."
@@ -1163,17 +1217,146 @@ class SFTTrainerWrapper:
             trust_remote_code=self._trust_remote_code,
             console=console,
             quant=quant,
+            tier=tier,
         )
         self.model = model
         self._stream_runtime = runtime
         stats = runtime.stats()
+        if stats["tier"] == TIER_RAM:
+            source_line = (
+                f"{stats['store_bytes'] / 1e9:.2f} GB "
+                f"{'pinned' if stats['pinned'] else 'pageable'} RAM store"
+            )
+        else:
+            source_line = (
+                f"streamed from DISK ({stats['disk_bytes'] / 1e9:.2f} GB on an "
+                f"NVMe volume, nothing held resident)"
+            )
+        buffer_line = (
+            f"{stats['buffers']} x "
+            f"{stats['buffer_bytes'] / stats['buffers'] / 1e6:.0f} MB VRAM buffers"
+        )
         console.print(
             f"[green]Layer streaming ready:[/] {stats['n_layers']} layers, "
-            f"{stats['store_bytes'] / 1e9:.2f} GB "
-            f"{'pinned' if stats['pinned'] else 'pageable'} RAM store, "
-            f"{stats['buffers']} x {stats['buffer_bytes'] / stats['buffers'] / 1e6:.0f} MB "
-            f"VRAM buffers"
+            f"{source_line}, {buffer_line}"
         )
+
+    def _close_stream_runtime(self) -> None:
+        """Release the streaming weight source, if this run had one."""
+        runtime = getattr(self, "_stream_runtime", None)
+        if runtime is not None:
+            runtime.close()
+
+    def _estimate_adapter_params(self, tcfg, model_config) -> int:
+        """Trainable adapter parameters, before the model exists.
+
+        Deliberately coarse and biased HIGH: it assumes every targeted module is
+        hidden x hidden. Gate/up/down projections are larger, but the whole
+        adapter term is ~0.5% of a streaming step's peak, so precision here buys
+        nothing while under-counting would eat into the safety margin.
+        """
+        hidden = int(getattr(model_config, "hidden_size", 0) or 0)
+        layers = int(getattr(model_config, "num_hidden_layers", 0) or 0)
+        targets = tcfg.lora.target_modules
+        n_targets = len(targets) if isinstance(targets, (list, tuple)) else 4
+        return layers * n_targets * 2 * tcfg.lora.r * hidden
+
+    def _stream_budget_lines(
+        self, cfg, tcfg, *, model_config, layer_bytes, embed_bytes, index, on_cuda
+    ):
+        """Predict peak VRAM + bracket throughput, and REFUSE a run that cannot fit.
+
+        Returns the extra lines for the pre-flight panel. Raises when the step is
+        predicted not to fit: on Linux that would be a hard OOM, and on Windows
+        something worse — WDDM spills to host memory without raising, so the run
+        silently becomes an order of magnitude slower and looks like the feature
+        is merely slow.
+        """
+        from soup_cli.utils.layer_stream import (
+            accumulation_advice,
+            decide_stream_fit,
+            estimate_logits_bytes,
+            estimate_stream_peak_vram,
+            forecast_stream_throughput,
+        )
+        from soup_cli.utils.layer_stream_runtime import measure_gemm_tflops
+
+        vocab = int(getattr(model_config, "vocab_size", 0) or 0)
+        hidden = int(getattr(model_config, "hidden_size", 0) or 0)
+        inter = int(getattr(model_config, "intermediate_size", 0) or 0)
+        seq_len = int(cfg.data.max_length)
+        batch = tcfg.batch_size if isinstance(tcfg.batch_size, int) else 1
+        if not (vocab and hidden and inter):
+            # Never silently: skipping the budget also skips the refusal that
+            # stops a run from OOMing (or, on Windows, spilling to host memory
+            # and running an order of magnitude slower with no error at all).
+            console.print(
+                "[yellow]Layer streaming could not read vocab_size / hidden_size "
+                "/ intermediate_size from the model config, so peak VRAM cannot "
+                "be predicted — the pre-flight fit check is SKIPPED for this "
+                "run.[/]"
+            )
+            return ()
+
+        predicted = estimate_stream_peak_vram(
+            layer_bytes=layer_bytes,
+            buffers=tcfg.stream_buffers,
+            extras_bytes=embed_bytes,
+            adapter_params=self._estimate_adapter_params(tcfg, model_config),
+            vocab_size=vocab,
+            hidden_size=hidden,
+            intermediate_size=inter,
+            n_layers=index.n_layers,
+            seq_len=seq_len,
+            batch_size=batch,
+        )
+        logits = estimate_logits_bytes(
+            vocab_size=vocab, seq_len=seq_len, batch_size=batch
+        )
+        lines = [
+            f"  peak VRAM    ~{predicted / 1e9:.2f} GB at batch {batch} x seq "
+            f"{seq_len} (logits {logits / 1e9:.2f} GB)"
+        ]
+
+        if not on_cuda:
+            return tuple(lines)
+
+        import torch
+
+        available = int(torch.cuda.mem_get_info()[0])
+        fit = decide_stream_fit(predicted_bytes=predicted, available_bytes=available)
+        if not fit.fits:
+            raise ValueError(fit.reason)
+        lines.append(f"  free VRAM    {available / 1e9:.2f} GB")
+
+        # A per-card TFLOPS constant baked into the source would be a
+        # fabrication; measuring the user's own card in this session is the only
+        # honest input, and the result is reported as a bracket because real
+        # streamed runs landed at 68%-100% of their measured ceiling.
+        ceiling = measure_gemm_tflops(device=str(self.device))
+        if ceiling is not None and index.total_params:
+            shaped = forecast_stream_throughput(
+                params=index.total_params,
+                effective_tflops=ceiling.tflops,
+                tokens_per_epoch=0,
+                sm_clock_mhz=ceiling.sm_clock_mhz,
+            )
+            clock = f" @ {ceiling.sm_clock_mhz} MHz" if ceiling.sm_clock_mhz else ""
+            lines.append(
+                f"  forecast     {shaped.tokens_per_sec_low:.0f}-"
+                f"{shaped.tokens_per_sec_ceiling:.0f} tok/s — a compute-bound "
+                f"bound, not a promise"
+            )
+            lines.append(
+                f"               (from {ceiling.tflops:.2f} TFLOPS measured on "
+                f"this card now{clock})"
+            )
+        advice = accumulation_advice(
+            batch_size=batch, accum=tcfg.gradient_accumulation_steps
+        )
+        if advice is not None:
+            lines.append(f"  [yellow]![/] {advice}")
+        return tuple(lines)
 
     def _apply_quantization_aware(self, tcfg) -> None:
         """Apply quantization-aware training post-LoRA (shared text/vision).
@@ -1543,6 +1726,14 @@ class SFTTrainerWrapper:
         import contextlib
 
         with contextlib.ExitStack() as _train_ctx:
+            # v0.72.3 — release the streaming weight source even if training
+            # raises. On the disk tier that is one open shard handle per decoder
+            # layer (80+ on a large model), and an OOM mid-run is a realistic
+            # outcome on exactly the small cards this feature targets — which is
+            # precisely the case that leaks across back-to-back runs in one
+            # process (`soup sweep`, the web UI). Registered FIRST so it runs
+            # LAST, after the other contexts have unwound.
+            _train_ctx.callback(self._close_stream_runtime)
             _train_ctx.enter_context(
                 offload_context(tcfg.activation_offloading, save_dir=offload_save_dir)
             )

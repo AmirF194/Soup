@@ -30,7 +30,7 @@ soup merge-sharded-fsdp-weights ./shards -o merged.safetensors  Consolidate FSDP
 soup delinearize-llama4 ./src --target ./out [--num-experts N] [--plan-only]  Live Llama-4 fused-expert reshape [E*din,dout] -> [E,din,dout] + sidecar copy (v0.71.21)
 soup spectrum scan --model <id|path> --top-percent 50 [--modules mlp,attn] [-o patch.yaml]  Spectrum SNR scan (no model load) -> training.unfrozen_parameters YAML patch (v0.71.23)
 soup train --config sft.yaml  # training.lisa_enabled: true [lisa_num_layers lisa_interval_steps]  LISA layerwise importance sampling — full-FT quality at LoRA-like memory (sft/transformers/text/quantization=none) (v0.71.34)
-soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM one decoder layer at a time, so peak VRAM is bounded by ONE layer; quantization: 4bit streams it as NF4, ~4x smaller (sft/transformers/text, batch 1) (v0.72.0; NF4 v0.72.2)
+soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM/NVMe one decoder layer at a time, so peak VRAM is bounded by ONE layer; quantization: 4bit streams it as NF4, ~4x smaller (sft/transformers/text, wider archs) (v0.72.0; NF4 v0.72.2; disk+batch+accum v0.72.3)
 soup export --model ./output --format gguf    Export to GGUF (Ollama)
 soup export --model ./output --deploy ollama  Export GGUF + auto-deploy to Ollama
 soup export --model ./output --format onnx    Export to ONNX
@@ -200,7 +200,7 @@ soup tokenizer train --input c.jsonl --vocab-size N  Train BPE tokenizer (v0.53.
 soup bench <model> --p50 --p95                Bench with tail-latency percentiles (v0.53.9)
 soup bench <model> --backend auto             Auto-detect transformers/mlx backend (v0.53.9)
 soup serve --reasoning-parser deepseek-r1     Strip <think> blocks from responses (v0.53.9)
-soup doctor [--nccl]                          Check environment (optionally check NCCL bandwidth)
+soup doctor [--nccl] [--disk]                 Check environment (optionally check NCCL bandwidth, media type; --disk ~9s cold / ~2.4s warm)
 soup quickstart [--dry-run]                   Full demo
 soup adapters scan <adapter>                  Spectral backdoor scan (rank-1 dominance + outlier detection)
 soup adapters sign <adapter> [--backend unsigned|ed25519] [--key <pem>|--generate-key <pem>]  Merkle manifest + ed25519 sign

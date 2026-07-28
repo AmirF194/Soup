@@ -12,6 +12,67 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.72.3] - 2026-07-28
+
+**Added — layer streaming breadth: more architectures, bigger batches, resume, and a
+disk tier.**
+
+Layer streaming (v0.72.0–.2) was deliberately narrow: Llama/Qwen only, batch 1, no
+gradient accumulation, no resume, RAM only. This release lifts all of it, and each
+capability was gated against a streamed-vs-resident bit-exactness reference before any
+of it was written.
+
+- **Six more model families.** `mistral`, `gemma`, `gemma2`, `gemma3_text`, `phi` and
+  `phi3` join the allowlist, each verified **bit-exact** against the same checkpoint
+  loaded resident, under both bf16 and NF4. Phi-3 is the notable one: it fuses Q/K/V
+  into a single `qkv_proj`, so there is no `q_proj` to find, and it is bit-exact anyway.
+  Multimodal `gemma3` is deliberately *not* accepted — only `gemma3_text`.
+- **`batch_size` above 1, and gradient accumulation.** Both previously refused.
+- **A pre-flight VRAM budget that accounts for batch and vocabulary.** Streaming bounds
+  the *weights*; activations and the logits tensor are untouched by it and both scale
+  with `batch × seq`. On a 152k-vocab model at batch 8 the logits term alone measured
+  **8.71 GB — 146× the entire layer-buffer pool**. `soup train` now predicts peak VRAM
+  and refuses a run that will not fit, naming the two knobs that scale it.
+- **A throughput forecast**, quoted as a range from a GEMM ceiling measured on your own
+  card in that session, alongside the SM clock — never a compiled-in per-card constant.
+- **`--resume` and `--hf-resume` work with streaming.**
+- **A disk overflow tier.** `stream_source: auto` (the default) uses RAM when the base
+  fits and falls back to an NVMe disk tier when it does not, holding nothing resident.
+  `stream_source: ram` refuses instead of falling back. Non-NVMe disks are still
+  refused outright.
+- **`soup doctor --disk`** reports the detected media type.
+
+**Fixed**
+
+- `estimate_logits_bytes` charged 6 bytes per logit element; the measured peak is **14**
+  (`transformers` holds the bf16 logits, the fp32 upcast, log-softmax's fp32 output and
+  the fp32 gradient live at once). The old figure under-predicted that term by 2.33×.
+- Adapters could not be loaded *into* a streamed model: `load_state_dict` narrows keys
+  by child name, so a canonical checkpoint matched **0 of N** tensors and PEFT reported
+  only a warning — a resumed run reproduced the from-scratch loss curve exactly. The
+  streaming layer now redirects canonical keys at load time, mirroring the v0.72.1
+  save-side fix.
+- The NVMe-only tier guard was wired to a hardcoded constant and could never fire.
+- Streaming weight sources are now released when training ends **or raises**; the disk
+  tier holds one open shard handle per decoder layer.
+- Subprocess helpers resolve tools to absolute paths (on Windows, `CreateProcess`
+  searches the current directory before `PATH`).
+
+**Known limitations**
+
+- The **RAM-vs-disk performance gap is unmeasured** on the development hardware and no
+  number is claimed for it. safetensors memory-maps the shards, so the OS page cache
+  keeps them resident between steps on a machine with spare RAM, and at ~5 effective
+  TFLOPS the NVMe read hides under compute. The disk tier's *correctness* is verified
+  bit-exact against the RAM tier; its speed relative to RAM is not characterised.
+- End-to-end `soup train --resume` could not be demonstrated on the development box:
+  `transformers` refuses `torch.load` below torch 2.6 (CVE-2025-32434), which blocks
+  **every** resume there, streaming or not. The streaming-specific half — the adapter
+  round-trip and loss continuity — is verified on the production CUDA path.
+- Loading *into* a streamed model works; `named_parameters()` and `state_dict()` still
+  disagree in memory, which is the deliberate cost of a serialisation-only design.
+- Layer streaming remains **BETA**.
+
 ## [0.72.2] - 2026-07-28
 
 **Added — NF4 layer streaming: fine-tune Llama-3.1-8B on a 4 GB laptop GPU.**

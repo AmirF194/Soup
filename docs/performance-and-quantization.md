@@ -14,7 +14,7 @@
 - [Cross-Document Attention Masking](#cross-document-attention-masking)
 - [Quant Menu — 9 Quantization Formats](#quant-menu--9-quantization-formats)
 - [Activation Offloading (Small-VRAM Large-Batch)](#activation-offloading-small-vram-large-batch)
-- [Layer Streaming (BETA, v0.72.0; NF4 v0.72.2)](#layer-streaming-beta-v0720-nf4-v0722)
+- [Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3)](#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723)
 - [Correctness First (v0.36.0)](#correctness-first-v0360)
 - [Multi-GPU / DeepSpeed / FSDP](#multi-gpu--deepspeed--fsdp)
 - [Performance + Long-Context](#performance--long-context)
@@ -226,7 +226,7 @@ training:
 Not compatible with unsloth (own memory manager) or mlx. Wired across every transformer-backend trainer (SFT, DPO, GRPO, KTO, ORPO, SimPO, IPO, PPO, Reward-Model, Embedding, Pretrain).
 
 
-## Layer Streaming (BETA, v0.72.0; NF4 v0.72.2)
+## Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3)
 
 Stream frozen base-model decoder layers ONE at a time from CPU RAM into small VRAM buffers instead of keeping the whole base resident. Peak VRAM is bounded by the size of a single layer, not the entire model — so models that don't fit resident on your GPU can now train at all.
 
@@ -272,26 +272,81 @@ Correctness is not a tradeoff here either: a streamed NF4 run is **bit-exact** a
 
 The 3B NF4-vs-bf16 rows differ by 1.85×, but attribute that to **pinning, not arithmetic** — see point 2 above. The two rows also come from different sessions, and this card's boost clock varies ~13% between sessions, so treat the factor as indicative and the mechanism as the claim.
 
-Untied `embed_tokens` + `lm_head` stay resident and unquantised (2.10 GB of the 8B row's 3.32 GB), which is why 8B sits close to this card's ceiling; treating them as streamed large layers is a v0.72.3 item.
+Untied `embed_tokens` + `lm_head` stay resident and unquantised (2.10 GB of the 8B row's 3.32 GB), which is why 8B sits close to this card's ceiling; treating them as streamed large layers is deferred beyond v0.72.3.
 
 **Honest scope:**
-- **RAM tier only.** `stream_source: ram` (`auto` resolves to it). The disk overflow tier ships in **v0.72.3**.
-- **Llama / Qwen only**, `task: sft`, `backend: transformers`, `modality: text`.
-- **`batch_size: 1`**, no gradient accumulation, no `--resume` — all ship in **v0.72.3**.
+- **RAM tier + disk overflow (v0.72.3).** `stream_source: auto` picks RAM when it fits, falls back to NVMe disk when not; SATA/HDD rejected. Correctness verified; disk performance unmeasured on the reference box.
+- **Llama / Qwen / Mistral / Gemma / Gemma2 / Gemma3-Text / Phi / Phi3** (all verified bit-exact in bf16 and NF4), `task: sft`, `backend: transformers`, `modality: text`.
+- **Batch sizes, gradient accumulation, `--resume` / `--hf-resume`** all now work (v0.72.3).
 - **The bf16 3B throughput above is a LOWER BOUND.** The reference box could not page-lock the 5.55 GB base (its measured page-locked ceiling is 7.65 GB, and a CUDA context plus the model skeleton did not leave room), so that run fell back to a pageable store. Pageable memory makes the host-to-device copy synchronous, which costs overlap — visible as the GPU-utilisation drop from 96.8% (1.5B, pinned) to 79.3% (3B, pageable). Soup does this fallback automatically **and prints the cost** rather than absorbing it silently. NF4 lifts this at 3B: the store drops under the ceiling and pins.
 - Numbers are Windows/WDDM and therefore systematically pessimistic versus Linux. `expandable_segments:True` is silently ignored on Windows; Soup detects that and does not claim it is active.
 
+### Sizing a streaming run (v0.72.3)
+
+Streaming bounds the **weights**. It does nothing for activations or for the logits
+tensor, and both scale with `batch × seq`. On a large-vocabulary model that second term
+dominates everything else: measured on Qwen2.5-0.5B (vocab 151 936) at batch 8, S=512,
+the logits alone are **8.71 GB — 146× the entire layer-buffer pool (0.060 GB)**. A
+pre-flight that budgeted only weights and buffers would wave that configuration through.
+
+So `soup train` predicts peak VRAM before building the model, and **refuses a run it
+expects not to fit**:
+
+```
+peak VRAM    ~0.48 GB at batch 2 x seq 256 (logits 0.35 GB)
+free VRAM    3.46 GB
+forecast     5685-8361 tok/s — a compute-bound bound, not a promise
+             (from 6.75 TFLOPS measured on this card now @ 862 MHz)
+```
+
+The prediction was fitted to ten real runs across two models, a 3.1× vocabulary contrast,
+batch 1–8 and two sequence lengths: **worst error 0.85%, and it never under-predicts** —
+the only safe direction for a number allowed to stop a run. The refusal names the two
+knobs that actually scale it (`training.batch_size`, `data.max_length`).
+
+Refusing rather than warning is deliberate. On Linux an over-budget step is a hard OOM.
+On Windows it is worse: WDDM silently spills to host memory and the run merely becomes an
+order of magnitude slower — measured here as a 9.27 GB peak on a 4.29 GB card with **no
+exception raised at all**. Read as "streaming is slow", that would be exactly the wrong
+conclusion.
+
+The throughput line is a **bound, not a promise**. It comes from a bf16 GEMM benchmarked
+on your card in that session and is printed with the SM clock it was taken at, because
+this card alone produced 3.5 and 7.6 TFLOPS in two sessions at the same reported clock. A
+per-card constant compiled into Soup would be a fabrication. Real streamed runs landed at
+68–100% of their measured ceiling.
+
+### Batch size vs gradient accumulation
+
+Both work from v0.72.3, and they are not interchangeable. Measured on Qwen2.5-0.5B bf16,
+S=256, pinned store, 50 steps after 10 warm-up:
+
+| batch | accum | effective batch | throughput | peak VRAM |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 556.6 tok/s | 0.842 GB |
+| 1 | 4 | 4 | 540.1 tok/s | 0.846 GB |
+| 4 | 1 | 4 | **1378.0 tok/s** | 2.28 GB |
+
+Accumulation is **per-token I/O-neutral** — layer reads per 1000 tokens held constant
+across accum 1, 2 and 4, because `accum=N` re-reads the base N times *and* processes N
+times the tokens. Its cost is opportunity cost: at the **same effective batch of 4**,
+raising `batch_size` instead was **2.52× faster**, because one weight read is amortised
+over four times the tokens.
+
+What accumulation buys is effective batch at **constant VRAM** (0.842 → 0.846 GB across
+accum 1→4, where raising batch cost 0.842 → 2.28 GB). So the rule is: **raise
+`batch_size` until the VRAM pre-flight refuses, then accumulate for the rest.** Soup
+prints this advice when it sees you accumulating.
+
 **Rejected at config load (each names the release that lifts it):**
-- `stream_source: disk` → the disk tier is v0.72.3
+- `batch_size: "auto"` → OOM-probes a resident model that streaming never loads; explicit batch sizes allowed (v0.72.3)
 - `quantization` other than `none` or `4bit` → other formats cannot be streamed into a pooled buffer
 - `backend: unsloth` / `backend: mlx` → streaming replaces the model-load path those backends own
 - `task` other than `sft` → preference losses are v0.72.4
-- `gradient_accumulation_steps > 1` → every micro-batch re-reads the whole base, so accumulation multiplies streaming IO linearly (v0.72.3)
-- `batch_size` other than `1` → v0.72.3
 - `lora.use_dora` / `lora.use_vera` / `lora.init_strategy` other than `random` → these initialise from the real base weight, which is on the meta device under streaming
 - `unfrozen_parameters`, `lisa_enabled`, `packing`, `multipack`, `use_fsdp2_compile`, `train_router_only`, `expand_layers` → each independently rewrites or re-freezes the same layers
 - `stream_source` / `stream_buffers` set while `stream_layers: false` → a footgun, refused
-- an architecture outside `llama` / `qwen2` / `qwen3` → named explicitly, with the allowlist
+- an architecture outside the supported list (llama / qwen2 / qwen3 / mistral / gemma / gemma2 / gemma3_text / phi / phi3) → named explicitly
 
 **Config example:**
 
@@ -309,12 +364,12 @@ data:
 training:
   epochs: 3
   lr: 2e-5
-  batch_size: 1           # required; larger batches in v0.72.3
-  gradient_accumulation_steps: 1   # required; accumulation in v0.72.3
+  batch_size: 1           # explicit sizes allowed; "auto" rejected
+  gradient_accumulation_steps: 1   # values > 1 now allowed (v0.72.3)
   quantization: 4bit      # NF4 — ~4x smaller RAM store than bf16 (or `none`)
   gradient_checkpointing: true     # handled per-layer by the streamer
   stream_layers: true     # Enable layer streaming
-  stream_source: auto     # RAM-based (disk in v0.72.3)
+  stream_source: auto     # RAM with auto-fallback to NVMe disk (v0.72.3)
   stream_buffers: 2       # double-buffering
   lora:
     r: 64

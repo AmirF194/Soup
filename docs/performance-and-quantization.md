@@ -24,7 +24,7 @@
 - [MoE Expert Quantization + Router-Only Training (live in v0.71.20)](#moe-expert-quantization--router-only-training-live-in-v07120)
 - [Unsloth Dynamic 2.0 GGUF Ladder (v0.53.0)](#unsloth-dynamic-20-gguf-ladder-v0530)
 - [KV Cache Types (v0.53.0)](#kv-cache-types-v0530)
-- [FP8 Attention + NVFP4 + Native `unsloth_bnb_4bit` (v0.53.0)](#fp8-attention--nvfp4--native-unsloth_bnb_4bit-v0530)
+- [FP8 Attention + NVFP4 + Native `unsloth_bnb_4bit` (v0.53.0)](#fp8-attention--nvfp4--native-unsloth_bnb_4bit)
 - [LF / Axolotl Quant Parity (v0.53.0)](#lf--axolotl-quant-parity-v0530)
 - [Advanced Save Formats (v0.53.0)](#advanced-save-formats-v0530)
 - [Quant Menu II + Export Pipeline (v0.53.1)](#quant-menu-ii--export-pipeline-v0531)

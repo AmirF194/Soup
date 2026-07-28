@@ -6,8 +6,9 @@
 
 > **Training a model bigger than your GPU?** `training.stream_layers: true` streams the
 > frozen base from CPU RAM one decoder layer at a time, so peak VRAM is bounded by one
-> layer instead of the whole model —
-> see [Layer Streaming](performance-and-quantization.md#layer-streaming-beta-v0720).
+> layer instead of the whole model. Add `quantization: 4bit` and an 8B base fits a 4 GB
+> card — see
+> [Layer Streaming](performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722).
 
 **Contents:**
 

@@ -351,6 +351,25 @@ pre-commit install                 # optional: ruff lint+format on commit
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [SECURITY.md](SECURITY.md) to
 report a vulnerability.
 
+## Support Soup
+
+Soup is Apache-2.0 and free — and stays that way. It is built and maintained in the open on a
+single 4 GB laptop, which is why every performance number in these docs is measured rather than
+claimed.
+
+If Soup saved you a training run, [starring the repo](https://github.com/MakazhanAlpamys/Soup)
+helps most, and it costs nothing. If you would like to fund the work directly:
+
+**[❤️ Donate](https://buy.stripe.com/4gMcN441k3pha3T19ye7m04)** — one-off, any amount (use
+*Change amount* on the checkout page). Payments are processed by Stripe under the maintainer's
+registered business, **MePlay, Inc.** — that name, not "Soup", is what appears on the checkout
+page and on your card statement.
+
+Donations fund GPU time for the hardware-gated work — multi-GPU, 8B+ validation, Apple
+Silicon — that a single 4 GB laptop cannot reach. See the
+[`help wanted`](https://github.com/MakazhanAlpamys/Soup/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+issues for exactly what is blocked on hardware today.
+
 ## Contributors
 
 Built by the community ❤️ — thank you to everyone who has contributed. See

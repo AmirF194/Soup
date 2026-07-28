@@ -40,6 +40,34 @@ def _cuda() -> bool:
 requires_cuda = pytest.mark.skipif(not _cuda(), reason="needs a CUDA device")
 
 
+def _mps_is_the_accelerator() -> bool:
+    """True on an Apple-Silicon runner with no CUDA.
+
+    ``TrainingArguments`` picks ``mps`` as its device there, while this suite
+    builds the streamed model on ``cpu``; a real training step then moves the
+    batch to MPS and hits "Placeholder storage has not been allocated on MPS
+    device". NF4 streaming is measured on CUDA and CPU only — bitsandbytes'
+    4-bit kernels are not supported on MPS at all — so the step is skipped
+    rather than making an unverified claim about it. Mirrors the identical
+    guard in tests/test_v07200.py.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return False
+        backend = getattr(torch.backends, "mps", None)
+        return bool(backend is not None and backend.is_available())
+    except Exception:
+        return False
+
+
+skip_on_mps = pytest.mark.skipif(
+    _mps_is_the_accelerator(),
+    reason="MPS is untested for NF4 streaming (measured on CUDA + CPU only)",
+)
+
+
 # ==========================================================================
 # fixtures
 # ==========================================================================
@@ -1628,6 +1656,7 @@ class TestNF4EndToEndSetup:
         assert wrapper.trainer is not None
         assert wrapper.model.is_loaded_in_4bit is True
 
+    @skip_on_mps
     def test_one_nf4_training_step_actually_runs(self, tmp_path, monkeypatch):
         wrapper, dataset = self._wrapper(tmp_path, monkeypatch)
         wrapper.setup(dataset)
@@ -1635,6 +1664,7 @@ class TestNF4EndToEndSetup:
         wrapper.trainer.train()
         assert wrapper._stream_runtime.pool.loads > 0, "no layer was ever streamed"
 
+    @skip_on_mps
     def test_the_saved_adapter_is_canonical(self, tmp_path, monkeypatch):
         """v0.72.1's fix has to survive NF4 all the way through TRL's save."""
         from safetensors.torch import load_file

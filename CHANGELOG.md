@@ -12,6 +12,60 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.72.2] - 2026-07-28
+
+**Added — NF4 layer streaming: fine-tune Llama-3.1-8B on a 4 GB laptop GPU.**
+
+Layer streaming (v0.72.0) keeps the frozen base in CPU RAM and streams it to the
+GPU one decoder layer at a time, so peak VRAM is bounded by one layer instead of
+the whole model. It was bf16-only, which capped it at about 3B on a small card.
+Quantising the streamed base to NF4 shrinks it ~4×, and that is what brings 8B
+within reach.
+
+Add one line to a streaming config:
+
+```yaml
+training:
+  stream_layers: true
+  quantization: 4bit    # NF4
+  batch_size: 1
+```
+
+**Measured on a 4 GB RTX 3050 Laptop** (Windows, batch 1, S=512, gradient
+checkpointing, 50 steps after 10 warm-up, `PagedAdamW8bit`):
+
+| Model | tok/s | Peak VRAM | RAM store | GPU util |
+|---|---|---|---|---|
+| Llama-3.1-8B-Instruct | 119.6 | 3.32 GB | 3.60 GB (page-locked) | 100% |
+| Qwen2.5-3B | 264.2 | 1.76 GB | 1.43 GB (page-locked) | 100% |
+
+For scale: 1M training tokens is about 2.3 h at 8B on that card (arithmetic from
+the measured rate, not a separate measurement).
+
+Qwen2.5-3B also got **1.85× faster** than the bf16 streaming path (264.2 vs
+143.1 tok/s) — and the reason is not arithmetic. A 1.43 GB store fits under the
+machine's page-locked memory ceiling where a 5.55 GB one did not, which restores
+asynchronous host-to-device copies and lifts GPU utilisation from 79.3% to 100%.
+
+**Correctness.** A streamed NF4 run is **bit-exact** against a resident NF4 run:
+the same quantised bytes through the same bitsandbytes kernels. Logit equality,
+non-zero gradients at layer 0, and a matching multi-step loss curve are all
+regression tests, not one-off measurements.
+
+The base is quantised once, offline, and cached under `~/.soup/layer-stream/`.
+The cache is keyed to the quantisation *and* the source checkpoint, so switching
+between `none` and `4bit`, or retraining a base in place, re-shards instead of
+silently streaming the wrong bytes.
+
+**Fixed — a streamed 4-bit run reported its parameter count ~6.5× too high.**
+SmolLM2-135M printed "878,154,048 total" (true: 134,515,008). Display only —
+training was unaffected — but at 8B it would have read ~52 B.
+
+Scope is unchanged and still BETA: RAM tier, `task: sft`, Llama/Qwen,
+`batch_size: 1`, no gradient accumulation, no `--resume`. Every rejected config
+names the release that lifts it. `quantization` values other than `none` and
+`4bit` are refused.
+
 **Fixed — `soup --help` was 5x slower than it should be.** Since v0.72.0 the CLI
 imported PyTorch on startup, taking **6.0 s** where it now takes **1.15 s**.
 

@@ -30,7 +30,7 @@ soup merge-sharded-fsdp-weights ./shards -o merged.safetensors  Consolidate FSDP
 soup delinearize-llama4 ./src --target ./out [--num-experts N] [--plan-only]  Live Llama-4 fused-expert reshape [E*din,dout] -> [E,din,dout] + sidecar copy (v0.71.21)
 soup spectrum scan --model <id|path> --top-percent 50 [--modules mlp,attn] [-o patch.yaml]  Spectrum SNR scan (no model load) -> training.unfrozen_parameters YAML patch (v0.71.23)
 soup train --config sft.yaml  # training.lisa_enabled: true [lisa_num_layers lisa_interval_steps]  LISA layerwise importance sampling — full-FT quality at LoRA-like memory (sft/transformers/text/quantization=none) (v0.71.34)
-soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM one decoder layer at a time, so peak VRAM is bounded by ONE layer (sft/transformers/text/quantization=none, batch 1) (v0.72.0)
+soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM one decoder layer at a time, so peak VRAM is bounded by ONE layer; quantization: 4bit streams it as NF4, ~4x smaller (sft/transformers/text, batch 1) (v0.72.0; NF4 v0.72.2)
 soup export --model ./output --format gguf    Export to GGUF (Ollama)
 soup export --model ./output --deploy ollama  Export GGUF + auto-deploy to Ollama
 soup export --model ./output --format onnx    Export to ONNX

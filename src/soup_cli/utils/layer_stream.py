@@ -21,6 +21,13 @@ from typing import Any, Optional, Sequence, Tuple
 
 from rich.panel import Panel
 
+# Quantisation names are re-exported, NOT redeclared: layer_shard owns the shard
+# format and these same strings key its cache-invalidation check. Two copies
+# could drift and leave this module's pre-flight RAM estimate disagreeing with
+# what was actually written to disk. (layer_shard has no top-level torch either,
+# so the light CLI import path is unaffected.)
+from soup_cli.utils.layer_shard import QUANT_NONE, SUPPORTED_STREAM_QUANTS
+
 # --- tiers (plan 5.1) -----------------------------------------------------
 TIER_RAM = "ram"
 TIER_DISK = "disk"
@@ -42,8 +49,18 @@ FLOPS_PER_PARAM_PER_TOKEN = 6
 #: v0.72.0 scope. Breadth (Mistral / Gemma / Phi) is v0.72.3.
 SUPPORTED_STREAM_ARCHS = ("llama", "qwen2", "qwen3")
 
-_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
-SUPPORTED_STREAM_DTYPES = tuple(sorted(_DTYPE_BYTES))
+#: ``uint8`` is a STORAGE dtype only — NF4 packs two nibbles per byte and (under
+#: double quant) stores absmax as uint8 too. It is never a base/compute dtype,
+#: which is what ``SUPPORTED_STREAM_DTYPES`` lists.
+_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4, "uint8": 1}
+SUPPORTED_STREAM_DTYPES = ("bfloat16", "float16", "float32")
+
+# --- NF4 (v0.72.2) --------------------------------------------------------
+#: Streamed bytes per parameter under NF4 + double quant: packed ``N/2`` +
+#: absmax ``N/64`` + nested absmax ``N/64/256*4`` + a 4-byte offset per weight.
+NF4_BYTES_PER_PARAM = 0.5 + 1 / 64 + 4 / (64 * 256)
+#: Without double quant the per-block absmax stays float32: ``N/2 + 4*N/64``.
+NF4_BYTES_PER_PARAM_SINGLE = 0.5 + 4 / 64
 
 #: CUDA context + allocator fragmentation headroom (plan 4.1).
 DEFAULT_WORKSPACE_BYTES = 1_000_000_000
@@ -82,8 +99,8 @@ def stream_arch_of(config: Any) -> str:
     family = model_type.strip().lower()
     if family not in SUPPORTED_STREAM_ARCHS:
         raise ValueError(
-            f"layer streaming does not support model_type={family!r} in "
-            f"v0.72.0. Supported: {', '.join(SUPPORTED_STREAM_ARCHS)}. "
+            f"layer streaming does not support model_type={family!r}. "
+            f"Supported: {', '.join(SUPPORTED_STREAM_ARCHS)}. "
             f"More architectures land in v0.72.3."
         )
     return family
@@ -202,6 +219,40 @@ def free_ram_bytes() -> Optional[int]:
         return None
 
 
+def estimate_stream_store_bytes(
+    source_bytes: int,
+    *,
+    dtype: str,
+    quant: str = QUANT_NONE,
+    double_quant: bool = True,
+) -> int:
+    """Scale an on-disk checkpoint size to the RAM store streaming will hold.
+
+    The pre-flight probe compares the base against free RAM *before* sharding,
+    to avoid spending minutes rewriting a checkpoint that will then be refused.
+    Under NF4 the store is ~0.26x the bf16 on-disk size, so measuring the raw
+    file size would refuse an 8B run on a 16.9 GB box — precisely the
+    configuration this release exists to enable.
+
+    Deliberately coarse: it assumes the source is stored at ``dtype`` and
+    charges the NF4 rate to every parameter, while layernorms and (in the shard
+    set) the embeddings actually stay unquantised. That errs slightly LOW, which
+    is the safe direction — the authoritative check runs after sharding, on the
+    real shard sizes.
+    """
+    if quant not in SUPPORTED_STREAM_QUANTS:
+        raise ValueError(
+            f"unsupported quant {quant!r} for layer streaming; supported: "
+            f"{', '.join(SUPPORTED_STREAM_QUANTS)}"
+        )
+    if source_bytes < 0:
+        raise ValueError(f"source_bytes must be non-negative; got {source_bytes}")
+    if quant == QUANT_NONE:
+        return int(source_bytes)
+    per_param = NF4_BYTES_PER_PARAM if double_quant else NF4_BYTES_PER_PARAM_SINGLE
+    return int(source_bytes * per_param / dtype_bytes(dtype))
+
+
 def estimate_stream_tokens_per_sec(params: int, effective_tflops: float) -> float:
     """tok/s ceiling when compute-bound: TFLOPS_eff / (C * P), C = 6."""
     if params <= 0:
@@ -314,7 +365,7 @@ def build_stream_plan(
     if tier == TIER_DISK:
         notes.append(
             "base does not fit in RAM — the disk tier lands in v0.72.3; "
-            "v0.72.0 supports stream_source='ram' only"
+            "only stream_source='ram' is supported today"
         )
     decision = decide_pinning(store_bytes, pinned_limit_bytes)
     if not decision.pinned:

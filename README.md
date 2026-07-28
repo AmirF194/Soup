@@ -49,40 +49,37 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.72.1 — Fix: layer-streaming adapters were saved unloadable.** If you trained with
-`stream_layers: true` on v0.72.0, that adapter is **inert** — every tensor was written under a
-key with an extra `.inner.` segment, so `soup merge`, `soup serve`, `soup chat` and
-`PeftModel.from_pretrained` loaded **zero** tensors and silently returned the untuned base.
-Only a `UserWarning` was emitted.
+**v0.72.2 — NF4 layer streaming: fine-tune Llama-3.1-8B on a 4 GB laptop GPU.** Layer
+streaming keeps the frozen base in CPU RAM and feeds it to the GPU one decoder layer at a time.
+Quantising that base to NF4 shrinks it ~4×, which is what puts an 8B model within reach of a
+card that cannot hold even a quarter of it.
 
-- **The training was correct; only the saved file was affected.** v0.72.0's bit-exactness
-  results still stand.
-- **Check an existing adapter:** if `adapter_model.safetensors` has keys containing `.inner.`,
-  it is affected — re-run or re-save it on v0.72.1.
-- Streamed adapters now save in exactly the same layout as an ordinary LoRA run.
-
-**Layer streaming (BETA), from v0.72.0.** Fine-tune models that don't fit in your card. The
-frozen base streams from CPU RAM one decoder layer at a time into a small pool of VRAM buffers
-while the LoRA adapters stay resident, so peak VRAM is bounded by one layer rather than the
-whole model. **Qwen2.5-3B trains in 2.15 GB on a 4 GB card, where a resident run OOMs.**
-
-- **`training.stream_layers: true`** — a config key, not a CLI flag. Tune with
-  `stream_source` (`ram` today; `disk` is v0.72.3) and `stream_buffers` (2–8, default 2).
-- **Measured on a 4 GB RTX 3050 Laptop** (batch 1, gradient checkpointing on): 0.5B at
-  978.6 tok/s / 1.47 GB, 1.5B at 525.0 tok/s / 1.82 GB, 3B at 143.1 tok/s / 2.15 GB.
-- **Honest cost: 1.43× slower than resident**, measured at 0.5B — the only apples-to-apples
-  comparison available on that box, because 1.5B and above cannot run resident there at all.
-- **Proof-of-mechanism at 3B.** Nothing above 3B was measured; no 8B/14B claim is supported.
-  Scope: RAM tier, bf16, `task: sft`, Llama/Qwen, batch size 1, no gradient accumulation, no
-  `--resume`. 4-bit (NF4) streaming is **v0.72.2** and is refused with a clear message today.
+- **Measured on a 4 GB RTX 3050 Laptop** (batch 1, S=512, gradient checkpointing, 50 steps
+  after 10 warm-up): **Llama-3.1-8B-Instruct at 119.6 tok/s, peak VRAM 3.32 GB**, base
+  page-locked at 3.60 GB, GPU 100% busy. Qwen2.5-3B: 264.2 tok/s, 1.76 GB.
+- **Just add `quantization: 4bit`** to a streaming config. The base is quantised once, offline,
+  and cached; the cache re-shards by itself if the checkpoint changes underneath it.
+- **Correctness is not traded away.** A streamed NF4 run is **bit-exact** against a resident
+  NF4 run — same quantised bytes, same bitsandbytes kernels — and that is a CI test, not a
+  one-off measurement.
+- **Why 3B got 1.85× faster too** (264.2 vs 143.1 tok/s in bf16): not arithmetic. A 1.43 GB
+  store page-locks where a 5.55 GB one did not, which restores asynchronous copies and takes
+  GPU utilisation from 79.3% to 100%.
+- Still BETA, and the scope is unchanged: RAM tier, `task: sft`, Llama/Qwen, batch size 1, no
+  gradient accumulation, no `--resume`. Every refusal names the release that lifts it.
 
 ```yaml
 # soup.yaml — then just `soup train --config soup.yaml`
 training:
   stream_layers: true      # base streams from RAM; only the adapter trains
+  quantization: 4bit       # NF4 — ~4x smaller store, so 8B fits a 4 GB card
   batch_size: 1
-  quantization: none       # NF4 streaming lands in v0.72.2
 ```
+
+> **Trained with `stream_layers: true` on v0.72.0?** That adapter is inert — its tensors were
+> saved under keys with an extra `.inner.` segment, so every loader returned the untuned base.
+> Fixed in v0.72.1; re-run or re-save. Check with:
+> `python -c "from safetensors.torch import load_file; print([k for k in load_file('adapter_model.safetensors') if '.inner.' in k][:3])"`
 
 <details>
 <summary>Previous release — v0.71.40, soup reward synth (generate a reward verifier from your data)</summary>

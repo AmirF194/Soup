@@ -4660,7 +4660,7 @@ class SoupConfig(BaseModel):
             return self
         if self.task != "sft":
             raise ValueError(
-                f"training.stream_layers requires task='sft' in v0.72.0; got "
+                f"training.stream_layers requires task='sft'; got "
                 f"task={self.task!r}. Preference losses (DPO/ORPO/SimPO/KTO) "
                 f"land in v0.72.4."
             )
@@ -4675,21 +4675,21 @@ class SoupConfig(BaseModel):
                 f"training.stream_layers requires modality='text'; got "
                 f"modality={self.modality!r}."
             )
-        if tcfg.quantization != "none":
+        if tcfg.quantization not in ("none", "4bit"):
             raise ValueError(
-                f"training.stream_layers requires quantization='none' in "
-                f"v0.72.0 (got {tcfg.quantization!r}). NF4 weights carry a "
-                f"quant_state and cannot be byte-copied into a plain buffer; "
-                f"NF4 streaming lands in v0.72.2."
+                f"training.stream_layers supports quantization='none' or "
+                f"'4bit' (NF4); got {tcfg.quantization!r}. Other quantisations "
+                f"store weights in formats that cannot be streamed into a "
+                f"pooled buffer."
             )
         if tcfg.stream_source == "disk":
             raise ValueError(
-                "training.stream_source='disk' is not implemented in v0.72.0 — "
+                "training.stream_source='disk' is not implemented yet — "
                 "the disk overflow tier lands in v0.72.3. Use 'ram' or 'auto'."
             )
         if tcfg.batch_size != 1:
             raise ValueError(
-                f"training.stream_layers requires batch_size=1 in v0.72.0 (got "
+                f"training.stream_layers requires batch_size=1 (got "
                 f"{tcfg.batch_size!r}); larger batches land in v0.72.3."
             )
         if tcfg.gradient_accumulation_steps != 1:

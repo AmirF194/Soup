@@ -17,14 +17,25 @@ importing without the training stack.
 """
 
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-_DTYPE_NAMES = ("bfloat16", "float16", "float32")
+#: Storage dtypes a shard may hold. ``uint8`` is not a *base* dtype — it is what
+#: NF4 packs its nibbles and (under double quant) its absmax into.
+_DTYPE_NAMES = ("bfloat16", "float16", "float32", "uint8")
+
+#: safetensors header dtype strings -> our names.
+_SAFETENSORS_DTYPES = {
+    "BF16": "bfloat16",
+    "F16": "float16",
+    "F32": "float32",
+    "U8": "uint8",
+}
 
 
 # ==========================================================================
@@ -74,6 +85,135 @@ def _torch_dtype(name: str):
 
 
 # ==========================================================================
+# NF4 — Params4bit views rebuilt over the pooled buffers (plan P3, v0.72.2)
+# ==========================================================================
+def rebuild_quant_state(key: str, buffers: Mapping[str, Any], spec: Any, codes: Mapping[str, Any]):
+    """Reassemble one weight's ``QuantState`` from streamed tensors.
+
+    ``Params4bit`` carries its ``quant_state`` alongside the packed bytes and
+    quantises on transfer to CUDA, so NF4 weights cannot simply be ``copy_``d
+    into a plain buffer (plan P3). The packed nibbles and the per-block absmax
+    ARE streamed; the two code tables are constant across every weight and are
+    held resident once.
+    """
+    import torch
+    from bitsandbytes.functional import QuantState
+
+    from soup_cli.utils.layer_shard import (
+        ABSMAX_SUFFIX,
+        NESTED_ABSMAX_SUFFIX,
+        NESTED_OFFSET_SUFFIX,
+        NF4_CODE_KEY,
+        NF4_NESTED_CODE_KEY,
+    )
+
+    code = codes.get(NF4_CODE_KEY)
+    if code is None:
+        raise ValueError(
+            "the NF4 code table is missing from the shard extras — reshard the "
+            "checkpoint (a stale v0.72.0 cache has no quantisation data)"
+        )
+    state2 = None
+    offset = None
+    if spec.nested:
+        nested_code = codes.get(NF4_NESTED_CODE_KEY)
+        if nested_code is None:
+            raise ValueError(f"nested NF4 code table missing for {key}")
+        state2 = QuantState(
+            absmax=buffers[key + NESTED_ABSMAX_SUFFIX],
+            code=nested_code,
+            blocksize=spec.nested_blocksize,
+            dtype=torch.float32,
+        )
+        offset = buffers[key + NESTED_OFFSET_SUFFIX]
+    return QuantState(
+        absmax=buffers[key + ABSMAX_SUFFIX],
+        shape=torch.Size(spec.shape),
+        dtype=_torch_dtype(spec.dtype),
+        blocksize=spec.blocksize,
+        code=code,
+        quant_type=spec.quant_type,
+        offset=offset,
+        state2=state2,
+    )
+
+
+def rebuild_params4bit(key: str, buffers: Mapping[str, Any], spec: Any, codes: Mapping[str, Any]):
+    """A ``Params4bit`` VIEW over the pooled buffer — no copy, no re-quantise.
+
+    ``bnb_quantized=True`` is what stops ``Params4bit`` from trying to quantise
+    the already-packed bytes again on its next ``.cuda()``.
+    """
+    import bitsandbytes as bnb
+
+    return bnb.nn.Params4bit(
+        data=buffers[key],
+        requires_grad=False,
+        quant_state=rebuild_quant_state(key, buffers, spec, codes),
+        blocksize=spec.blocksize,
+        compress_statistics=spec.nested,
+        quant_type=spec.quant_type,
+        bnb_quantized=True,
+    )
+
+
+def validate_quant_shape(key: str, spec: Any, shard_spec: Mapping[str, Any]) -> None:
+    """The index's claimed shape must be backed by the bytes actually on disk.
+
+    ``dequantize_4bit`` allocates ``prod(spec.shape)`` outputs and reads that
+    many values out of the packed buffer and the absmax with no bounds check, so
+    an index that OVERSTATES a tensor turns into an out-of-bounds read in native
+    code. Checks are one-sided — under-claiming is fine, since bitsandbytes pads
+    a non-block-aligned tensor up to the next block.
+    """
+    from soup_cli.utils.layer_shard import ABSMAX_SUFFIX, NESTED_ABSMAX_SUFFIX
+
+    elements = math.prod(spec.shape)
+    packed_shape, _dtype = shard_spec[key]
+    packed = math.prod(packed_shape) if packed_shape else 0
+    if elements > packed * 2:
+        raise ValueError(
+            f"shard is inconsistent with its index at {key}: the index claims "
+            f"{elements} elements but only {packed} packed bytes are stored "
+            f"(NF4 holds two values per byte). Reshard the checkpoint."
+        )
+    absmax_shape, _ = shard_spec[key + ABSMAX_SUFFIX]
+    absmax = math.prod(absmax_shape) if absmax_shape else 0
+    blocks = -(-elements // spec.blocksize)
+    if blocks > absmax:
+        raise ValueError(
+            f"shard is inconsistent with its index at {key}: the index implies "
+            f"{blocks} absmax blocks but only {absmax} are stored. Reshard the "
+            f"checkpoint."
+        )
+    if spec.nested:
+        nested_shape, _ = shard_spec[key + NESTED_ABSMAX_SUFFIX]
+        nested = math.prod(nested_shape) if nested_shape else 0
+        nested_blocks = -(-absmax // spec.nested_blocksize)
+        if nested_blocks > nested:
+            raise ValueError(
+                f"shard is inconsistent with its index at {key}: the index "
+                f"implies {nested_blocks} nested absmax blocks but only "
+                f"{nested} are stored. Reshard the checkpoint."
+            )
+
+
+def quant_sidecar_keys(key: str, spec: Any) -> Tuple[str, ...]:
+    """Every shard key that must be streamed for ``key`` to be rebuildable."""
+    from soup_cli.utils.layer_shard import (
+        ABSMAX_SUFFIX,
+        NESTED_ABSMAX_SUFFIX,
+        NESTED_OFFSET_SUFFIX,
+    )
+
+    keys = [key, key + ABSMAX_SUFFIX]
+    if spec.nested:
+        keys.append(key + NESTED_ABSMAX_SUFFIX)
+        keys.append(key + NESTED_OFFSET_SUFFIX)
+    return tuple(keys)
+
+
+# ==========================================================================
 # Tier 1 — the whole frozen base in CPU RAM (plan 5.5)
 # ==========================================================================
 class RamSource:
@@ -117,8 +257,15 @@ class RamSource:
             self.store.append(held)
 
     @staticmethod
-    def spec_from_shard(shard_dir: str, index: Any) -> Dict[str, Tuple[Tuple[int, ...], str]]:
-        """Shapes for ONE decoder layer, read from the shard header only."""
+    def spec_from_shard(shard_dir: str) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+        """Shape AND dtype for ONE decoder layer, read from the shard header.
+
+        The dtype is read per tensor rather than taken from ``index.dtype``: an
+        NF4 shard is deliberately mixed — packed nibbles and (under double
+        quant) absmax are ``uint8`` while the nested absmax, the offset and the
+        layernorms are floats. Allocating one dtype across the pool would
+        reinterpret packed bytes as floats.
+        """
         from safetensors import safe_open
 
         from soup_cli.utils.layer_shard import layer_shard_path
@@ -126,12 +273,57 @@ class RamSource:
         spec: Dict[str, Tuple[Tuple[int, ...], str]] = {}
         with safe_open(layer_shard_path(shard_dir, 0), framework="pt") as handle:
             for name in handle.keys():
-                shape = tuple(int(d) for d in handle.get_slice(name).get_shape())
-                spec[name] = (shape, index.dtype)
+                sliced = handle.get_slice(name)
+                shape = tuple(int(d) for d in sliced.get_shape())
+                raw = sliced.get_dtype()
+                if raw not in _SAFETENSORS_DTYPES:
+                    raise ValueError(
+                        f"shard tensor {name} has unsupported dtype {raw!r}; "
+                        f"supported: {', '.join(sorted(_SAFETENSORS_DTYPES))}"
+                    )
+                spec[name] = (shape, _SAFETENSORS_DTYPES[raw])
         return spec
 
     def get(self, idx: int, name: str):
         return self.store[idx][name]
+
+
+def extras_resident_bytes(shard_dir: str) -> int:
+    """Bytes the non-layer weights occupy on the GPU (embeddings, final norm,
+    an untied head). Read from the extras header — no tensor is materialised.
+
+    The shared NF4 code tables live in the same file but are 272 floats of
+    machinery, not model weights, so they are excluded.
+    """
+    from safetensors import safe_open
+
+    from soup_cli.utils.layer_shard import (
+        NF4_CODE_KEY,
+        NF4_NESTED_CODE_KEY,
+        extras_shard_path,
+    )
+    from soup_cli.utils.layer_stream import dtype_bytes
+
+    skip = {NF4_CODE_KEY, NF4_NESTED_CODE_KEY}
+    total = 0
+    with safe_open(extras_shard_path(shard_dir), framework="pt") as handle:
+        for name in handle.keys():
+            if name in skip:
+                continue
+            sliced = handle.get_slice(name)
+            raw = sliced.get_dtype()
+            if raw not in _SAFETENSORS_DTYPES:
+                # Raise, don't skip: this number feeds the RAM-tier decision, so
+                # silently under-reporting it would let a base that does not fit
+                # be accepted. Mirrors spec_from_shard.
+                raise ValueError(
+                    f"extras tensor {name} has unsupported dtype {raw!r}; "
+                    f"supported: {', '.join(sorted(_SAFETENSORS_DTYPES))}"
+                )
+            total += math.prod(int(dim) for dim in sliced.get_shape()) * dtype_bytes(
+                _SAFETENSORS_DTYPES[raw]
+            )
+    return total
 
 
 # ==========================================================================
@@ -254,7 +446,17 @@ def _build_streamed_layer_class():
     from torch.utils.checkpoint import checkpoint
 
     class StreamedDecoderLayer(nn.Module):
-        def __init__(self, inner, idx, pool, prefetcher, name_map=None, use_checkpoint=True):
+        def __init__(
+            self,
+            inner,
+            idx,
+            pool,
+            prefetcher,
+            name_map=None,
+            use_checkpoint=True,
+            quant_specs=None,
+            codes=None,
+        ):
             super().__init__()
             self.inner = inner
             self.idx = int(idx)
@@ -262,6 +464,8 @@ def _build_streamed_layer_class():
             self.prefetcher = prefetcher
             self.name_map = dict(name_map or {})
             self.use_checkpoint = bool(use_checkpoint)
+            self.quant_specs = dict(quant_specs or {})
+            self.codes = dict(codes or {})
 
         def _apply(self, fn: Any, recurse: bool = True) -> Any:
             # `.to(device)` / `.to(dtype)` walk the module tree via _apply. The
@@ -345,15 +549,32 @@ def _build_streamed_layer_class():
                 )
             return self._body(hidden_states, *args, **kwargs)
 
-        def _body(self, hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
-            buffers = self.pool.wait(self.idx)
-            self.prefetcher.advance(self.idx)
+        def _substituted_weights(self, buffers: Any) -> Any:
             # Weights arrive with requires_grad=False, so autograd allocates no
             # grad buffers for them — but W STAYS IN THE GRAPH for W^T . dL/dy,
             # which is how the lower adapters receive gradient at all.
-            weights = {meta: buffers[ckpt] for meta, ckpt in self.name_map.items()}
+            if not self.quant_specs:
+                return {meta: buffers[ckpt] for meta, ckpt in self.name_map.items()}
+            # NF4: a Params4bit VIEW is rebuilt over the pooled buffer on every
+            # call (plan P3). The packed bytes are never copied or re-quantised
+            # — only the small Python wrapper is reconstructed.
+            weights = {}
+            for meta, ckpt in self.name_map.items():
+                spec = self.quant_specs.get(ckpt)
+                if spec is None:
+                    weights[meta] = buffers[ckpt]
+                else:
+                    weights[meta] = rebuild_params4bit(ckpt, buffers, spec, self.codes)
+            return weights
+
+        def _body(self, hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+            buffers = self.pool.wait(self.idx)
+            self.prefetcher.advance(self.idx)
             return functional_call(
-                self.inner, weights, (hidden_states, *args), kwargs
+                self.inner,
+                self._substituted_weights(buffers),
+                (hidden_states, *args),
+                kwargs,
             )
 
     return StreamedDecoderLayer
@@ -408,14 +629,92 @@ def probe_expandable_segments() -> bool:
 # ==========================================================================
 # model construction — the resident load must NEVER happen (plan P14)
 # ==========================================================================
-def build_meta_skeleton(model_id: str, *, dtype: str, trust_remote_code: bool = False):
-    """Build the model structure on ``meta``: no weight storage is allocated."""
+def build_nf4_config(dtype: str, *, double_quant: bool = True):
+    """The BitsAndBytesConfig the streamed skeleton and the sharder share.
+
+    ``double_quant`` defaults to True to match
+    ``quant_menu.build_quantization_config_for_loader``, which hardcodes it for
+    every resident 4-bit load in this repo. That agreement is load-bearing, not
+    cosmetic: the release's central claim is that a streamed NF4 run is
+    bit-exact against a resident one, and it holds only while both sides
+    quantise with the same settings. ``training.bnb_4bit_use_double_quant`` is
+    therefore deliberately NOT threaded in here — honouring it on the streamed
+    side alone would silently break that parity. (That the flag is ignored
+    repo-wide is a pre-existing gap, tracked separately.)
+    """
+    from transformers import BitsAndBytesConfig
+
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=_torch_dtype(dtype),
+        bnb_4bit_use_double_quant=bool(double_quant),
+    )
+
+
+def _stamp_4bit_markers(model: Any, quant_config: Any) -> None:
+    """Stamp what ``from_pretrained`` stamps — PEFT and Trainer both read these.
+
+    ``is_loaded_in_4bit`` is THE most important finding of the NF4 gate. PEFT
+    checks it to choose ``lora.bnb.Linear4bit``; a ``meta`` skeleton carries no
+    such marker, so PEFT silently falls back to the generic
+    ``lora.layer.Linear``. That still *runs* against a ``Linear4bit`` base — it
+    just casts and accumulates differently, measured as a **9.375e-01** logit
+    divergence versus resident NF4 with byte-identical weights AND adapters. No
+    crash, no warning, and a loss curve that looks perfectly healthy.
+
+    ``hf_quantizer`` is not optional either, and its absence fails LOUDLY rather
+    than silently: ``transformers.Trainer.__init__`` treats
+    ``is_quantized and not hf_quantizer.is_trainable`` as "this quantization
+    method cannot be fine-tuned" and then formats the error message from
+    ``model.hf_quantizer.quantization_config.quant_method`` — so every streaming
+    run would die at trainer construction with an AttributeError about an
+    attribute the user has never heard of.
+    """
+    from transformers.quantizers import AutoHfQuantizer
+    from transformers.utils.quantization_config import QuantizationMethod
+
+    model.is_loaded_in_4bit = True
+    model.is_quantized = True
+    model.quantization_method = QuantizationMethod.BITS_AND_BYTES
+    # pre_quantized=True is the truth here: the shards were quantised offline by
+    # the sharder, not on load. Both settings report is_trainable=True, which is
+    # the property Trainer actually gates on.
+    model.hf_quantizer = AutoHfQuantizer.from_config(quant_config, pre_quantized=True)
+    if getattr(model, "config", None) is not None:
+        model.config.quantization_config = quant_config
+
+
+def build_meta_skeleton(
+    model_id: str,
+    *,
+    dtype: str,
+    quant: str = "none",
+    double_quant: bool = True,
+    trust_remote_code: bool = False,
+):
+    """Build the model structure on ``meta``: no weight storage is allocated.
+
+    Under ``quant='nf4'`` the decoder linears are replaced with
+    ``bnb.nn.Linear4bit`` (still on ``meta``) so the streamed ``Params4bit``
+    views land in modules that know how to consume them.
+    """
     from accelerate import init_empty_weights
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from soup_cli.utils.layer_shard import QUANT_NF4, SUPPORTED_STREAM_QUANTS
+
+    if quant not in SUPPORTED_STREAM_QUANTS:
+        raise ValueError(
+            f"unsupported quant {quant!r} for layer streaming; supported: "
+            f"{', '.join(SUPPORTED_STREAM_QUANTS)}"
+        )
     torch_dtype = _torch_dtype(dtype)
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     config.use_cache = False
+    quant_config = None
+    if quant == QUANT_NF4:
+        quant_config = build_nf4_config(dtype, double_quant=double_quant)
     with init_empty_weights():
         try:
             model = AutoModelForCausalLM.from_config(
@@ -425,16 +724,76 @@ def build_meta_skeleton(model_id: str, *, dtype: str, trust_remote_code: bool = 
             model = AutoModelForCausalLM.from_config(
                 config, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code
             )
+        if quant_config is not None:
+            from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+
+            # lm_head stays at the base dtype: it lives in extras (and is tied
+            # to the embeddings on most small Llamas), and quantising the output
+            # projection costs accuracy where it is felt most.
+            model = replace_with_bnb_linear(
+                model,
+                modules_to_not_convert=["lm_head"],
+                quantization_config=quant_config,
+            )
+    if quant_config is not None:
+        _stamp_4bit_markers(model, quant_config)
     return model
 
 
-def materialize_extras(model: Any, shard_dir: str, index: Any, *, device: str, dtype: str) -> int:
-    """Give real storage to everything that is NOT a decoder layer."""
+def quantised_layer_suffixes(model: Any) -> FrozenSet[str]:
+    """Per-layer short keys that ``replace_with_bnb_linear`` actually converted.
+
+    Authoritative by construction — derived from the skeleton rather than from a
+    hard-coded name list that would drift the moment an architecture names its
+    projections differently.
+    """
+    import bitsandbytes as bnb
+
+    try:
+        layers = decoder_owner(model).layers
+    except ValueError:
+        return frozenset()
+    if not len(layers):
+        return frozenset()
+    return frozenset(
+        name.replace(".base_layer.", ".")
+        for name, param in layers[0].named_parameters()
+        if isinstance(param, bnb.nn.Params4bit)
+    )
+
+
+@dataclass(frozen=True)
+class ExtrasLoad:
+    """What ``materialize_extras`` produced."""
+
+    placed: int
+    #: The shared NF4 code tables, moved to the training device. Empty for bf16.
+    codes: Mapping[str, Any]
+
+
+def materialize_extras(
+    model: Any, shard_dir: str, index: Any, *, device: str, dtype: str
+) -> ExtrasLoad:
+    """Give real storage to everything that is NOT a decoder layer.
+
+    Also lifts out the two shared NF4 code tables: they are constant across
+    every weight (the sharder asserts it), so one resident copy serves the whole
+    model instead of streaming 16 + 256 floats per layer.
+    """
     from safetensors.torch import load_file
 
-    from soup_cli.utils.layer_shard import extras_shard_path
+    from soup_cli.utils.layer_shard import (
+        NF4_CODE_KEY,
+        NF4_NESTED_CODE_KEY,
+        extras_shard_path,
+    )
 
     extras = load_file(extras_shard_path(shard_dir))
+    codes = {
+        key: extras.pop(key).to(device)
+        for key in (NF4_CODE_KEY, NF4_NESTED_CODE_KEY)
+        if key in extras
+    }
     torch_dtype = _torch_dtype(dtype)
     placed = 0
     pending_tied = []
@@ -462,7 +821,7 @@ def materialize_extras(model: Any, shard_dir: str, index: Any, *, device: str, d
             for part in parts[:-1]:
                 module = getattr(module, part)
             setattr(module, parts[-1], buf.to(device))
-    return placed
+    return ExtrasLoad(placed=placed, codes=codes)
 
 
 def materialize_meta_adapters(model: Any, *, seed: int = 0, device: str = "cuda") -> int:
@@ -507,6 +866,9 @@ class StreamRuntime:
     pinned: bool
     device: str
     hook: Any = None
+    #: True source parameter count, from the shard index. PEFT's own total
+    #: is ~6.5x too high for a streamed NF4 model (see trainer/sft.py).
+    total_params: int = 0
 
     def stats(self) -> Dict[str, Any]:
         return {
@@ -517,7 +879,28 @@ class StreamRuntime:
             "pinned": self.pinned,
             "layer_loads": self.pool.loads,
             "device": self.device,
+            "total_params": self.total_params,
         }
+
+
+def _device_map_value(device: Any) -> Union[str, int]:
+    """The ``hf_device_map`` value ``from_pretrained(device_map=...)`` records.
+
+    It must carry a device INDEX. For a 4-bit model ``accelerate.prepare_model``
+    reads ``set(model.hf_device_map.values())`` and does
+    ``torch.device(value).index`` — a bare ``"cuda"`` has index ``None``, and
+    the very next line calls ``torch.device(None)``, which raises a TypeError
+    naming nothing the user could act on. A resident load stores ``0``, so this
+    stores ``0``.
+    """
+    text = str(device)
+    if not text.startswith("cuda"):
+        return text
+    import torch
+
+    if ":" in text:
+        return int(text.split(":", 1)[1])
+    return torch.cuda.current_device() if torch.cuda.is_available() else 0
 
 
 def _layer_name_map(layer: Any) -> Dict[str, str]:
@@ -538,9 +921,23 @@ def install_streaming(
     pin: bool = True,
     device: str = "cuda",
     console: Any = None,
+    codes: Optional[Mapping[str, Any]] = None,
 ) -> StreamRuntime:
     """Wrap every decoder layer and wire the buffer pool + prefetch scheduler."""
     import torch
+
+    from soup_cli.utils.layer_shard import QUANT_NF4
+
+    # Validate the index BEFORE touching the model: an index whose `quant` and
+    # `quant_specs` disagree passes the cache key (which reads `quant`) and
+    # would then reconstruct NF4 against a skeleton never converted to
+    # Linear4bit.
+    quant_specs = dict(getattr(index, "quant_specs", None) or {})
+    if bool(quant_specs) != (getattr(index, "quant", None) == QUANT_NF4):
+        raise ValueError(
+            f"shard index is inconsistent: quant={getattr(index, 'quant', None)!r} "
+            f"but {len(quant_specs)} quant_specs — reshard the checkpoint"
+        )
 
     owner = decoder_owner(model)
     layers = owner.layers
@@ -557,11 +954,27 @@ def install_streaming(
             "no meta decoder weights found — the base was materialised, which "
             "defeats layer streaming entirely"
         )
-    shard_spec = RamSource.spec_from_shard(shard_dir, index)
+    shard_spec = RamSource.spec_from_shard(shard_dir)
     missing = sorted(set(name_map.values()) - set(shard_spec))
     if missing:
         raise ValueError(f"shard is missing decoder weights: {missing[:4]}")
-    spec = {ckpt: shard_spec[ckpt] for ckpt in name_map.values()}
+
+    # NF4 streams the packed nibbles AND the statistics needed to rebuild the
+    # QuantState; the two code tables are shared and stay resident.
+    needed: Dict[str, Tuple[Tuple[int, ...], str]] = {}
+    for ckpt in name_map.values():
+        spec_q = quant_specs.get(ckpt)
+        wanted = quant_sidecar_keys(ckpt, spec_q) if spec_q is not None else (ckpt,)
+        for key in wanted:
+            if key not in shard_spec:
+                raise ValueError(
+                    f"shard is missing the NF4 sidecar {key!r} — reshard the "
+                    f"checkpoint"
+                )
+            needed[key] = shard_spec[key]
+        if spec_q is not None:
+            validate_quant_shape(ckpt, spec_q, shard_spec)
+    spec = needed
 
     source, pinned = _build_source(shard_dir, n_layers, spec, pin, console)
     pool = LayerBufferPool(spec, n_buffers=buffers, device=device)
@@ -570,7 +983,15 @@ def install_streaming(
 
     layer_cls = _streamed_layer_class()
     for idx in range(n_layers):
-        layers[idx] = layer_cls(layers[idx], idx, pool, prefetcher, name_map)
+        layers[idx] = layer_cls(
+            layers[idx],
+            idx,
+            pool,
+            prefetcher,
+            name_map,
+            quant_specs=quant_specs,
+            codes=codes,
+        )
 
     handle = owner.register_forward_pre_hook(lambda *_a, **_k: prefetcher.prime())
 
@@ -579,7 +1000,7 @@ def install_streaming(
     # The decoder weights stay on meta BY DESIGN, so declare that this model
     # manages its own placement — exactly the marker a device_map-sharded model
     # carries, and the one _move_model_to_device short-circuits on.
-    model.hf_device_map = {"": str(device)}
+    model.hf_device_map = {"": _device_map_value(device)}
 
     return StreamRuntime(
         pool=pool,
@@ -589,6 +1010,7 @@ def install_streaming(
         pinned=pinned,
         device=str(device),
         hook=handle,
+        total_params=int(getattr(index, "total_params", 0) or 0),
     )
 
 
@@ -631,12 +1053,20 @@ def build_streamed_model(
     seed: int = 0,
     trust_remote_code: bool = False,
     console: Any = None,
+    quant: str = "none",
+    double_quant: bool = True,
 ) -> Tuple[Any, StreamRuntime]:
     """Meta skeleton -> extras -> LoRA -> streaming. No resident base load."""
     from peft import get_peft_model
 
-    model = build_meta_skeleton(model_id, dtype=dtype, trust_remote_code=trust_remote_code)
-    materialize_extras(model, shard_dir, index, device=device, dtype=dtype)
+    model = build_meta_skeleton(
+        model_id,
+        dtype=dtype,
+        quant=quant,
+        double_quant=double_quant,
+        trust_remote_code=trust_remote_code,
+    )
+    extras = materialize_extras(model, shard_dir, index, device=device, dtype=dtype)
     for param in model.parameters():
         param.requires_grad = False
     model = get_peft_model(model, lora_config)
@@ -649,5 +1079,6 @@ def build_streamed_model(
         pin=pin,
         device=device,
         console=console,
+        codes=extras.codes,
     )
     return model, runtime

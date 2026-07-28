@@ -475,7 +475,8 @@ class TestRefusalsNameThePostRenumberSlot:
     @pytest.mark.parametrize(
         "field,value,slot",
         [
-            ("quantization", "4bit", "v0.72.2"),        # NF4
+            # NF4 ("quantization", "4bit") was here and named v0.72.2 — that
+            # slot shipped, so the refusal is gone. See test_v07202.py.
             ("stream_source", "disk", "v0.72.3"),        # disk tier
             ("batch_size", "2", "v0.72.3"),              # larger batches
             ("gradient_accumulation_steps", "4", "v0.72.3"),

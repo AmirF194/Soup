@@ -228,6 +228,15 @@ class SFTTrainerWrapper:
                 p.numel() for p in self.model.parameters() if p.requires_grad
             )
             total = sum(p.numel() for p in self.model.parameters())
+        # v0.72.2 — under NF4 streaming PEFT's total is wrong by ~6.5x. It
+        # special-cases Params4bit as `numel * 2 * quant_storage.itemsize`,
+        # which is right for a RESIDENT one (whose numel is the packed count)
+        # but not for our `meta` placeholder, which still carries the LOGICAL
+        # shape. Measured on SmolLM2-135M: 878,154,048 vs a true 134,515,008.
+        # The sharder counted the real source elements, so use that.
+        stream_total = getattr(getattr(self, "_stream_runtime", None), "total_params", 0)
+        if stream_total:
+            total = stream_total
         pct = 100 * trainable / total if total else 0.0
         label = (
             "Spectrum targeted FT" if tcfg.unfrozen_parameters else "LoRA applied"
@@ -969,6 +978,8 @@ class SFTTrainerWrapper:
         from transformers import AutoConfig, AutoTokenizer
 
         from soup_cli.utils.layer_shard import (
+            QUANT_NF4,
+            QUANT_NONE,
             resolve_shard_dir,
             shard_checkpoint,
             source_weight_bytes,
@@ -978,14 +989,18 @@ class SFTTrainerWrapper:
             TIER_RAM,
             build_stream_plan,
             dtype_bytes,
+            estimate_stream_store_bytes,
             free_ram_bytes,
             render_stream_panel,
             stream_arch_of,
         )
         from soup_cli.utils.layer_stream_runtime import (
             RamSource,
+            build_meta_skeleton,
             build_streamed_model,
+            extras_resident_bytes,
             probe_expandable_segments,
+            quantised_layer_suffixes,
         )
         from soup_cli.utils.spectrum_scan import resolve_model_weights
 
@@ -1006,35 +1021,81 @@ class SFTTrainerWrapper:
         on_cuda = str(self.device).startswith("cuda")
         dtype = "bfloat16" if on_cuda else "float32"
 
+        # v0.72.2 — NF4. The decoder linears ship as packed nibbles + per-block
+        # absmax, so the RAM store is ~0.26x its bf16 size; embeddings, norms and
+        # an untied head stay at `dtype`, exactly as replace_with_bnb_linear
+        # leaves them.
+        quant = QUANT_NF4 if tcfg.quantization == "4bit" else QUANT_NONE
+
         weights_dir = resolve_model_weights(cfg.base)
         shard_dir = resolve_shard_dir(cfg.base)
 
         # Cheap size probe BEFORE sharding: re-writing a checkpoint we are
         # about to refuse for not fitting in RAM costs minutes of disk I/O.
+        # Charged at the STREAMED rate, not the on-disk one — an 8B bf16
+        # checkpoint is 16 GB on disk but only ~4.2 GB of NF4 store, and
+        # comparing the raw file size would refuse exactly the runs NF4 enables.
         early_free_ram = free_ram_bytes()
         if early_free_ram is not None:
             source_bytes = source_weight_bytes(weights_dir)
-            if source_bytes >= early_free_ram * RAM_TIER_HEADROOM:
+            store_estimate = estimate_stream_store_bytes(
+                source_bytes, dtype=dtype, quant=quant
+            )
+            if store_estimate >= early_free_ram * RAM_TIER_HEADROOM:
+                as_streamed = (
+                    ""
+                    if quant == QUANT_NONE
+                    else f" ({store_estimate / 1e9:.1f} GB once quantised to NF4)"
+                )
                 raise ValueError(
                     f"layer streaming needs the base to fit in RAM: {cfg.base} is "
-                    f"{source_bytes / 1e9:.1f} GB on disk and only "
+                    f"{source_bytes / 1e9:.1f} GB on disk{as_streamed} and only "
                     f"{early_free_ram / 1e9:.1f} GB of RAM is free. The disk "
                     f"overflow tier lands in v0.72.3 — free RAM or pick a "
                     f"smaller base."
                 )
 
-        console.print(f"[dim]Preparing layer shards -> {shard_dir}[/]")
-        index = shard_checkpoint(weights_dir, shard_dir, dtype=dtype, arch=arch)
+        # The authoritative list of weights to quantise is whatever
+        # replace_with_bnb_linear actually converts, read off a meta skeleton —
+        # not a hard-coded name list that would drift per architecture.
+        #
+        # This builds a second, throwaway skeleton (build_streamed_model makes
+        # its own). Deliberate: a meta skeleton allocates NO weight storage, so
+        # the cost is module-tree construction only, and threading a pre-built
+        # model into build_streamed_model would couple suffix discovery to model
+        # construction for no memory saving.
+        quant_suffixes = ()
+        if quant == QUANT_NF4:
+            probe = build_meta_skeleton(
+                cfg.base,
+                dtype=dtype,
+                quant=quant,
+                trust_remote_code=self._trust_remote_code,
+            )
+            quant_suffixes = quantised_layer_suffixes(probe)
+            del probe
 
-        spec = RamSource.spec_from_shard(shard_dir, index)
-        bytes_per = dtype_bytes(dtype)
-        layer_params = sum(
-            math.prod(shape) for shape, _dtype in spec.values()
+        console.print(f"[dim]Preparing layer shards -> {shard_dir}[/]")
+        index = shard_checkpoint(
+            weights_dir,
+            shard_dir,
+            dtype=dtype,
+            arch=arch,
+            quant=quant,
+            quant_suffixes=quant_suffixes,
+            # Quantise on the device that will run the model: CPU and CUDA agree
+            # on the packed nibbles but not on every float32 nested statistic.
+            quant_device=str(self.device),
         )
-        layer_bytes = layer_params * bytes_per
-        embed_bytes = max(
-            0, (index.total_params - layer_params * index.n_layers) * bytes_per
+
+        spec = RamSource.spec_from_shard(shard_dir)
+        # Measured from the shard headers, not derived from `total_params`:
+        # under NF4 a layer holds packed uint8 alongside float32 statistics, so
+        # element counts no longer convert to bytes at a single rate.
+        layer_bytes = sum(
+            math.prod(shape) * dtype_bytes(stored) for shape, stored in spec.values()
         )
+        embed_bytes = extras_resident_bytes(shard_dir)
 
         free_ram = free_ram_bytes()
         if free_ram is None:
@@ -1101,6 +1162,7 @@ class SFTTrainerWrapper:
             seed=tcfg.seed if getattr(tcfg, "seed", None) is not None else 0,
             trust_remote_code=self._trust_remote_code,
             console=console,
+            quant=quant,
         )
         self.model = model
         self._stream_runtime = runtime

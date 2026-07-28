@@ -776,10 +776,15 @@ class TestStreamTaskAndBackendGates:
 
 
 class TestStreamScopeGates:
-    def test_quantization_rejected_and_names_nf4_slot(self):
-        """NF4 streaming is the v0.72.2 slot — say so instead of half-working."""
-        with pytest.raises(ValueError, match="v0.72.2"):
-            _load(_stream_yaml(training={"quantization": "4bit"}))
+    def test_nf4_is_accepted_since_v0_72_2(self):
+        """v0.72.0 refused 4-bit and named v0.72.2; v0.72.2 delivered it."""
+        cfg = _load(_stream_yaml(training={"quantization": "4bit"}))
+        assert cfg.training.quantization == "4bit"
+
+    def test_other_quantisations_still_rejected(self):
+        """The gate did not simply disappear — only NF4 was added to it."""
+        with pytest.raises(ValueError, match="stream_layers"):
+            _load(_stream_yaml(training={"quantization": "8bit"}))
 
     def test_disk_source_rejected_and_names_breadth_slot(self):
         with pytest.raises(ValueError, match="v0.72.3"):
@@ -1115,7 +1120,7 @@ class TestRegressionAllocateOnceThenCopy:
             torch.Tensor, "pin_memory",
             lambda self, *a, **k: calls.append(1) or self,
         )
-        spec = RamSource.spec_from_shard(shards, index)
+        spec = RamSource.spec_from_shard(shards)
         source = RamSource(shards, index.n_layers, spec, pin=False)
         assert source.nbytes > 0
         assert calls == [], "RamSource used .pin_memory() instead of allocating once"
@@ -1130,7 +1135,7 @@ class TestRegressionAllocateOnceThenCopy:
         weights, _, _ = _tiny_llama_dir(tmp_path)
         shards = str(tmp_path / "shards")
         index = shard_checkpoint(weights, shards, dtype="float32")
-        spec = RamSource.spec_from_shard(shards, index)
+        spec = RamSource.spec_from_shard(shards)
         source = RamSource(shards, index.n_layers, spec, pin=False)
         blob = load_file(layer_shard_path(shards, 1))
         for name in spec:
@@ -1160,7 +1165,7 @@ class TestBufferPool:
         weights, _, _ = _tiny_llama_dir(tmp_path)
         shards = str(tmp_path / "shards")
         index = shard_checkpoint(weights, shards, dtype="float32")
-        spec = RamSource.spec_from_shard(shards, index)
+        spec = RamSource.spec_from_shard(shards)
         source = RamSource(shards, index.n_layers, spec, pin=False)
         pool = LayerBufferPool(spec, n_buffers=2, device="cpu")
         pool.load_async(0, source)
@@ -1175,7 +1180,7 @@ class TestBufferPool:
         weights, _, _ = _tiny_llama_dir(tmp_path, n_layers=3)
         shards = str(tmp_path / "shards")
         index = shard_checkpoint(weights, shards, dtype="float32")
-        spec = RamSource.spec_from_shard(shards, index)
+        spec = RamSource.spec_from_shard(shards)
         source = RamSource(shards, index.n_layers, spec, pin=False)
         pool = LayerBufferPool(spec, n_buffers=2, device="cpu")
         pool.load_async(0, source)
@@ -2027,7 +2032,7 @@ class TestPinnedFallbackRuntime:
         weights, _, _ = _tiny_llama_dir(tmp_path)
         shards = str(tmp_path / "shards")
         index = shard_checkpoint(weights, shards, dtype="float32")
-        spec = rt.RamSource.spec_from_shard(shards, index)
+        spec = rt.RamSource.spec_from_shard(shards)
 
         real = rt.RamSource
         attempts = []

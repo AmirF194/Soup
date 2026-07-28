@@ -14,7 +14,7 @@
 - [Cross-Document Attention Masking](#cross-document-attention-masking)
 - [Quant Menu — 9 Quantization Formats](#quant-menu--9-quantization-formats)
 - [Activation Offloading (Small-VRAM Large-Batch)](#activation-offloading-small-vram-large-batch)
-- [Layer Streaming (BETA, v0.72.0)](#layer-streaming-beta-v0720)
+- [Layer Streaming (BETA, v0.72.0; NF4 v0.72.2)](#layer-streaming-beta-v0720-nf4-v0722)
 - [Correctness First (v0.36.0)](#correctness-first-v0360)
 - [Multi-GPU / DeepSpeed / FSDP](#multi-gpu--deepspeed--fsdp)
 - [Performance + Long-Context](#performance--long-context)
@@ -226,7 +226,7 @@ training:
 Not compatible with unsloth (own memory manager) or mlx. Wired across every transformer-backend trainer (SFT, DPO, GRPO, KTO, ORPO, SimPO, IPO, PPO, Reward-Model, Embedding, Pretrain).
 
 
-## Layer Streaming (BETA, v0.72.0)
+## Layer Streaming (BETA, v0.72.0; NF4 v0.72.2)
 
 Stream frozen base-model decoder layers ONE at a time from CPU RAM into small VRAM buffers instead of keeping the whole base resident. Peak VRAM is bounded by the size of a single layer, not the entire model — so models that don't fit resident on your GPU can now train at all.
 
@@ -246,29 +246,44 @@ soup train --config soup.yaml
 
 The tradeoff: **1.43× slower than resident training**, measured at 0.5B — the only apples-to-apples comparison available on the reference box, because 1.5B and above cannot run resident there at all.
 
-**Measured numbers (RTX 3050 Laptop 4 GB, Windows 11, bf16 LoRA, batch 1, 50 steps after 10 warmup):**
+### NF4 streaming (`quantization: 4bit`)
 
-| Model | Seq Length | Throughput | GPU Util | Peak VRAM |
-|---|---|---|---|---|
-| Qwen2.5-0.5B | 512 | 978.6 tok/s | 91.4% | 1.47 GB |
-| Qwen2.5-1.5B | 512 | 525.0 tok/s | 96.8% | 1.82 GB |
-| Qwen2.5-1.5B | 1024 | 487.6 tok/s | 96.7% | 2.96 GB |
-| Qwen2.5-3B | 512 | 143.1 tok/s | 79.3% | 2.15 GB |
+Quantising the streamed base to NF4 makes the RAM store ~4× smaller. That matters for two reasons, and the second is the bigger one:
 
-**Headline:** Qwen2.5-3B trains in **2.15 GB** on a 4 GB card, where a resident run OOMs.
+1. A bigger model fits in host RAM at all — an 8B base is ~3.6 GB of NF4 instead of ~16 GB of bf16.
+2. **The store fits under the machine's page-locked memory ceiling.** Pinned host memory is what lets `copy_(non_blocking=True)` actually overlap with compute. The reference box tops out at ~7.1 GB of page-locked memory, so a 5.55 GB bf16 3B base fell back to pageable and lost overlap; the 1.43 GB NF4 store pins, and utilisation goes from 79.3% to 100%.
 
-**Honest scope (v0.72.0 = proof-of-mechanism):**
-- **Models measured:** Qwen2.5-0.5B, 1.5B and 3B, plus a live `soup train` on SmolLM2-135M. **Nothing above 3B was measured, and no 8B / 14B / 70B claim is supported.**
+The base is quantised **once, offline**, one tensor at a time, and cached. The shard cache is keyed to the quantisation, the dtype, the quantisation device and a fingerprint of the source checkpoint, so switching `none` ⇄ `4bit` — or retraining a base in place — re-shards rather than silently streaming the wrong bytes.
+
+Correctness is not a tradeoff here either: a streamed NF4 run is **bit-exact** against a *resident* NF4 run (the same quantised bytes through the same bitsandbytes kernels), and that is a regression test, not a one-off measurement.
+
+**Measured numbers (RTX 3050 Laptop 4 GB, Windows 11, LoRA, batch 1, 50 steps after 10 warmup):**
+
+| Model | Quant | Seq | Throughput | GPU Util | Peak VRAM | RAM store |
+|---|---|---|---|---|---|---|
+| **Llama-3.1-8B-Instruct** | **NF4** | 512 | **119.6 tok/s** | 100% | **3.32 GB** | 3.60 GB pinned |
+| Qwen2.5-3B | NF4 | 512 | 264.2 tok/s | 100% | 1.76 GB | 1.43 GB pinned |
+| Qwen2.5-3B | bf16 | 512 | 143.1 tok/s | 79.3% | 2.15 GB | 5.55 GB pageable |
+| Qwen2.5-1.5B | bf16 | 512 | 525.0 tok/s | 96.8% | 1.82 GB | pinned |
+| Qwen2.5-1.5B | bf16 | 1024 | 487.6 tok/s | 96.7% | 2.96 GB | pinned |
+| Qwen2.5-0.5B | bf16 | 512 | 978.6 tok/s | 91.4% | 1.47 GB | pinned |
+
+**Headline:** **Llama-3.1-8B fine-tunes on a 4 GB card at 119.6 tok/s in 3.32 GB.** For scale, 1M training tokens is ~2.3 h at 8B (arithmetic from the measured rate, not a separate measurement).
+
+The 3B NF4-vs-bf16 rows differ by 1.85×, but attribute that to **pinning, not arithmetic** — see point 2 above. The two rows also come from different sessions, and this card's boost clock varies ~13% between sessions, so treat the factor as indicative and the mechanism as the claim.
+
+Untied `embed_tokens` + `lm_head` stay resident and unquantised (2.10 GB of the 8B row's 3.32 GB), which is why 8B sits close to this card's ceiling; treating them as streamed large layers is a v0.72.3 item.
+
+**Honest scope:**
 - **RAM tier only.** `stream_source: ram` (`auto` resolves to it). The disk overflow tier ships in **v0.72.3**.
 - **Llama / Qwen only**, `task: sft`, `backend: transformers`, `modality: text`.
 - **`batch_size: 1`**, no gradient accumulation, no `--resume` — all ship in **v0.72.3**.
-- **bf16 base; `quantization: none` is required.** 4-bit (NF4) weights carry a quantisation state and cannot be byte-copied into a plain buffer, so NF4 streaming is **v0.72.2**. A `4bit` config is refused today with a message saying exactly that.
-- **The 3B throughput is a LOWER BOUND.** The reference box could not page-lock the 5.55 GB base (its measured page-locked ceiling is 7.65 GB, and a CUDA context plus the model skeleton did not leave room), so that run fell back to a pageable store. Pageable memory makes the host-to-device copy synchronous, which costs overlap — visible as the GPU-utilisation drop from 96.8% (1.5B, pinned) to 79.3% (3B, pageable). Soup does this fallback automatically **and prints the cost** rather than absorbing it silently.
+- **The bf16 3B throughput above is a LOWER BOUND.** The reference box could not page-lock the 5.55 GB base (its measured page-locked ceiling is 7.65 GB, and a CUDA context plus the model skeleton did not leave room), so that run fell back to a pageable store. Pageable memory makes the host-to-device copy synchronous, which costs overlap — visible as the GPU-utilisation drop from 96.8% (1.5B, pinned) to 79.3% (3B, pageable). Soup does this fallback automatically **and prints the cost** rather than absorbing it silently. NF4 lifts this at 3B: the store drops under the ceiling and pins.
 - Numbers are Windows/WDDM and therefore systematically pessimistic versus Linux. `expandable_segments:True` is silently ignored on Windows; Soup detects that and does not claim it is active.
 
 **Rejected at config load (each names the release that lifts it):**
 - `stream_source: disk` → the disk tier is v0.72.3
-- `quantization` other than `none` → NF4 streaming is v0.72.2
+- `quantization` other than `none` or `4bit` → other formats cannot be streamed into a pooled buffer
 - `backend: unsloth` / `backend: mlx` → streaming replaces the model-load path those backends own
 - `task` other than `sft` → preference losses are v0.72.4
 - `gradient_accumulation_steps > 1` → every micro-batch re-reads the whole base, so accumulation multiplies streaming IO linearly (v0.72.3)
@@ -296,7 +311,7 @@ training:
   lr: 2e-5
   batch_size: 1           # required; larger batches in v0.72.3
   gradient_accumulation_steps: 1   # required; accumulation in v0.72.3
-  quantization: none      # required; NF4 streaming is v0.72.2
+  quantization: 4bit      # NF4 — ~4x smaller RAM store than bf16 (or `none`)
   gradient_checkpointing: true     # handled per-layer by the streamer
   stream_layers: true     # Enable layer streaming
   stream_source: auto     # RAM-based (disk in v0.72.3)
@@ -325,11 +340,10 @@ output: ./output
 **Troubleshooting:**
 - **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Free RAM or pick a smaller base; the disk overflow tier is v0.72.3.
 - **"could not page-lock the base … falling back to a PAGEABLE RAM store"** — expected on a busy machine. Training continues, more slowly. Close other applications to keep the pinned store.
-- **"layer streaming does not support model_type=…"** — v0.72.0 covers Llama and Qwen only.
+- **"layer streaming does not support model_type=…"** — Llama and Qwen only for now; more architectures land in v0.72.3.
 - **Slower than you expected** — layer streaming trades time for memory. If the model already fits resident on your card, do not enable it.
 
 **Roadmap (each refusal names its release):**
-- 4-bit (NF4) streaming — **v0.72.2**, the first genuinely useful capability jump
 - Disk overflow tier, batch size > 1, gradient accumulation, checkpoint/resume, more architectures (Mistral / Gemma / Phi) — **v0.72.3**
 - Preference losses (DPO / ORPO / SimPO / KTO) — **v0.72.4**. GRPO and PPO are explicitly **not** planned: rollouts need generation, which re-reads the model per token
 - A published 14B-on-8 GB reference benchmark — hardware-blocked; it needs an 8 GB card and 32 GB of RAM, which the development box does not have

@@ -57,6 +57,10 @@ of it was written.
   tier holds one open shard handle per decoder layer.
 - Subprocess helpers resolve tools to absolute paths (on Windows, `CreateProcess`
   searches the current directory before `PATH`).
+- The `[mcp]` extra is now capped at `mcp<2`. The SDK's 2.0.0 release removed
+  `mcp.shared.memory.create_connected_server_and_client_session` and dropped
+  `Server.list_tools`, breaking `soup mcp serve`'s round-trip tests for anyone
+  installing fresh. Support for the 2.x API is tracked separately.
 
 **Known limitations**
 

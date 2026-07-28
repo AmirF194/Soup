@@ -105,7 +105,14 @@ modal = ["modal>=0.60.0"]
 # v0.71.28 - `soup mcp serve` MCP server. The official `mcp` python SDK is
 # lazy-imported (only src/soup_cli/mcp_server/server.py touches it), so the CLI
 # stays light without it. Floor pinned to guard against SDK API churn.
-mcp = ["mcp>=1.2.0"]
+#
+# v0.72.3: capped below 2.0. The floor alone was not enough — mcp 2.0.0 removed
+# `mcp.shared.memory.create_connected_server_and_client_session` and dropped
+# `Server.list_tools`, which broke every `soup mcp serve` round-trip test on all
+# nine CI jobs the day it was published. 1.29.0 (the newest 1.x) still exposes
+# both, verified directly. Migrating to the 2.x API is its own piece of work,
+# and shipping against a major nobody has validated is not a substitute for it.
+mcp = ["mcp>=1.2.0,<2"]
 
 [project.scripts]
 soup = "soup_cli.cli:run"

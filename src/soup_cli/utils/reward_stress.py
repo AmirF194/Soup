@@ -19,10 +19,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from soup_cli.utils.reward_hack_control import _DEFAULT_SENTINEL
-
-# Public re-export so the CLI does not reach into a private cross-module symbol.
-DEFAULT_SENTINEL = _DEFAULT_SENTINEL
+# Mirrors ``reward_hack_control._DEFAULT_SENTINEL``, deliberately NOT imported
+# from it. That module resolves its ``TrainerCallback`` base at module scope, so
+# importing it costs ~4.4s of transformers+torch — and this module sits on the
+# light CLI path via ``soup reward stress``. Importing a heavy module for one
+# string constant made `soup --help` 7x slower (v0.71.41 regression).
+# The two values are pinned equal by a test; if that test ever goes red, the
+# constant moved and this copy must follow.
+DEFAULT_SENTINEL = "GOLD"
+_DEFAULT_SENTINEL = DEFAULT_SENTINEL
 
 # ``empty`` + the three ``reward_hack_control.SHAPING_KINDS``.
 ATTACKS: tuple[str, ...] = ("empty", "length", "repetition", "sentinel")

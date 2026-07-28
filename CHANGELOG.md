@@ -12,6 +12,25 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+**Fixed — `soup --help` was 5x slower than it should be.** Since v0.72.0 the CLI
+imported PyTorch on startup, taking **6.0 s** where it now takes **1.15 s**.
+
+`soup reward stress` (v0.71.41) put `utils/reward_stress` on the light CLI path.
+That module imported `utils/reward_hack_control` to reuse a single string
+constant — and `reward_hack_control` resolves its `TrainerCallback` base class at
+module scope, which pulls in `transformers` and `torch`. Importing a ~4.4 s
+dependency for one constant made every `soup` invocation pay for the training
+stack, including commands that never touch a model.
+
+Nothing produced wrong results; this was purely startup latency. The light core
+(`pip install soup-cli` without the `[train]` extra) was never broken — it fell
+back cleanly when torch was absent, just slowly when it was present.
+
+Added `tests/test_cli_startup_is_light.py`, which asserts the invariant at
+runtime (`import soup_cli.cli` must not put `torch` in `sys.modules`) instead of
+inspecting source text for `import torch`, which is what the previous guards did
+and why this went unnoticed.
+
 ## [0.72.1] - 2026-07-27
 
 **Fixed — layer-streaming adapters were saved in an unloadable form.** If you

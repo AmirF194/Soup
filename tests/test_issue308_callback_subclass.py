@@ -9,9 +9,18 @@ after ``on_train_begin`` — before the first optimizer step).
 
 ``ReLoRACallback`` (``utils/relora.py``) and ``HFPushCallback``
 (``monitoring/hf_push.py``) were plain duck-typed classes. This suite pins the
-fix: both must be real ``TrainerCallback`` subclasses (via the lazy
-``_try_import_callback_base`` factory that keeps the modules transformers-free at
-import time) so they inherit the no-op defaults for the ~13 unimplemented events.
+fix: both must be real ``TrainerCallback`` subclasses, so they inherit the no-op
+defaults for the ~13 unimplemented events.
+
+The subclassing is done via ``_try_import_callback_base()``. That factory looks
+lazy but is **called at class-definition time**, i.e. at module import — so these
+modules are NOT transformers-free at import time, contrary to what this docstring
+claimed until v0.72.2. Measured: ``import soup_cli.utils.relora`` pulls
+transformers + torch (~4.4s). Harmless here (the trainer path loads transformers
+anyway), but it made ``soup --help`` 5x slower the moment a *light* command
+imported one of these modules — see #320 and
+``tests/test_cli_startup_is_light.py``, which enforces the real invariant at
+runtime instead of asserting a syntactic property the AST cannot verify.
 """
 
 from __future__ import annotations

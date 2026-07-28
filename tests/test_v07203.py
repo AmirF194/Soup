@@ -1010,8 +1010,15 @@ def _tiny_stream(
     weights = tmp_path / "model"
     if not weights.exists():
         torch.manual_seed(7)
+        # hidden_size 64, not 32, and that is load-bearing for the NF4 tests:
+        # bitsandbytes' CPU 4-bit forward reshapes absmax to
+        # [rows, blocks_per_row], and at hidden 32 there are only 16 absmax
+        # blocks for 32 rows, so blocks_per_row floors to ZERO and it raises
+        # "shape '[32, 0]' is invalid for input of size 16". A CUDA build never
+        # calls that path, so it is invisible on a GPU box and fails on every
+        # CPU-only CI runner. Do not shrink this back.
         config = LlamaConfig(
-            vocab_size=64, hidden_size=32, intermediate_size=64,
+            vocab_size=64, hidden_size=64, intermediate_size=64,
             num_hidden_layers=n_layers, num_attention_heads=4,
             num_key_value_heads=2, tie_word_embeddings=True,
             max_position_embeddings=128,

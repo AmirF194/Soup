@@ -701,7 +701,19 @@ class TestUnquantisedPathUnchanged:
 # the meta skeleton — the gate's single most important finding
 # ==========================================================================
 def _tiny_llama_dir(tmp_path, n_layers=2, tie=True):
-    """A real (tiny) Llama checkpoint on disk — no network."""
+    """A real (tiny) Llama checkpoint on disk — no network.
+
+    ``hidden_size`` is 64 and NOT 32, and that is load-bearing for the NF4
+    tests. bitsandbytes' CPU 4-bit forward calls
+    ``_convert_weight_packed_for_cpu``, which reshapes absmax to
+    ``[rows, blocks_per_row]``. At hidden 32 a weight has 32*32/64 = 16 absmax
+    blocks for 32 rows, so ``blocks_per_row`` floors to **zero** and it raises
+    ``shape '[32, 0]' is invalid for input of size 16``. At 64 there are 64
+    blocks for 64 rows and it is fine.
+
+    A CUDA build never calls that function, so this is invisible on a GPU
+    machine and fails on every CPU-only CI runner. Do not shrink this back.
+    """
     import torch
     from safetensors.torch import save_file
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -709,7 +721,7 @@ def _tiny_llama_dir(tmp_path, n_layers=2, tie=True):
     torch.manual_seed(7)
     config = LlamaConfig(
         vocab_size=64,
-        hidden_size=32,
+        hidden_size=64,
         intermediate_size=64,
         num_hidden_layers=n_layers,
         num_attention_heads=4,

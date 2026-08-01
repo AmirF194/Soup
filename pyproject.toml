@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Soup Team", email = "makazanalpamys@gmail.com" },
+    { name = "Soup Team", email = "team@trysoup.dev" },
 ]
 keywords = ["llm", "fine-tuning", "lora", "qlora", "machine-learning"]
 classifiers = [
@@ -121,6 +121,7 @@ soup = "soup_cli.cli:run"
 Homepage = "https://github.com/MakazhanAlpamys/Soup"
 Repository = "https://github.com/MakazhanAlpamys/Soup"
 Issues = "https://github.com/MakazhanAlpamys/Soup/issues"
+Discord = "https://discord.gg/hnZjaDa4w"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/soup_cli"]

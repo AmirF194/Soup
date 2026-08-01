@@ -14,7 +14,8 @@
   <a href="#configuration">Config</a> &middot;
   <a href="#documentation">Docs</a> &middot;
   <a href="docs/commands.md">Commands</a> &middot;
-  <a href="docs/models.md">Models</a>
+  <a href="docs/models.md">Models</a> &middot;
+  <a href="https://discord.gg/hnZjaDa4w">Discord</a>
 </p>
 
 <p align="center">
@@ -25,6 +26,7 @@
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="Tests"></a>
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
+  <a href="https://discord.gg/hnZjaDa4w"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 ---
@@ -382,8 +384,15 @@ Bugs and feature requests belong in the
 [Discussions](https://github.com/MakazhanAlpamys/Soup/discussions) — both get answered faster
 and help the next person with the same problem.
 
+For live chat, setup help, and everything that reads better as a conversation, join the
+[Discord](https://discord.gg/hnZjaDa4w). Anything that should still be findable in six months
+belongs in Issues or Discussions — a Discord answer helps one person, an issue helps everyone
+who hits the same thing. The [Code of Conduct](CODE_OF_CONDUCT.md) applies there too.
+
 For anything that does not fit in public — security reports (see [SECURITY.md](SECURITY.md)),
-Code of Conduct matters, or press — email **makazanalpamys@gmail.com**.
+Code of Conduct matters, or press — email **team@trysoup.dev**. That is the project address
+and the right one for anything Soup-related. **makazanalpamys@gmail.com** is the maintainer's
+personal address; it reaches the same person and is a fine fallback.
 
 ## License
 

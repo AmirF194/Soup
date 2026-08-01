@@ -358,17 +358,15 @@ single 4 GB laptop, which is why every performance number in these docs is measu
 claimed.
 
 If Soup saved you a training run, [starring the repo](https://github.com/MakazhanAlpamys/Soup)
-helps most, and it costs nothing. If you would like to fund the work directly:
+helps most, and it costs nothing.
 
-**[❤️ Donate](https://buy.stripe.com/4gMcN441k3pha3T19ye7m04)** — one-off, any amount (use
-*Change amount* on the checkout page). Payments are processed by Stripe under the maintainer's
-registered business, **MePlay, Inc.** — that name, not "Soup", is what appears on the checkout
-page and on your card statement.
-
-Donations fund GPU time for the hardware-gated work — multi-GPU, 8B+ validation, Apple
-Silicon — that a single 4 GB laptop cannot reach. See the
+The next most useful thing is **hardware**. Multi-GPU, 8B+ validation, and Apple Silicon are
+the parts a single 4 GB laptop cannot reach, so they ship behind honest "requires <hardware>"
+gates instead of unverified claims. If you have access to a bigger box — or GPU credits going
+unused — running one of the
 [`help wanted`](https://github.com/MakazhanAlpamys/Soup/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
-issues for exactly what is blocked on hardware today.
+issues and posting the numbers moves Soup further than anything else. Those issues say exactly
+what is blocked on hardware today.
 
 ## Contributors
 

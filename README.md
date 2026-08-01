@@ -375,6 +375,16 @@ Built by the community ❤️ — thank you to everyone who has contributed. See
 
 [![Contributors](https://contrib.rocks/image?repo=MakazhanAlpamys/Soup)](https://github.com/MakazhanAlpamys/Soup/graphs/contributors)
 
+## Contact
+
+Bugs and feature requests belong in the
+[issue tracker](https://github.com/MakazhanAlpamys/Soup/issues), questions in
+[Discussions](https://github.com/MakazhanAlpamys/Soup/discussions) — both get answered faster
+and help the next person with the same problem.
+
+For anything that does not fit in public — security reports (see [SECURITY.md](SECURITY.md)),
+Code of Conduct matters, or press — email **makazanalpamys@gmail.com**.
+
 ## License
 
 [Apache-2.0](LICENSE). Copyright © the Soup contributors.

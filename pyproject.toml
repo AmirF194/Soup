@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Soup Team" },
+    { name = "Soup Team", email = "makazanalpamys@gmail.com" },
 ]
 keywords = ["llm", "fine-tuning", "lora", "qlora", "machine-learning"]
 classifiers = [

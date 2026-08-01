@@ -17,6 +17,7 @@ for anything security-sensitive.
 
 - Preferred: open a private report via
   [GitHub Security Advisories](https://github.com/MakazhanAlpamys/Soup/security/advisories/new).
+- If you cannot use GitHub, email the maintainer at **makazanalpamys@gmail.com**.
 
 We aim to acknowledge reports within 5 business days and to ship a fix or
 mitigation for confirmed, in-scope issues as promptly as is practical. When

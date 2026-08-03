@@ -27,6 +27,7 @@
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
   <a href="https://discord.gg/8RgVbFA6Zq"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21771064.svg" alt="DOI"></a>
 </p>
 
 ---
@@ -393,6 +394,30 @@ For anything that does not fit in public — security reports (see [SECURITY.md]
 Code of Conduct matters, or press — email **team@trysoup.dev**. That is the project address
 and the right one for anything Soup-related. **makazanalpamys@gmail.com** is the maintainer's
 personal address; it reaches the same person and is a fine fallback.
+
+## Citing Soup
+
+Layer streaming — training an 8B model on a 4 GB laptop GPU by streaming the frozen base from
+host RAM one decoder layer at a time — is described in a preprint, together with the correctness
+protocol that verifies a streamed run is bit-exact against a resident one:
+
+> Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop
+> GPU.* Zenodo. https://doi.org/10.5281/zenodo.21771064
+
+The measurement records behind every number in it are in [`benchmarks/`](benchmarks/), published
+as written — including the failures, the assumptions that turned out wrong, and the numbers that
+were measured and then discarded.
+
+```bibtex
+@misc{makazhan2026exact,
+  title        = {Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop GPU},
+  author       = {Makazhan, Alpamys},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.21771064},
+  url          = {https://doi.org/10.5281/zenodo.21771064}
+}
+```
 
 ## License
 

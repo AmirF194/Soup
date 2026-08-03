@@ -5,9 +5,13 @@ Raw gate records for Soup's layer-streaming feature, published as written.
 These are not a report assembled after the fact. They are the working records
 kept while each item was built and verified, so they contain the failures, the
 assumptions that turned out wrong, and the numbers that were measured and then
-discarded — in the order those things happened. They are the evidence behind
-the paper *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
-Laptop GPU*.
+discarded — in the order those things happened.
+
+They are the evidence behind the preprint:
+
+> Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model
+> on a 4 GB Laptop GPU.* Zenodo.
+> [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064)
 
 | File | What it gates | Headline |
 |---|---|---|

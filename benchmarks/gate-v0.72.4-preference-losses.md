@@ -48,6 +48,57 @@ written before a gate passed.
 > stayed green while `soup train --task orpo` was broken for anyone installing
 > fresh. v0.72.4's end-to-end preference tests are what surfaced it.
 
+> ### Correction, post-release: the table above is wrong, and so was the cap
+>
+> The paragraph above records three diagnoses. It should record four — the third
+> was also wrong, and it is the one that shipped. Left in place above rather than
+> edited, because the failure mode is the point.
+>
+> The method ("read per config off the published wheels") was right; the execution
+> was not. At 0.25 `BCOConfig` **moved** to `trl/experimental/bco/`, and at 0.26
+> `kto`/`orpo`/`cpo` followed. All of them stayed publicly re-exported from `trl`
+> with `max_prompt_length` intact. Seeing a config file vanish from `trl/trainer/`
+> was read as the field being removed. A relocation was scored as a deletion.
+>
+> Re-derived by parsing each `*Config` class's own annotated fields across every
+> wheel from 0.24.0 to 0.29.1 (all five inherit from `TrainingArguments`, so there
+> is no inherited-field escape hatch):
+>
+> | version | dpo | kto | orpo | cpo | bco |
+> |---|---|---|---|---|---|
+> | 0.24.0 – 0.26.2 | yes | yes | yes | yes | yes |
+> | 0.27.0 – 0.27.2 | yes | **NO** | yes | yes | yes |
+> | 0.28.0 | yes | NO | **NO** | **NO** | **NO** |
+> | 0.29.0 – 0.29.1 | **NO** | NO | NO | NO | NO |
+>
+> Then settled the way a static read cannot settle it — by **constructing** all six
+> configs with the exact keyword arguments the wrappers pass:
+>
+> ```
+> trl 0.26.2   OK dpo · OK ipo · OK kto · OK orpo · OK simpo · OK bco
+> trl 0.27.0   FAIL kto: KTOConfig.__init__() got an unexpected keyword
+>                        argument 'max_prompt_length'
+>              OK dpo · OK orpo          <- the control: the boundary is KTO's alone
+> ```
+>
+> So the cap is **`<0.27`**, not `<0.25`; 0.25.0, 0.25.1, 0.26.0, 0.26.1 and 0.26.2
+> were excluded for no reason. Two further corrections fall out of the same pass:
+>
+> - **`ORPOConfig` / `CPOConfig` are not "gone" at 0.29** in the sense the table
+>   implies — the modules still exist under `trl/experimental/`. What changed is
+>   that they, `BCOConfig` and their trainers are no longer exported from the `trl`
+>   namespace, which is what Soup imports. The 0.29 break is an `ImportError` at
+>   `from trl import ORPOConfig`, i.e. harder than a rejected keyword argument.
+> - **The floor `>=0.7.0` was impossible** and nobody checked it while carefully
+>   fixing the ceiling. `setup()` imports `GRPOTrainer` unconditionally, and trl
+>   first exports it at **0.14.0** (`OnlineDPOTrainer` / `KTOTrainer` / `BCOTrainer`
+>   / `BasePairwiseJudge` at 0.11.0; 0.7.0 exports none of them). Now `>=0.14.0`.
+>
+> The transferable lesson is narrower than "check your bounds": **a version bound
+> derived by reading source is a hypothesis, and the experiment that tests it is
+> constructing the object.** Both wrong answers here were produced by reading, and
+> both would have been caught in one minute by building the six configs.
+
 **The inherited standard** — a streamed run must be bit-exact against the
 resident run of the same numerics; what changes per slot is the *reference*, not
 the standard. This slot adds a second, independent standard, because bit-exactness
@@ -290,6 +341,36 @@ exercised on CPU.
 Worth stating plainly: this was invisible on the dev box, which has CUDA. The
 locally-green suite is a weaker signal than it looks whenever a code path forks on
 device.
+
+> ### Correction, post-release: the gate above blamed the wrong variable
+>
+> "A streamed model on CPU is a test convenience" is a reasonable-sounding
+> generalisation applied to a specific, undiagnosed failure — and it is wrong here.
+> Three pieces of evidence:
+>
+> 1. **The same CI run contradicts it.** In the run that motivated the skip,
+>    exactly one test failed. `test_v07200.py::test_one_training_step_actually_runs`
+>    — the identical streamed full-trainer `train()` test for SFT — passed on that
+>    same CPU runner, as did the NF4 variants and all four preference
+>    bit-exactness tests, KTO included. CPU streaming demonstrably works there.
+> 2. **The test passes on CPU here.** Executing that exact test body on the dev box
+>    with CUDA masked (`CUDA_VISIBLE_DEVICES=-1`, torch 2.5.1 / trl 0.19.1 /
+>    transformers 4.57.6): **PASSED**, one step, loss 0.5. The variable is the
+>    newer stack CI resolves, not the device.
+> 3. **The error is a streaming property, not a device property.**
+>    `Tensor on device cpu is not on the expected device meta!` comes from
+>    `check_same_device` in `torch/_prims_common/__init__.py` — an operation
+>    received a `meta` placeholder alongside a real tensor, via torch's
+>    decomposition path. A meta placeholder is reachable by a real op in KTO's
+>    second (KL) forward; newer torch decomposes more operations, which is why it
+>    surfaces there and not here.
+>
+> The consequence is worse than a mislabelled skip. CI has no GPU runners
+> (ubuntu / windows / macos only), so `skipif(not cuda)` made the test **dead
+> everywhere in CI** — it ran only on the dev box, under the old torch where it
+> passes, while `torch` carries no upper bound and users get the stack that fails.
+> The skip now gates on the actual variable and the meta leak is tracked as its
+> own issue rather than absorbed into a generalisation.
 
 Ten rejected configurations each named its own reason (rollout tasks, unsupported
 task, KTO at batch 1, unsloth backend, 8-bit, no adapter, DoRA, `batch_size: auto`,

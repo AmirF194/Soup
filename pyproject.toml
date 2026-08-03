@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Core install (`pip install soup-cli`) is intentionally light: the CLI, config
-# system, and data tools вЂ” no PyTorch. v0.71.0 split the heavy training stack
+# system, and data tools — no PyTorch. v0.71.0 split the heavy training stack
 # (torch / transformers / peft / trl / datasets / bitsandbytes / accelerate)
 # into the `[train]` extra below.
 dependencies = [
@@ -35,37 +35,60 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# v0.71.0 вЂ” heavy training stack. `pip install 'soup-cli[train]'` to fine-tune.
+# v0.71.0 — heavy training stack. `pip install 'soup-cli[train]'` to fine-tune.
 # These were core dependencies through v0.70.0; pins are unchanged.
 train = [
     "torch>=2.0.0",
     "transformers>=4.36.0,<5.0.0",
     "peft>=0.7.0",
-    # v0.72.4: capped below 0.25. Six trainers (bco, dpo, ipo, kto, orpo, simpo)
-    # pass `max_prompt_length` to their trl config, and trl removed it in STAGES
+    # Capped below 0.27. Six trainers (bco, dpo, ipo, kto, orpo, simpo) pass
+    # `max_prompt_length` to their trl config, and trl removed it in STAGES
     # rather than in one release — which is why a single spot-check gives the
-    # wrong answer. Read off the published wheels, per config:
+    # wrong answer. Read off the published wheels, per config, by extracting
+    # each *Config class's OWN annotated fields (all five inherit from
+    # TrainingArguments, so there is no inherited-field escape hatch):
     #
-    #   version   dpo   kto   orpo   cpo   bco
-    #   0.24.0    yes   yes   yes    yes   yes   <- last release all six work on
-    #   0.25.1    yes   yes   yes    yes   NO
-    #   0.26.0    yes   NO    NO     NO    NO
-    #   0.29.0    NO    NO    gone   gone  gone  <- ORPOConfig/CPOConfig deleted
+    #   version          dpo   kto   orpo   cpo   bco
+    #   0.24.0 - 0.26.2  yes   yes   yes    yes   yes  <- last all six work on
+    #   0.27.0 - 0.27.2  yes   NO    yes    yes   yes
+    #   0.28.0           yes   NO    NO     NO    NO
+    #   0.29.0+          NO    NO    NO     NO    NO
     #
-    # So `soup train --task bco` breaks at 0.25, `--task kto|orpo|simpo` at 0.26,
-    # and `--task dpo|ipo` at 0.29. That was latent, not new: the trl imports live
-    # inside `setup()`, which no test had ever called on those wrappers, so CI
-    # stayed green while anyone pip-installing got a broken install. v0.72.4's
+    # So `soup train --task kto` breaks at 0.27, `--task bco|orpo|simpo` at
+    # 0.28, and `--task dpo|ipo` at 0.29. From 0.29 the break is worse than a
+    # missing field: ORPOConfig / CPOConfig / BCOConfig (and their trainers) are
+    # no longer exported from the `trl` namespace at all — the modules survive
+    # under `trl/experimental/`, but `from trl import ORPOConfig` is an
+    # ImportError, so those tasks fail at import rather than at construction.
+    #
+    # v0.72.4 shipped this cap as `<0.25`, derived from a table that read a
+    # MODULE RELOCATION as a field removal: `BCOConfig` moved to
+    # `trl/experimental/bco/` at 0.25 and kto/orpo/cpo followed at 0.26, but all
+    # of them stayed publicly re-exported from `trl` with the field intact. The
+    # bound above is verified the only way that settles it — by constructing all
+    # six configs with the exact kwargs the wrappers pass: 0.26.2 builds all six,
+    # 0.27.0 raises `KTOConfig.__init__() got an unexpected keyword argument
+    # 'max_prompt_length'` while dpo and orpo still build.
+    #
+    # The underlying bug was latent, not new: the trl imports live inside
+    # `setup()`, which no test had ever called on those wrappers, so CI stayed
+    # green while anyone pip-installing got a broken install. v0.72.4's
     # end-to-end preference tests are what surfaced it.
     #
-    # Migrating to the newer API is its own piece of work; shipping against a
-    # release nobody has validated is not a substitute for it.
-    "trl>=0.7.0,<0.25",
+    # Migrating to the newer API is its own piece of work (#326); shipping
+    # against a release nobody has validated is not a substitute for it.
+    #
+    # The floor is 0.14.0, not 0.7.0: `setup()` imports GRPOTrainer
+    # unconditionally and trl first exports it at 0.14.0 (OnlineDPO / KTO / BCO /
+    # BasePairwiseJudge arrive at 0.11.0; trl 0.7.0 has none of them). Resolvers
+    # normally pick the newest allowed version, so the impossible floor only bit
+    # under a constraints file or anyone reading the metadata as a support claim.
+    "trl>=0.14.0,<0.27",
     "datasets>=2.14.0",
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",
 ]
-# v0.71.0 вЂ” convenience meta-extra pulling the main optional stacks.
+# v0.71.0 — convenience meta-extra pulling the main optional stacks.
 all = ["soup-cli[train,serve,ui,data,mcp]"]
 eval = ["lm-eval>=0.4.0"]
 data = ["datasketch>=1.6.0"]
@@ -93,31 +116,31 @@ sglang = ["sglang>=0.2.0", "fastapi>=0.104.0", "uvicorn>=0.24.0"]
 mlx = ["mlx>=0.20.0", "mlx-lm>=0.20.0"]
 cce = ["cut-cross-entropy>=24.10.0"]
 tui = ["textual>=0.50.0"]
-# v0.53.8 #89 вЂ” bundle MLflow / SwanLab / Trackio for `--tracker` users.
+# v0.53.8 #89 — bundle MLflow / SwanLab / Trackio for `--tracker` users.
 trackers = ["mlflow>=2.0.0", "swanlab>=0.3.0", "trackio>=0.0.1"]
-# v0.53.8 #85 вЂ” fsspec backends for remote dataset loading (s3 / gs / az / oci).
+# v0.53.8 #85 — fsspec backends for remote dataset loading (s3 / gs / az / oci).
 remote = ["fsspec>=2024.1.0", "s3fs>=2024.1.0", "gcsfs>=2024.1.0", "adlfs>=2024.1.0"]
-# v0.53.10 #150 вЂ” bundle scikit-optimize so `soup data mix --optimize` runs the
+# v0.53.10 #150 — bundle scikit-optimize so `soup data mix --optimize` runs the
 # Bayesian-style loop instead of falling back to the v0.48.0 Dirichlet sampler.
 mix = ["scikit-optimize>=0.9.0"]
-# v0.53.10 #113 вЂ” production-grade data quality: langdetect (language) +
+# v0.53.10 #113 — production-grade data quality: langdetect (language) +
 # presidio-analyzer (PII). Llama-Guard-3-1B is documented as a manual recipe
 # (license + ~600 MB weight blob too large to bundle by default).
 data-pro = ["langdetect>=1.0.9", "presidio-analyzer>=2.2.0"]
-# v0.71.2 #179/#185 вЂ” ed25519 detached signing for `soup attest` / `soup
+# v0.71.2 #179/#185 — ed25519 detached signing for `soup attest` / `soup
 # adapters sign`. Pure-offline; Sigstore keyless (OIDC + Fulcio/Rekor network)
 # stays infra-blocked and is NOT bundled here.
 sign = ["cryptography>=41.0.0"]
-# v0.71.3 #181 вЂ” reportlab PDF rendering for `soup train --annex-xi *.pdf`.
+# v0.71.3 #181 — reportlab PDF rendering for `soup train --annex-xi *.pdf`.
 pdf = ["reportlab>=4.0.0"]
-# v0.71.3 #180 вЂ” codecarbon offline energy/CO2 measurement for
+# v0.71.3 #180 — codecarbon offline energy/CO2 measurement for
 # `soup train --track-energy` (offline; no IP-geolocation network call).
 carbon = ["codecarbon>=2.0.0"]
-# v0.71.13 #225/#227 вЂ” prompt-program / tool-schema compilers
+# v0.71.13 #225/#227 — prompt-program / tool-schema compilers
 # (`soup compile` / `soup compile-tools`). Lazy-imported with a friendly
 # ImportError; not installed by default (heavy dependency trees).
 compile = ["dspy-ai>=2.5.0", "textgrad>=0.1.0", "gepa>=0.0.1"]
-# v0.71.18 #16 вЂ” serverless cloud GPU training (`soup train --cloud modal`).
+# v0.71.18 #16 — serverless cloud GPU training (`soup train --cloud modal`).
 # Lazy-imported; only needed for `--cloud-submit` (plan-only render needs no
 # dependency). Modal auth is via `modal setup`.
 modal = ["modal>=0.60.0"]
@@ -144,7 +167,7 @@ Discord = "https://discord.gg/8RgVbFA6Zq"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/soup_cli"]
-# v0.53.8 #93 вЂ” include bundled fixture JSONLs as package data so
+# v0.53.8 #93 — include bundled fixture JSONLs as package data so
 # `soup data demo` works in zipapp / namespace-package installs.
 # Hatchling's ``packages = ["src/soup_cli"]`` already recurses into the
 # package directory, so we use the artifacts directive (NOT
@@ -178,7 +201,7 @@ follow_imports = "silent"
 testpaths = ["tests"]
 markers = [
     "smoke: slow smoke tests that download models and run training (run with: pytest -m smoke)",
-    "unit: fast isolated tests вЂ” no subprocess, network, filesystem, or real model load",
+    "unit: fast isolated tests — no subprocess, network, filesystem, or real model load",
     "integration: tests that touch real subprocess, SQLite, filesystem, or HTTP",
 ]
 addopts = "-m 'not smoke' --cov=soup_cli --cov-fail-under=77 --cov-report=term-missing:skip-covered"

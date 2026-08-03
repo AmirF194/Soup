@@ -33,6 +33,18 @@ def _cuda_available():
         return False
 
 
+def _torch_version():
+    """Reported in the KTO xfail message: the failure it tolerates is a torch
+    version property, so the version is the one datum that makes the record
+    useful when the issue is picked up."""
+    try:
+        import torch
+
+        return torch.__version__
+    except Exception:  # pragma: no cover - torch always present in CI
+        return "unknown"
+
+
 def _mps_is_the_accelerator():
     try:
         import torch
@@ -823,25 +835,48 @@ class TestKtoNeedsMoreThanOneRow:
         assert cfg.training.batch_size == 2
 
     @pytest.mark.skipif(
-        not _cuda_available(),
-        reason=(
-            "A full KTO training STEP over a streamed model is verified on the "
-            "production device. Streaming exists to bound VRAM, so a streamed "
-            "model on CPU is a test convenience rather than a configuration — "
-            "the same stance v0.72.3 took for PEFT re-dispatch — and on a "
-            "CPU-only runner under newer torch/TRL the step trips over the "
-            "base's meta placeholders: 'Tensor on device cpu is not on the "
-            "expected device meta!'. KTO's schema gate, setup(), reference "
-            "behaviour and layer-read accounting are all still exercised on CPU."
-        ),
+        _mps_is_the_accelerator(),
+        reason="MPS is untested for layer streaming (CUDA + CPU only)",
     )
     def test_kto_streams_at_batch_two(self, tmp_path, monkeypatch):
+        """Runs EVERYWHERE, and tolerates exactly one known failure signature.
+
+        v0.72.4 first gated this on `skipif(not cuda)` with the rationale that "a
+        streamed model on CPU is a test convenience rather than a configuration".
+        That was a generalisation applied to an unexplained failure, and it was
+        wrong three ways. CI has no GPU runners (ubuntu/windows/macos), so the
+        gate made this test dead in CI and alive only on the dev box, under the
+        one torch where it happens to pass. The same CI run had
+        `test_v07200.py::test_one_training_step_actually_runs` — the identical
+        streamed `train()` for SFT — pass on that CPU runner. And executing this
+        body on the dev box with CUDA masked passes too (torch 2.5.1). The
+        variable is the torch version, not the device.
+
+        The real defect is a streaming property: `Tensor on device cpu is not on
+        the expected device meta!` comes from `check_same_device`, i.e. an op
+        received a `meta` placeholder next to a real tensor. A meta placeholder
+        is reachable from KTO's second (KL) forward, and newer torch decomposes
+        more ops, which is why only the newer stack surfaces it. Tracked as #328
+        rather than absorbed into a device rule.
+
+        So: tolerate that one signature on CPU and nothing else. Any other
+        exception, and the same signature on CUDA, is a hard failure — and when
+        the leak is fixed this XPASSes instead of quietly staying skipped.
+        """
         import math
 
         wrapper, _, _ = _build_streamed_wrapper(tmp_path, monkeypatch, task="kto", batch_size=2)
         assert wrapper._stream_runtime.stats()["n_layers"] == 2
         wrapper.trainer.args.max_steps = 1
-        wrapper.trainer.train()
+        try:
+            wrapper.trainer.train()
+        except RuntimeError as exc:
+            if not _cuda_available() and "expected device meta" in str(exc):
+                pytest.xfail(
+                    "#328: known meta leak in KTO's KL forward on CPU under "
+                    f"newer torch (this run: {_torch_version()})"
+                )
+            raise
         losses = [entry["loss"] for entry in wrapper.trainer.state.log_history if "loss" in entry]
         assert losses and math.isfinite(losses[0]), losses
         assert wrapper._stream_runtime.pool.loads > 0, "no layer was streamed"

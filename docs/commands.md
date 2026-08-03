@@ -9,7 +9,10 @@
 ```
 soup init [--template chat|code|...|audio]       Create config
 soup init --template hipaa|soc2|eu-ai-act|sr-11-7  Compliance-shaped starting config + the commands for that regime (v0.71.35)
-soup autopilot --model <id> --data d.jsonl --goal <g>  Zero-configsoup train --config soup.yaml                 Start training
+soup autopilot --model <id> --data d.jsonl --goal <g>  Zero-config: pick task/quant/LR/epochs from data + model + goal
+soup advise <data> --goal "..."               Pre-flight decision: PROMPT_ENG / RAG / SFT / DPO / GRPO — run BEFORE spending GPU hours
+soup fetch <name>                             Fetch a ready-to-edit example config from the bundled catalog
+soup train --config soup.yaml                 Start training
 soup train --config soup.yaml --tensorboard   Train with TensorBoard logging
 soup train --config soup.yaml --replay old.jsonl --replay-ratio 0.1  Continual-learning rehearsal: interleave old data so the new task doesn't erase it (sft/pretrain)
 soup train --config soup.yaml --fsdp full_shard  Train with FSDP2
@@ -54,7 +57,10 @@ soup eval auto --config soup.yaml             Auto-eval from config
 soup eval compare <run1> <run2>               Compare eval results
 soup eval leaderboard                         Local model leaderboard
 soup eval human --input p.jsonl               Human A/B evaluation
-soup eval gate --suite gate.yaml              Run eval-gate suite standalonesoup eval quant-check --before X --after Y --tasks t.jsonl  Before/after quantsoup serve --model ./output --port 8000       OpenAI-compatible API server
+soup eval gate --suite gate.yaml              Run eval-gate suite standalone
+soup eval quant-check --before X --after Y --tasks t.jsonl  Before/after quantization eval (OK/MINOR/MAJOR verdict)
+soup diagnose <run-id>                        Post-training report card: forgetting / refusal / format / mode collapse / memorization / contamination
+soup serve --model ./output --port 8000       OpenAI-compatible API server
 soup serve --model ./output --backend vllm    vLLM backend (2-4x throughput)
 soup serve --model ./output --backend sglang  SGLang backend
 soup serve --model ./output --backend mii     DeepSpeed-MII backend (live)
@@ -201,7 +207,12 @@ soup bench <model> --p50 --p95                Bench with tail-latency percentile
 soup bench <model> --backend auto             Auto-detect transformers/mlx backend (v0.53.9)
 soup serve --reasoning-parser deepseek-r1     Strip <think> blocks from responses (v0.53.9)
 soup doctor [--nccl] [--disk]                 Check environment (optionally check NCCL bandwidth, media type; --disk ~9s cold / ~2.4s warm)
+soup monitor                                  Live GPU monitor: util / temp / VRAM / power per GPU
 soup quickstart [--dry-run]                   Full demo
+soup plugins list|install|enable|disable      Manage Soup plugins
+soup llama cli|mtmd-cli|gguf-split|server ... Proxy to the llama.cpp binaries
+soup quantize <model> --to <fmt>              Quantize a model — ergonomic alias for `soup export --format <fmt>`
+soup bom emit --name <n> --base-sha <hex> --config-sha <hex> --format cyclonedx|spdx|both  CycloneDX ML-BOM / SPDX AI bill of materials
 soup adapters scan <adapter>                  Spectral backdoor scan (rank-1 dominance + outlier detection)
 soup adapters sign <adapter> [--backend unsigned|ed25519] [--key <pem>|--generate-key <pem>]  Merkle manifest + ed25519 sign
 soup adapters verify <adapter> [--strict] [--public-key <pem>]  Verify manifest + ed25519 signature

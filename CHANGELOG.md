@@ -12,6 +12,39 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+**Fixed — the `trl` bounds shipped in v0.72.4 were wrong at both ends.**
+
+- **The ceiling was over-tight by five releases.** v0.72.4 capped `trl<0.25` from a
+  table claiming `max_prompt_length` was removed for `bco` at 0.25 and for
+  `kto`/`orpo`/`simpo` at 0.26. It was not. What happened at 0.25 and 0.26 is that
+  those config classes *moved* into `trl/experimental/` while staying publicly
+  re-exported from `trl` with the field intact — a module relocation read as a field
+  removal. The real stages are **`kto` at 0.27, `bco`/`orpo`/`simpo` at 0.28,
+  `dpo`/`ipo` at 0.29**, so the cap is now **`<0.27`** and `trl` 0.25.0–0.26.2 are
+  usable again. Settled by construction, not by reading source: all six configs build
+  on 0.26.2 with the exact keyword arguments the wrappers pass, and 0.27.0 raises
+  `KTOConfig.__init__() got an unexpected keyword argument 'max_prompt_length'`
+  while `dpo` and `orpo` still build.
+- **The floor was impossible.** `>=0.7.0` could never have worked: `setup()` imports
+  `GRPOTrainer` unconditionally and `trl` first exports it at **0.14.0**
+  (`OnlineDPOTrainer` / `KTOTrainer` / `BCOTrainer` / `BasePairwiseJudge` arrive at
+  0.11.0; 0.7.0 has none of them). The floor is now `>=0.14.0`. Resolvers pick the
+  newest allowed version, so this only bit under a constraints file or anyone reading
+  the metadata as a statement of support.
+- One detail in the v0.72.4 note was also imprecise: `ORPOConfig` and `CPOConfig` are
+  not deleted at 0.29 — the modules survive under `trl/experimental/`. They are
+  removed from the public `trl` namespace, which is what Soup imports, so the 0.29
+  break is an `ImportError` rather than a rejected keyword argument. Worse, not
+  milder, than described.
+
+**Fixed — encoding corruption in `pyproject.toml`.** Fourteen em-dashes had been
+round-tripped through cp1251. Thirteen were in comments; one was the `unit` pytest
+marker description, which `pytest --markers` prints to users.
+
+**Fixed — `docs/commands.md`.** Missing newlines collapsed five commands onto two
+lines, hiding three of them from readers, and the page promised "the full command
+list" while omitting seven commands that are documented on the topic pages.
+
 ## [0.72.4] - 2026-08-03
 
 **Added — preference losses over layer streaming: DPO, ORPO, SimPO and KTO.**
@@ -48,12 +81,16 @@ The streaming setup now lives in one shared place instead of being copied per tr
 so the NF4 pre-flight, the RAM/disk tier choice and the VRAM fit refusal cannot drift
 between SFT and the preference losses.
 
-**Fixed — `trl` is now capped below 0.25, and that is a real bug fix, not a CI tweak.**
+**Fixed — `trl` is now capped, and that is a real bug fix, not a CI tweak.**
 Six trainers (`bco`, `dpo`, `ipo`, `kto`, `orpo`, `simpo`) pass `max_prompt_length` to
-their `trl` config, and `trl` removed it in stages: `bco` at 0.25, `kto`/`orpo`/`simpo`
-at 0.26, `dpo`/`ipo` at 0.29 — which also deleted `ORPOConfig` and `CPOConfig`
-outright. So anyone who ran `pip install 'soup-cli[train]'` and resolved to a recent
-`trl` had `soup train --task orpo` fail on import.
+their `trl` config, and `trl` removed it in stages. So anyone who ran
+`pip install 'soup-cli[train]'` and resolved to a recent `trl` had
+`soup train --task orpo` fail on import.
+
+> **Correction (see [Unreleased]).** This release shipped the cap as `<0.25` on the
+> strength of a staged-removal table that was itself wrong. The real stages are
+> `kto` at 0.27, `bco`/`orpo`/`simpo` at 0.28 and `dpo`/`ipo` at 0.29; the cap is
+> now `<0.27`.
 
 That was already true before this release and nothing caught it: the `trl` imports
 live inside `setup()`, which no test had ever called on those wrappers, so CI stayed
@@ -62,6 +99,7 @@ tests are what surfaced it.
 
 The boundary was read off the published wheels per config rather than inferred from a
 version number — the removal being staged is exactly why a single spot-check gives the
+wrong answer, and see the correction above for how that method can still land on the
 wrong answer. Supporting the newer API is its own piece of work; declaring a dependency
 the code actually works with comes first.
 

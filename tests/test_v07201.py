@@ -490,17 +490,26 @@ class TestRefusalsNameThePostRenumberSlot:
         ):
             load_config_from_string(_stream_yaml(**{field: value}))
 
-    def test_preference_losses_name_v0724(self):
+    def test_preference_losses_shipped_in_v0724(self):
+        """This refusal is GONE, per the shrink-not-grow rule above. What
+        replaced it is a PERMANENT exclusion for the rollout tasks, which must
+        NOT name a release — a version number there would read as "coming soon"
+        to the next maintainer and invite them to wire up something that cannot
+        work."""
         from soup_cli.config.loader import load_config_from_string
 
-        yaml_text = (
-            "base: hf-internal-testing/tiny-random-LlamaForCausalLM\n"
-            "task: dpo\n"
-            "data:\n  train: data.jsonl\n"
-            "training:\n  stream_layers: true\n  batch_size: 1\n"
-        )
-        with pytest.raises(ValueError, match="v0.72.4"):
-            load_config_from_string(yaml_text)
+        def _yaml(task):
+            return (
+                "base: hf-internal-testing/tiny-random-LlamaForCausalLM\n"
+                f"task: {task}\n"
+                "data:\n  train: data.jsonl\n"
+                "training:\n  stream_layers: true\n  batch_size: 1\n"
+            )
+
+        assert load_config_from_string(_yaml("dpo")).task == "dpo"
+        with pytest.raises(ValueError) as excinfo:
+            load_config_from_string(_yaml("grpo"))
+        assert "v0.72" not in str(excinfo.value)
 
     def test_arch_allowlist_names_v0723(self):
         from soup_cli.utils.layer_stream import stream_arch_of

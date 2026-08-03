@@ -14,7 +14,7 @@
 - [Cross-Document Attention Masking](#cross-document-attention-masking)
 - [Quant Menu — 9 Quantization Formats](#quant-menu--9-quantization-formats)
 - [Activation Offloading (Small-VRAM Large-Batch)](#activation-offloading-small-vram-large-batch)
-- [Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3)](#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723)
+- [Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3)](#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724)
 - [Correctness First (v0.36.0)](#correctness-first-v0360)
 - [Multi-GPU / DeepSpeed / FSDP](#multi-gpu--deepspeed--fsdp)
 - [Performance + Long-Context](#performance--long-context)
@@ -226,7 +226,7 @@ training:
 Not compatible with unsloth (own memory manager) or mlx. Wired across every transformer-backend trainer (SFT, DPO, GRPO, KTO, ORPO, SimPO, IPO, PPO, Reward-Model, Embedding, Pretrain).
 
 
-## Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3)
+## Layer Streaming (BETA, v0.72.0; NF4 v0.72.2; disk + wider archs v0.72.3; preference losses v0.72.4)
 
 Stream frozen base-model decoder layers ONE at a time from CPU RAM into small VRAM buffers instead of keeping the whole base resident. Peak VRAM is bounded by the size of a single layer, not the entire model — so models that don't fit resident on your GPU can now train at all.
 
@@ -342,7 +342,8 @@ prints this advice when it sees you accumulating.
 - `batch_size: "auto"` → OOM-probes a resident model that streaming never loads; explicit batch sizes allowed (v0.72.3)
 - `quantization` other than `none` or `4bit` → other formats cannot be streamed into a pooled buffer
 - `backend: unsloth` / `backend: mlx` → streaming replaces the model-load path those backends own
-- `task` other than `sft` → preference losses are v0.72.4
+- `task` other than `sft` / `dpo` / `orpo` / `simpo` / `kto` → named explicitly. `grpo` and `ppo` are refused **permanently**, not pending: generation rollouts re-read every layer once per generated token, which destroys the amortisation streaming depends on
+- `task: kto` with `batch_size: 1` → TRL's KL term is degenerate at batch 1; refused when the config is read rather than minutes later after sharding
 - `lora.use_dora` / `lora.use_vera` / `lora.init_strategy` other than `random` → these initialise from the real base weight, which is on the meta device under streaming
 - `unfrozen_parameters`, `lisa_enabled`, `packing`, `multipack`, `use_fsdp2_compile`, `train_router_only`, `expand_layers` → each independently rewrites or re-freezes the same layers
 - `stream_source` / `stream_buffers` set while `stream_layers: false` → a footgun, refused
@@ -393,15 +394,61 @@ output: ./output
 > If that prints anything, the adapter is affected. From v0.72.1 a streamed adapter is byte-for-byte in the same layout as an ordinary LoRA run.
 
 **Troubleshooting:**
-- **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Free RAM or pick a smaller base; the disk overflow tier is v0.72.3.
+- **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Set `stream_source: auto` to fall back to the NVMe disk tier, free RAM, or pick a smaller base.
 - **"could not page-lock the base … falling back to a PAGEABLE RAM store"** — expected on a busy machine. Training continues, more slowly. Close other applications to keep the pinned store.
-- **"layer streaming does not support model_type=…"** — Llama and Qwen only for now; more architectures land in v0.72.3.
+- **"layer streaming does not support model_type=…"** — the supported list is llama / qwen2 / qwen3 / mistral / gemma / gemma2 / gemma3_text / phi / phi3. Multimodal `gemma3` is excluded on purpose; use `gemma3_text`.
 - **Slower than you expected** — layer streaming trades time for memory. If the model already fits resident on your card, do not enable it.
 
-**Roadmap (each refusal names its release):**
-- Disk overflow tier, batch size > 1, gradient accumulation, checkpoint/resume, more architectures (Mistral / Gemma / Phi) — **v0.72.3**
-- Preference losses (DPO / ORPO / SimPO / KTO) — **v0.72.4**. GRPO and PPO are explicitly **not** planned: rollouts need generation, which re-reads the model per token
+### Preference losses over streaming (v0.72.4)
+
+`dpo`, `orpo`, `simpo` and `kto` stream exactly like `sft` — same config keys, same
+pre-flight, same refusals. The interesting part is DPO's reference model.
+
+**DPO compares the model being trained against a frozen reference.** Implemented as a
+second model instance that doubles memory and there is no point streaming at all. Soup
+instead uses *the same streamed base with its LoRA adapters switched off*, so the
+reference costs no extra weights. Measured on an RTX 3050 4 GB with a 730 MB model:
+
+| arm | peak VRAM | vs SFT |
+|---|---|---|
+| streamed SFT | 89.53 MB | — |
+| **streamed DPO** | **81.87 MB** | **0.914×** |
+| the same run forced to build a real second model | 812.32 MB | 9.92× |
+
+The third row is the control: a second instance costs **+730.44 MB against 730.44 MB of
+weights**, i.e. exactly one copy. The RAM store and the VRAM buffer pool are
+byte-identical between the SFT and DPO arms.
+
+**KTO is not reference-free**, however it is usually described — it selects a reference
+the same way DPO does, so it gets the same treatment. ORPO and SimPO genuinely are
+reference-free. All four are verified **bit-exact** against a resident run of the same
+loss.
+
+**The cost is time, not memory.** DPO runs the layer stack three times per step (policy
+forward, reference forward, checkpoint recompute) against SFT's two — measured **1.52×**
+the layer reads on a 24-layer model. Streaming makes the reference free in memory; it
+does not make it free.
+
+**Two things to know before you configure it:**
+
+- **`kto` needs `batch_size: 2` or more.** TRL's KL term is degenerate at batch 1, so
+  the run cannot work; Soup refuses it when your config is read rather than after
+  sharding the checkpoint. (KTO is streamable at all only because v0.72.3 lifted
+  streaming's own batch-1 restriction.)
+- **The VRAM pre-flight is deliberately conservative for paired losses.** DPO, ORPO and
+  SimPO send chosen and rejected through the model as one tensor, so the budget charges
+  twice the rows — correct, and it never under-predicts. But it charges them at the
+  *supervised* loss's measured per-element rate, and TRL's preference losses use a
+  cheaper path, so the estimate is an upper bound rather than a tight one. Concretely,
+  on a 4 GB card with a 128k-vocab 1B model: DPO at `max_length: 512` is allowed, and
+  from `max_length: 768` up it is refused even though it would probably fit. Lower
+  `max_length` if you hit that. (Tracked as a follow-up; under-predicting would be the
+  strictly worse failure, because on Windows it is not an error but a silent spill to
+  host memory.)
+
+**Roadmap:**
 - A published 14B-on-8 GB reference benchmark — hardware-blocked; it needs an 8 GB card and 32 GB of RAM, which the development box does not have
+- GRPO and PPO are explicitly **not** planned: rollouts need generation, which re-reads the model per token
 
 **Shard cache.** The first streaming run rewrites the checkpoint into one safetensors shard per decoder layer under `~/.soup/layer-stream/` (override with `SOUP_LAYER_STREAM_CACHE_DIR`). That costs disk space roughly equal to the base. The cache is keyed to a fingerprint of the source checkpoint, so a base retrained in place re-shards instead of silently training against stale weights.
 
@@ -708,5 +755,3 @@ Autopilot also detects pre-quantized bases automatically — `TheBloke/Llama-2-7
 The advanced GGUF pipeline uses POSIX `O_NOFOLLOW` to defeat the TOCTOU race between the dispatch-time symlink check and the actual open of the calibration data — a crafted environment cannot race-swap the calibration file between validate and read.
 
 `soup deploy autopilot --measure` caches results at `~/.soup/deploy_autopilot_cache.json` keyed on `(base, profile, eval-tasks)`. Repeat invocations short-circuit; pass `SOUP_DEPLOY_AUTOPILOT_CACHE=<path>` to redirect (constrained to home / cwd / tempdir). The recommended candidate uses soft-fallback: first `OK` by insertion order, else the candidate with the smallest delta (least drop relative to its own baseline).
-
-

@@ -52,25 +52,27 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.72.3 — layer streaming grows up: more models, bigger batches, resume, and a disk
-tier.** Layer streaming keeps the frozen base out of VRAM and feeds it to the GPU one
-decoder layer at a time. v0.72.0–.2 kept the scope deliberately tiny to prove it worked;
-this release removes the training wheels.
+**v0.72.4 — align on a laptop: DPO, ORPO, SimPO and KTO over layer streaming.** Layer
+streaming keeps the frozen base out of VRAM and feeds it to the GPU one decoder layer at
+a time. It used to support supervised fine-tuning only; now it runs the preference
+losses too.
 
-- **Six more model families** — Mistral, Gemma / Gemma 2 / Gemma 3, and Phi / Phi-3 — each
-  verified **bit-exact** against the same checkpoint loaded resident, in bf16 *and* NF4.
-- **`batch_size` above 1, gradient accumulation, and `--resume`** all work now.
-- **A pre-flight that predicts peak VRAM and refuses a run that will not fit.** Streaming
-  bounds the *weights*; the logits tensor is not bounded by it and scales with
-  `batch × seq`. On a 152k-vocab model at batch 8 that single tensor measured **8.71 GB —
-  146× the entire layer-buffer pool.** The prediction was fitted to ten real runs and
-  never under-predicts any of them.
-- **A throughput forecast measured on your card, in your session**, quoted as a range
-  next to the SM clock it was taken at — not a number compiled into the source.
-- **A disk overflow tier.** When the base will not fit in RAM, `stream_source: auto`
-  streams it from NVMe instead of refusing. Honest caveat: its *correctness* is verified
-  bit-exact against the RAM tier, but **how much slower it is has not been measured** on
-  the development hardware, and no figure is claimed.
+- **DPO's reference model is free.** DPO needs a reference to compare against, and a
+  second copy of the model would double memory and defeat the whole point. Soup uses
+  *the same streamed base with its adapters switched off* — one set of weights, one
+  stream. Measured on an RTX 3050 4 GB: streamed DPO peaked at **0.914×** the
+  supervised-fine-tuning peak. Forcing a real second model in the same test cost
+  **+730 MB — exactly one copy of the weights.**
+- **KTO is not reference-free**, however it is usually described: it picks its reference
+  the same way DPO does, so it gets the same treatment. ORPO and SimPO genuinely are.
+- **Bit-exact against a normal, non-streamed run** of the same loss — `0.0` difference,
+  the bar every release in this series has to clear.
+- **The VRAM pre-flight knows a paired loss is twice the rows**, because chosen and
+  rejected go through the model as one tensor.
+- **Honest cost:** the reference is free in *memory*, not in *time* — DPO reads the
+  layer stack **1.52×** as often per step as supervised fine-tuning does.
+- `grpo` / `ppo` stay excluded on purpose: generation re-reads every layer per token,
+  which is exactly what streaming cannot amortise.
 - Still BETA.
 
 ```yaml

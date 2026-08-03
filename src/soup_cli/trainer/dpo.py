@@ -7,12 +7,13 @@ from typing import Optional
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
+from soup_cli.trainer.stream_setup import StreamingSetupMixin
 from soup_cli.utils.gpu import estimate_batch_size, model_size_from_name
 
 console = Console()
 
 
-class DPOTrainerWrapper:
+class DPOTrainerWrapper(StreamingSetupMixin):
     """High-level wrapper for DPO training from SoupConfig.
 
     DPO requires preference data with three fields:
@@ -20,6 +21,11 @@ class DPOTrainerWrapper:
     - chosen: the preferred response
     - rejected: the less preferred response
     """
+
+    #: TRL builds this loss's forward through ``concatenated_inputs`` +
+    #: ``torch.cat``, so chosen and rejected arrive as ONE tensor of twice
+    #: the configured batch. The VRAM pre-flight must budget for that.
+    _STREAM_ROWS_PER_EXAMPLE = 2
 
     def __init__(
         self,
@@ -69,14 +75,28 @@ class DPOTrainerWrapper:
         cfg = self.config
         tcfg = cfg.training
         use_unsloth = cfg.backend == "unsloth"
+        # v0.72.4 — layer streaming replaces the model-load path entirely (meta
+        # skeleton, never a resident load), so it dispatches ahead of the backend
+        # branches. The schema already rejects streaming + unsloth/mlx.
+        use_streaming = bool(getattr(tcfg, "stream_layers", False))
 
-        if use_unsloth:
+        if use_streaming:
+            self._setup_streaming_transformers(cfg, tcfg)
+        elif use_unsloth:
             self._setup_unsloth(cfg, tcfg)
         else:
             self._setup_transformers(cfg, tcfg)
 
         trainable, total = self.model.get_nb_trainable_parameters()
-        pct = 100 * trainable / total
+        # v0.72.4 (mirrors sft.py) — under NF4 streaming PEFT's total is wrong
+        # by ~6.5x: it sizes Params4bit as `numel * 2 * quant_storage.itemsize`,
+        # right for a RESIDENT one but not for our `meta` placeholder, which
+        # still carries the LOGICAL shape. The sharder counted the real source
+        # elements, so prefer that.
+        stream_total = getattr(self._stream_runtime, "total_params", 0)
+        if stream_total:
+            total = stream_total
+        pct = 100 * trainable / total if total else 0.0
         console.print(
             f"[green]LoRA applied:[/] {trainable:,} trainable"
             f" / {total:,} total ({pct:.2f}%)"
@@ -311,8 +331,10 @@ class DPOTrainerWrapper:
 
         from soup_cli.utils.v028_features import activation_offloading_context
 
-        with activation_offloading_context(
-            self.config.training, self._output_dir,
+        # v0.72.4 — the shared context releases the streaming weight source even
+        # if training raises (see StreamingSetupMixin._training_context).
+        with self._training_context(
+            activation_offloading_context(self.config.training, self._output_dir)
         ):
             self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         duration = time.time() - start

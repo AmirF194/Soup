@@ -41,6 +41,21 @@ MIN_STREAM_BUFFERS = 2
 MAX_STREAM_BUFFERS = 8
 DEFAULT_STREAM_BUFFERS = 2
 
+# --- tasks ----------------------------------------------------------------
+#: Tasks whose trainers can run against a streamed base (v0.72.4).
+#:
+#: DPO and KTO take their reference model from the SAME streamed base with the
+#: adapters disabled (TRL's ``null_ref_context``), so the reference costs no
+#: extra weights at all — measured 0.914x the SFT peak, where forcing a real
+#: second instance cost 9.92x. ORPO and SimPO are reference-free.
+SUPPORTED_STREAM_TASKS = ("sft", "dpo", "orpo", "simpo", "kto")
+
+#: Tasks PERMANENTLY excluded, not merely unimplemented. Generation rollouts
+#: re-read every layer once per generated token, which destroys the whole
+#: premise: streaming amortises one weight read over a training step, not over a
+#: single decoded token (plan §3.2).
+ROLLOUT_STREAM_TASKS = ("grpo", "ppo")
+
 #: FLOPs per parameter per token. 6 == WITH gradient checkpointing
 #: (2 forward + 2 recompute + 2 dL/dx; base weight-grads are skipped because
 #: the base is frozen). Streaming always checkpoints, so this is never 4.

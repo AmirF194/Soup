@@ -12,6 +12,47 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.72.4] - 2026-08-03
+
+**Added — preference losses over layer streaming: DPO, ORPO, SimPO and KTO.**
+
+Layer streaming kept the frozen base in CPU RAM and fed it to the GPU one decoder
+layer at a time, but only for `task: sft`. This release opens it to the four
+preference losses. The whole risk was one thing: **DPO needs a reference model, and a
+second model instance would double memory and defeat the feature entirely.**
+
+- **The reference is the same streamed base with its adapters disabled** — one set of
+  weights, one stream, no second pass. Measured on an RTX 3050 4 GB with a 730 MB
+  model: streamed DPO peaked at **0.914x** the SFT peak, with a byte-identical RAM
+  store and buffer pool. Forcing a real second instance in the same harness cost
+  **+730.44 MB against 730.44 MB of weights** — exactly one copy. That control is what
+  makes the first number mean something.
+- **KTO is *not* reference-free**, contrary to how it is usually described: it selects
+  its reference exactly the way DPO does, so it gets the same treatment and the same
+  memory assertion. ORPO and SimPO genuinely are reference-free.
+- **Bit-exact against a resident run of the same loss** — `0.0` difference for all
+  four, the standard every slot in this series inherits.
+- **The pre-flight now knows that a paired loss is twice the rows.** DPO, ORPO and
+  SimPO concatenate chosen and rejected into one tensor, so a VRAM budget computed at
+  one row per example would have under-predicted by half — and on Windows the
+  consequence is not an error but a silent spill to host memory that makes the run an
+  order of magnitude slower.
+- **KTO requires `batch_size >= 2`** (its KL term is degenerate at 1). Soup now says so
+  when your config is read, rather than minutes later after sharding the checkpoint.
+  KTO is streamable at all only because v0.72.3 lifted the batch-1 restriction.
+- **`grpo` and `ppo` remain excluded permanently**, not "not yet": generation rollouts
+  re-read every layer once per generated token, which destroys the amortisation
+  streaming depends on. The refusal says so and deliberately names no release.
+
+The streaming setup now lives in one shared place instead of being copied per trainer,
+so the NF4 pre-flight, the RAM/disk tier choice and the VRAM fit refusal cannot drift
+between SFT and the preference losses.
+
+Honest costs: streaming makes the reference free in **memory**, not in **time** — DPO
+traverses the layer stack three times per step against SFT's two, measured at **1.52x**
+the layer reads. And the VRAM pre-flight is a sound *upper* bound for preference
+losses rather than a tight estimate; see Known Limitations in the release notes.
+
 ## [0.72.3] - 2026-07-28
 
 **Added — layer streaming breadth: more architectures, bigger batches, resume, and a

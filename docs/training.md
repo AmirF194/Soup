@@ -5,10 +5,12 @@
 > SFT, DPO/GRPO/PPO/KTO/ORPO/SimPO/IPO/BCO, tool-calling, PRM, pre-training, distillation, classification, vision/audio/TTS, unlearning, RAFT/RA-DIT, and the loop-hardening detectors.
 
 > **Training a model bigger than your GPU?** `training.stream_layers: true` streams the
-> frozen base from CPU RAM (with NVMe disk overflow in v0.72.3) one decoder layer at a time, 
-> so peak VRAM is bounded by one layer instead of the whole model. Add `quantization: 4bit` 
-> and an 8B base fits a 4 GB card — see
-> [Layer Streaming](performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723).
+> frozen base from CPU RAM (with NVMe disk overflow) one decoder layer at a time, so peak
+> VRAM is bounded by one layer instead of the whole model. Add `quantization: 4bit` and an
+> 8B base fits a 4 GB card. Works for `sft` and, from v0.72.4, for `dpo` / `orpo` /
+> `simpo` / `kto` — DPO's reference model is the same streamed base with its adapters
+> switched off, so it costs no extra weights — see
+> [Layer Streaming](performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724).
 
 **Contents:**
 
@@ -1444,5 +1446,3 @@ a conflicting combo is rejected loudly at config load. Scans cache under `~/.sou
 `all` default) is recommended for very large models — it skips the giant embedding/lm_head matrices.
 The SNR kernel is pure-numpy and transpose-invariant, so GPT-2 `Conv1D` weights score the same as
 Linear weights. (v0.71.23)
-
-

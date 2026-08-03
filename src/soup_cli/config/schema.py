@@ -12,6 +12,12 @@ from soup_cli.utils.layer_stream import (
     MAX_STREAM_BUFFERS,
     MIN_STREAM_BUFFERS,
 )
+from soup_cli.utils.layer_stream import (
+    ROLLOUT_STREAM_TASKS as _STREAM_ROLLOUT_TASKS,
+)
+from soup_cli.utils.layer_stream import (
+    SUPPORTED_STREAM_TASKS as _STREAM_SUPPORTED_TASKS,
+)
 
 # v0.39.0 Part C — per-pattern LoRA rank/alpha bounds
 _MAX_LORA_RANK_PATTERN_KEYS = 256
@@ -4658,11 +4664,22 @@ class SoupConfig(BaseModel):
                     "the base layer-by-layer."
                 )
             return self
-        if self.task != "sft":
+        # v0.72.4 — the four preference losses join SFT. DPO and KTO take their
+        # reference from the SAME streamed base with adapters disabled (TRL's
+        # `null_ref_context`), so the reference costs no extra weights: measured
+        # 0.914x SFT peak VRAM where a second instance was 9.92x.
+        if self.task in _STREAM_ROLLOUT_TASKS:
             raise ValueError(
-                f"training.stream_layers requires task='sft'; got "
-                f"task={self.task!r}. Preference losses (DPO/ORPO/SimPO/KTO) "
-                f"land in v0.72.4."
+                f"training.stream_layers cannot be used with task={self.task!r}: "
+                f"it needs generation rollouts, which re-read every layer once "
+                f"per generated token. That destroys the amortisation streaming "
+                f"depends on (one weight read per step, not per token), so this "
+                f"is a permanent exclusion rather than an unimplemented one."
+            )
+        if self.task not in _STREAM_SUPPORTED_TASKS:
+            raise ValueError(
+                f"training.stream_layers supports task in "
+                f"{sorted(_STREAM_SUPPORTED_TASKS)}; got task={self.task!r}."
             )
         if self.backend != "transformers":
             raise ValueError(
@@ -4706,6 +4723,23 @@ class SoupConfig(BaseModel):
         # pre-flight says so rather than the schema refusing it, because
         # accumulation is the ONLY way to raise effective batch once the VRAM
         # budget is exhausted (peak moved 0.842 -> 0.846 GB across accum 1->4).
+        # v0.72.4 — KTO's KL term is degenerate at a per-device batch of 1, so
+        # TRL refuses it outright ("Actual (not effective) batch size must be
+        # > 1"). Under streaming that ValueError arrives only AFTER the RAM
+        # pre-flight, the checkpoint sharding and — at quantization='4bit' —
+        # the NF4 quantisation pass: minutes of disk I/O on a real base, to
+        # fail on a config that was already invalid. Refuse it at parse time.
+        if (
+            self.task == "kto"
+            and isinstance(tcfg.batch_size, int)
+            and tcfg.batch_size < 2
+        ):
+            raise ValueError(
+                "task='kto' requires training.batch_size >= 2 (TRL's KL term is "
+                "degenerate at batch 1). Checked here rather than in the "
+                "trainer so a streaming run fails before sharding the "
+                "checkpoint, not minutes into it."
+            )
         if tcfg.lora.r < 1:
             raise ValueError(
                 "training.stream_layers requires LoRA (training.lora.r >= 1) — "

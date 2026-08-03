@@ -769,9 +769,18 @@ class TestStreamSchemaDefaults:
 
 
 class TestStreamTaskAndBackendGates:
-    def test_non_sft_task_rejected(self):
-        with pytest.raises(ValueError, match="sft"):
-            _load(_stream_yaml(task="dpo"))
+    def test_unsupported_task_rejected(self):
+        """v0.72.4 opened the four preference losses, so `dpo` is no longer the
+        example here. `reward_model` still has no streaming path, and `grpo` is
+        excluded permanently — rollouts re-read every layer per generated
+        token."""
+        with pytest.raises(ValueError, match="stream_layers"):
+            _load(_stream_yaml(task="reward_model"))
+        with pytest.raises(ValueError, match="generation"):
+            _load(_stream_yaml(task="grpo"))
+
+    def test_preference_tasks_are_accepted_since_v0724(self):
+        assert _load(_stream_yaml(task="dpo")).task == "dpo"
 
     def test_unsloth_backend_rejected(self):
         with pytest.raises(ValueError, match="transformers"):

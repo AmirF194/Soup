@@ -41,21 +41,26 @@ train = [
     "torch>=2.0.0",
     "transformers>=4.36.0,<5.0.0",
     "peft>=0.7.0",
-    # v0.72.4: capped below 0.29. The break is at a MINOR, not at 1.0 — verified
-    # by reading the wheels rather than assuming: 0.28.0 still exports
-    # `ORPOConfig` and `CPOConfig` and still accepts `max_prompt_length`; 0.29.0
-    # removes all three. Six trainers (bco, dpo, ipo, kto, orpo, simpo) pass
-    # `max_prompt_length`, and orpo/simpo import configs that no longer exist, so
-    # on >=0.29 `soup train --task orpo` fails at import.
+    # v0.72.4: capped below 0.25. Six trainers (bco, dpo, ipo, kto, orpo, simpo)
+    # pass `max_prompt_length` to their trl config, and trl removed it in STAGES
+    # rather than in one release — which is why a single spot-check gives the
+    # wrong answer. Read off the published wheels, per config:
     #
-    # That was latent, not new: the trl imports live inside `setup()`, which no
-    # test had ever called on those wrappers, so CI stayed green while the code
-    # only worked on <0.29 and anyone pip-installing today got a broken install.
-    # v0.72.4's end-to-end preference tests are what surfaced it.
+    #   version   dpo   kto   orpo   cpo   bco
+    #   0.24.0    yes   yes   yes    yes   yes   <- last release all six work on
+    #   0.25.1    yes   yes   yes    yes   NO
+    #   0.26.0    yes   NO    NO     NO    NO
+    #   0.29.0    NO    NO    gone   gone  gone  <- ORPOConfig/CPOConfig deleted
     #
-    # Migrating to the >=0.29 API is its own piece of work; shipping against a
+    # So `soup train --task bco` breaks at 0.25, `--task kto|orpo|simpo` at 0.26,
+    # and `--task dpo|ipo` at 0.29. That was latent, not new: the trl imports live
+    # inside `setup()`, which no test had ever called on those wrappers, so CI
+    # stayed green while anyone pip-installing got a broken install. v0.72.4's
+    # end-to-end preference tests are what surfaced it.
+    #
+    # Migrating to the newer API is its own piece of work; shipping against a
     # release nobody has validated is not a substitute for it.
-    "trl>=0.7.0,<0.29",
+    "trl>=0.7.0,<0.25",
     "datasets>=2.14.0",
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",

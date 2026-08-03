@@ -48,20 +48,22 @@ The streaming setup now lives in one shared place instead of being copied per tr
 so the NF4 pre-flight, the RAM/disk tier choice and the VRAM fit refusal cannot drift
 between SFT and the preference losses.
 
-**Fixed — `trl` is now capped below 0.29, and that is a real bug fix, not a CI tweak.**
-`trl` 0.29.0 removed `ORPOConfig` and `CPOConfig` outright and dropped
-`max_prompt_length` from the remaining preference configs, so **six trainers** (`bco`,
-`dpo`, `ipo`, `kto`, `orpo`, `simpo`) could not so much as build their configuration
-against it: anyone who ran `pip install 'soup-cli[train]'` and resolved to 0.29+ had
-`soup train --task orpo` fail on import. That was already true before this release and
-nothing caught it — the `trl` imports live inside `setup()`, which no test had ever
-called on those wrappers, so CI stayed green while the code only worked below 0.29.
-This release's end-to-end preference tests are what surfaced it.
+**Fixed — `trl` is now capped below 0.25, and that is a real bug fix, not a CI tweak.**
+Six trainers (`bco`, `dpo`, `ipo`, `kto`, `orpo`, `simpo`) pass `max_prompt_length` to
+their `trl` config, and `trl` removed it in stages: `bco` at 0.25, `kto`/`orpo`/`simpo`
+at 0.26, `dpo`/`ipo` at 0.29 — which also deleted `ORPOConfig` and `CPOConfig`
+outright. So anyone who ran `pip install 'soup-cli[train]'` and resolved to a recent
+`trl` had `soup train --task orpo` fail on import.
 
-The boundary was established by reading the published wheels rather than assumed:
-0.28.0 still exports both configs and still accepts `max_prompt_length`; 0.29.0 has
-none of the three. Supporting the newer API is its own piece of work; declaring a
-dependency the code actually works with comes first.
+That was already true before this release and nothing caught it: the `trl` imports
+live inside `setup()`, which no test had ever called on those wrappers, so CI stayed
+green while the code only worked on older `trl`. This release's end-to-end preference
+tests are what surfaced it.
+
+The boundary was read off the published wheels per config rather than inferred from a
+version number — the removal being staged is exactly why a single spot-check gives the
+wrong answer. Supporting the newer API is its own piece of work; declaring a dependency
+the code actually works with comes first.
 
 Honest costs: streaming makes the reference free in **memory**, not in **time** — DPO
 traverses the layer stack three times per step against SFT's two, measured at **1.52x**

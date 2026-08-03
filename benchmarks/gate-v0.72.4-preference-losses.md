@@ -24,11 +24,29 @@ written before a gate passed.
 > therefore also records *which TRL internals the property depends on*, so the
 > shipped tests assert the property rather than the internals.
 >
-> An earlier note in this repo claimed CI runs trl "1.9.2". That was wrong and
-> repeating it cost a red CI cycle: the break is at a MINOR, 0.29.0, which
-> removed `ORPOConfig`, `CPOConfig` and `max_prompt_length`. Established by
-> reading the published wheels (0.28.0 has all three, 0.29.0 has none), not
-> inferred from a major-version bump. The dependency is capped `<0.29`.
+> **A dependency break found during this release, and two wrong diagnoses before
+> the right one.** Six trainers (`bco`, `dpo`, `ipo`, `kto`, `orpo`, `simpo`) pass
+> `max_prompt_length` to their trl config, and trl removed it in STAGES — which is
+> why each spot-check gave a different answer. Read per config off the published
+> wheels:
+>
+> | version | dpo | kto | orpo | cpo | bco |
+> |---|---|---|---|---|---|
+> | 0.24.0 | yes | yes | yes | yes | yes |
+> | 0.25.1 | yes | yes | yes | yes | **NO** |
+> | 0.26.0 | yes | **NO** | **NO** | **NO** | NO |
+> | 0.29.0 | **NO** | NO | *gone* | *gone* | *gone* |
+>
+> First diagnosis: "trl 1.x removed them" — taken from an existing note in this
+> repo claiming CI runs trl 1.9.2. Wrong; CI's install log shows **0.29.1**, so a
+> `<1` cap excluded nothing. Second: "the break is 0.29.0" — right for `dpo`, but
+> checked only `dpo_config.py` and extrapolated. The dependency is capped
+> **`<0.25`**, the last release on which all six work.
+>
+> This is a pre-existing bug, not one this release introduced: the trl imports
+> live inside `setup()`, which no test had ever called on those wrappers, so CI
+> stayed green while `soup train --task orpo` was broken for anyone installing
+> fresh. v0.72.4's end-to-end preference tests are what surfaced it.
 
 **The inherited standard** — a streamed run must be bit-exact against the
 resident run of the same numerics; what changes per slot is the *reference*, not

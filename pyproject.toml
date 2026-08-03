@@ -41,16 +41,21 @@ train = [
     "torch>=2.0.0",
     "transformers>=4.36.0,<5.0.0",
     "peft>=0.7.0",
-    # v0.72.4: capped below 1.0. The floor alone was not enough. trl 1.x removed
-    # `ORPOConfig` and `CPOConfig` outright and dropped `max_prompt_length` from
-    # the remaining preference configs, so six trainers (bco, dpo, ipo, kto,
-    # orpo, simpo) cannot even build their config against it. That was latent,
-    # not new: no test had ever called `.setup()` on those wrappers, so CI stayed
-    # green on trl 1.9.2 while `soup train --task orpo` was dead on arrival for
-    # anyone who pip-installed today. v0.72.4's own end-to-end tests are what
-    # surfaced it. Migrating to the 1.x API is its own piece of work (#TBD) and
-    # shipping against a major nobody has validated is not a substitute for it.
-    "trl>=0.7.0,<1",
+    # v0.72.4: capped below 0.29. The break is at a MINOR, not at 1.0 — verified
+    # by reading the wheels rather than assuming: 0.28.0 still exports
+    # `ORPOConfig` and `CPOConfig` and still accepts `max_prompt_length`; 0.29.0
+    # removes all three. Six trainers (bco, dpo, ipo, kto, orpo, simpo) pass
+    # `max_prompt_length`, and orpo/simpo import configs that no longer exist, so
+    # on >=0.29 `soup train --task orpo` fails at import.
+    #
+    # That was latent, not new: the trl imports live inside `setup()`, which no
+    # test had ever called on those wrappers, so CI stayed green while the code
+    # only worked on <0.29 and anyone pip-installing today got a broken install.
+    # v0.72.4's end-to-end preference tests are what surfaced it.
+    #
+    # Migrating to the >=0.29 API is its own piece of work; shipping against a
+    # release nobody has validated is not a substitute for it.
+    "trl>=0.7.0,<0.29",
     "datasets>=2.14.0",
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",

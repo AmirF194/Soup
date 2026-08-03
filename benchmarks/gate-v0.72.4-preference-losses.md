@@ -19,10 +19,16 @@ torch 2.5.1+cu121 · transformers 4.57.6 · peft 0.18.1 · **trl 0.19.1**.
 Gates are throwaway scripts in the session scratchpad; nothing under `src/` was
 written before a gate passed.
 
-> **Version caveat, stated up front.** CI runs trl 1.9.2 / peft 0.20.0 /
+> **Version caveat, stated up front.** CI resolves trl **0.29.1** / peft 0.20.0 /
 > torch 2.13.0. Everything below is measured against trl **0.19.1**. The gate
 > therefore also records *which TRL internals the property depends on*, so the
 > shipped tests assert the property rather than the internals.
+>
+> An earlier note in this repo claimed CI runs trl "1.9.2". That was wrong and
+> repeating it cost a red CI cycle: the break is at a MINOR, 0.29.0, which
+> removed `ORPOConfig`, `CPOConfig` and `max_prompt_length`. Established by
+> reading the published wheels (0.28.0 has all three, 0.29.0 has none), not
+> inferred from a major-version bump. The dependency is capped `<0.29`.
 
 **The inherited standard** — a streamed run must be bit-exact against the
 resident run of the same numerics; what changes per slot is the *reference*, not

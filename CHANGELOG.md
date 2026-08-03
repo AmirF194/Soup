@@ -48,16 +48,20 @@ The streaming setup now lives in one shared place instead of being copied per tr
 so the NF4 pre-flight, the RAM/disk tier choice and the VRAM fit refusal cannot drift
 between SFT and the preference losses.
 
-**Fixed — `trl` is now capped below 1.0, and that is a real bug fix, not a CI tweak.**
-`trl` 1.x removed `ORPOConfig` and `CPOConfig` outright and dropped
+**Fixed — `trl` is now capped below 0.29, and that is a real bug fix, not a CI tweak.**
+`trl` 0.29.0 removed `ORPOConfig` and `CPOConfig` outright and dropped
 `max_prompt_length` from the remaining preference configs, so **six trainers** (`bco`,
 `dpo`, `ipo`, `kto`, `orpo`, `simpo`) could not so much as build their configuration
-against it: anyone who ran `pip install 'soup-cli[train]'` and got `trl` 1.x had
+against it: anyone who ran `pip install 'soup-cli[train]'` and resolved to 0.29+ had
 `soup train --task orpo` fail on import. That was already true before this release and
-nothing caught it — no test had ever called `setup()` on those wrappers, so CI stayed
-green against `trl` 1.9.2 while the code only worked on 0.x. This release's
-end-to-end preference tests are what surfaced it. Supporting the `trl` 1.x API is its
-own piece of work; declaring a dependency the code actually works with comes first.
+nothing caught it — the `trl` imports live inside `setup()`, which no test had ever
+called on those wrappers, so CI stayed green while the code only worked below 0.29.
+This release's end-to-end preference tests are what surfaced it.
+
+The boundary was established by reading the published wheels rather than assumed:
+0.28.0 still exports both configs and still accepts `max_prompt_length`; 0.29.0 has
+none of the three. Supporting the newer API is its own piece of work; declaring a
+dependency the code actually works with comes first.
 
 Honest costs: streaming makes the reference free in **memory**, not in **time** — DPO
 traverses the layer stack three times per step against SFT's two, measured at **1.52x**

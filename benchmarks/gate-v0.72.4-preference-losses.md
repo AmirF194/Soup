@@ -276,6 +276,21 @@ All four saved adapters: **120 tensors, 0 keys carrying the streaming wrapper
 segment, 60/60 non-zero `lora_B`** — i.e. ordinary LoRA adapters that load into any
 non-streaming model.
 
+### One CPU-only limitation, found by CI rather than locally
+
+A full KTO **training step** over a streamed model runs on CUDA (verified here and
+on the dev box) but fails on a CPU-only runner under newer torch/TRL with
+`Tensor on device cpu is not on the expected device meta!`. Streaming exists to
+bound VRAM, so a streamed model on CPU is a test convenience rather than a real
+configuration — the same stance v0.72.3 took on PEFT's re-dispatch — and that test
+is therefore gated to the production device. Everything else about KTO (the schema
+gate, `setup()`, the reference behaviour, the layer-read accounting) is still
+exercised on CPU.
+
+Worth stating plainly: this was invisible on the dev box, which has CUDA. The
+locally-green suite is a weaker signal than it looks whenever a code path forks on
+device.
+
 Ten rejected configurations each named its own reason (rollout tasks, unsupported
 task, KTO at batch 1, unsloth backend, 8-bit, no adapter, DoRA, `batch_size: auto`,
 packing).

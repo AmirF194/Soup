@@ -962,6 +962,10 @@ class TestKtoBatchIsRefusedEarly:
             report_to=[],
             max_length=32,
             max_prompt_length=16,
+            # Newer TRL configs enable bf16 by default, which a CPU-only runner
+            # rejects with "Your setup doesn't support bf16/gpu" BEFORE reaching
+            # the batch-size check this test exists to pin.
+            bf16=False,
         )
         with pytest.raises(ValueError, match="batch size"):
             KTOTrainer(

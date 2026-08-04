@@ -1,4 +1,4 @@
-"""soup train --stream-layers — streaming runtime (v0.72.0 BETA).
+"""training.stream_layers — streaming runtime (v0.72.0 BETA).
 
 The torch half: pre-allocated VRAM buffer pool, the CPU-RAM weight source, the
 prefetch scheduler, the layer wrapper, and the meta-device model build.

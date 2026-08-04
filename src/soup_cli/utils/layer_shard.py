@@ -1,4 +1,4 @@
-"""soup train --stream-layers — checkpoint sharder (v0.72.0 BETA).
+"""training.stream_layers — checkpoint sharder (v0.72.0 BETA).
 
 Rewrites an HF checkpoint into one ``layer_NNN.safetensors`` per decoder layer
 plus a single ``extras.safetensors`` (embeddings / final norm / untied head),

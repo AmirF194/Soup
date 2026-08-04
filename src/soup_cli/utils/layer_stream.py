@@ -1,4 +1,4 @@
-"""soup train --stream-layers — layer streaming planner (v0.72.0 BETA).
+"""training.stream_layers — layer streaming planner (v0.72.0 BETA).
 
 The pure half: tier choice, pinned-vs-pageable decision, the architecture
 allowlist, and the VRAM / throughput arithmetic. **No top-level torch** — this
@@ -856,4 +856,4 @@ def render_stream_panel(plan: StreamPlan, extra_lines: Sequence[str] = ()) -> Pa
     lines.extend(extra_lines)
     for note in plan.notes:
         lines.append(f"  [yellow]![/] {note}")
-    return Panel("\n".join(lines), title="soup train --stream-layers", border_style="cyan")
+    return Panel("\n".join(lines), title="training.stream_layers", border_style="cyan")

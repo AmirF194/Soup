@@ -1501,7 +1501,7 @@ training:
 
 class TestReportedParameterCount:
     """Found by the step-6 smoke, not by any unit test: a real
-    ``soup train --stream-layers`` with ``quantization: 4bit`` printed
+    ``training.stream_layers`` run with ``quantization: 4bit`` printed
     "878,154,048 total" for SmolLM2-135M (true count 134,515,008), while the
     RESIDENT NF4 path printed 134,975,808. PEFT special-cases ``Params4bit`` as
     ``numel * 2 * quant_storage.itemsize`` — correct for a resident one, whose

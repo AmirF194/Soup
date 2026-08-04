@@ -540,5 +540,3 @@ training:
 ```
 
 > **Note:** GaLore requires `quantization: none` and `backend: transformers` (not unsloth).
-
-

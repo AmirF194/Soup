@@ -604,5 +604,3 @@ future caller adding `tar.extractall` automatically gets the safe-mode
 extraction filter. `soup airgap-bundle` is intentionally a top-level
 command (not `soup deploy airgap-bundle`) — it's an export operation,
 not a deploy target.
-
-

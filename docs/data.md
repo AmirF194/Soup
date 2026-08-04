@@ -819,5 +819,3 @@ systematically longer than `rejected`, reported as a Cohen's d effect size —
 `prompt_leak` (the prompt echoed verbatim inside the completion, a common
 synthetic-data pipeline bug). Same OK/MINOR/MAJOR taxonomy and exit codes as
 `soup data doctor`.
-
-

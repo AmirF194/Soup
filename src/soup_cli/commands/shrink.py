@@ -602,5 +602,3 @@ def _run_heal(
         raise RuntimeError(f"heal distill failed (rc={result.returncode}): {tail}")
 
     _fuse_adapter(base_dir=pruned_dir, adapter_dir=out_dir, trc=trc)
-
-

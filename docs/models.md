@@ -95,5 +95,3 @@ no PyTorch. Add `[train]` to fine-tune, or install other extras only when you ne
 | `dev` | `pip install "soup-cli[dev]"` | Tests + lint + types (pytest, ruff, mypy, pre-commit) |
 
 The complete, authoritative extras list is in [`pyproject.toml`](../pyproject.toml).
-
-

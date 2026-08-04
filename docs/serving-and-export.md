@@ -701,5 +701,3 @@ Three POST routes are now available on `soup serve`:
 - **`POST /v1/tools/bash`** — Deferred to v0.53.8. Current child-process isolation
   insufficient for `/bin/sh -c` (subprocess escapes the RLVR sandbox). Returns 501 with
   v0.53.8 marker pending container/namespace work.
-
-

@@ -920,5 +920,3 @@ soup license-advisor --target b2c --license llama-3 --monthly-active-users 80000
 ```
 
 The Llama-family allowlist is tight (no `.startswith` over-match), so a hypothetical future `llama-permissive-2030` won't false-trigger the 700M-MAU gate. Composes with v0.60 `soup adapters merge --license <id>` for the merge-time conflict gate.
-
-

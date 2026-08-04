@@ -40,6 +40,13 @@ soup init --template chat
 soup train
 ```
 
+**Fine-tune an 8B model on a 4 GB laptop GPU.** Layer streaming keeps the frozen base out of
+VRAM and feeds it to the GPU one decoder layer at a time. Measured on an RTX 3050 Laptop 4 GB:
+Llama-3.1-8B-Instruct + NF4 at **119.6 tok/s, 3.32 GB peak** — bit-exact against a normal
+resident run. Opt-in (`stream_layers: true`) and still BETA —
+[how it works](docs/performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724) ·
+[all measurements](benchmarks/) · [paper](https://doi.org/10.5281/zenodo.21771064)
+
 ## Why Soup?
 
 Training LLMs is still painful. Even experienced teams spend 30-50% of their time fighting

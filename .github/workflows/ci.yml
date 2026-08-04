@@ -49,17 +49,23 @@ jobs:
       # (seen with trl.trainer.grpo_trainer on windows-latest / py3.11).
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
-      # Pin the HF cache to a deterministic path so actions/cache restores it
-      # identically on ubuntu / windows / macos — the default
-      # ~/.cache/huggingface sits under a different user on each runner. Kept
-      # OUTSIDE the checkout on purpose: this lands ~0.5 GB on disk, and inside
-      # the repo it would be walked by the tests that scan cwd for containment.
-      HF_HOME: ${{ runner.temp }}/hf-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Pin the HF cache to a deterministic path
+        # Set here and not in the job-level `env:` block: the `runner` context
+        # is not available there (only github / needs / strategy / matrix /
+        # vars / secrets / inputs are), and referencing it makes GitHub reject
+        # the whole workflow file before any job starts.
+        #
+        # Why a fixed path at all: the default ~/.cache/huggingface sits under
+        # a different user on each runner OS, so actions/cache cannot restore
+        # it by one key. Kept OUTSIDE the checkout because it lands ~0.5 GB,
+        # which the tests that walk cwd for containment would otherwise scan.
+        shell: bash
+        run: echo "HF_HOME=$RUNNER_TEMP/hf-cache" >> "$GITHUB_ENV"
       - name: Restore HF Hub cache
         id: hf-cache
         uses: actions/cache/restore@v4

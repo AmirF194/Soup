@@ -16,6 +16,19 @@ jobs:
           python-version: "3.11"
       - run: pip install ruff
       - run: ruff check src/soup_cli/ tests/
+      - name: Lint the workflows themselves
+        # `check-yaml` and a YAML parser both accept a workflow GitHub will
+        # reject: 195d60b used the `runner` context in a job-level `env:` block,
+        # which is valid YAML and invalid Actions, and the whole matrix died
+        # before any job produced a log. actionlint checks context availability,
+        # expression syntax, action inputs, and shellchecks `run:` blocks.
+        #
+        # Pinned and installed from source rather than `curl | bash` of the
+        # upstream install script, matching how the rest of this repo pulls
+        # third-party tooling. Go is preinstalled on ubuntu-latest.
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color
 
   type-check:
     runs-on: ubuntu-latest

@@ -16,6 +16,19 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  # Validates .github/workflows/*.yml against the GitHub Actions schema —
+  # context availability, expression syntax, action inputs, shellcheck over
+  # `run:` blocks. `check-yaml` below cannot see any of that: a workflow can be
+  # perfectly valid YAML and still be rejected by GitHub before a single job
+  # starts, which is exactly what happened in 195d60b.
+  #
+  # Builds with Go. If a contributor has no Go toolchain, swap this for the
+  # `actionlint-docker` id from the same repo.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:

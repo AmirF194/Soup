@@ -136,30 +136,49 @@ jobs:
               ("gpt2", SAFETENSORS),
           ]
 
-          complete = True
-          for repo, allow in models:
-              for attempt in range(1, 7):
+          # One budget for the whole list, not per repo. Run 30947949103
+          # showed why: on windows/3.11 ALL SIX repos failed EVERY attempt,
+          # including the tiny fixtures every other cell fetched in under a
+          # second. The Hub had cut that runner off for the duration — so
+          # burning a fresh retry ladder on repo #2 the moment repo #1 gave up
+          # just spends the budget faster without ever waiting out the block.
+          deadline = time.monotonic() + 360
+          pending = list(models)
+          delay = 10
+
+          while pending and time.monotonic() < deadline:
+              still_pending = []
+              for repo, allow in pending:
                   try:
                       snapshot_download(repo, allow_patterns=allow)
                       print(f"warmed {repo}")
-                      break
                   except Exception as exc:  # noqa: BLE001 — best effort, never fail the job
-                      print(f"attempt {attempt}/6 for {repo} failed: {type(exc).__name__}: {exc}")
-                      time.sleep(min(5 * attempt, 30))
-              else:
-                  print(f"::warning title=HF cache::could not warm {repo} after 6 attempts")
-                  complete = False
+                      print(f"{repo}: {type(exc).__name__}: {exc}")
+                      still_pending.append((repo, allow))
+              pending = still_pending
+              if pending:
+                  print(f"{len(pending)} repo(s) left; retrying in {delay}s")
+                  time.sleep(delay)
+                  delay = min(delay * 2, 60)
+
+          for repo, _ in pending:
+              print(f"::warning title=HF cache::could not warm {repo} within the retry budget")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"warmed={'all' if complete else 'partial'}\n")
+              fh.write(f"warmed={'partial' if pending else 'all'}\n")
       - name: Save HF Hub cache
         # Only a COMPLETE warm is saved. A partial one would freeze the very
         # gap this step exists to close: the key is content-addressed, so a
         # cache written while a model was 429-ing is never replaced, and every
         # later run would restore the same hole.
-        # Restricted to one cell per OS — the blobs are platform-independent,
-        # and 3 python versions racing to upload the same key is pure waste.
-        if: always() && steps.warm.outputs.warmed == 'all' && matrix.python-version == '3.11' && steps.hf-cache.outputs.cache-hit != 'true'
+        #
+        # ANY cell may save, deliberately. Restricting this to 3.11 to avoid
+        # redundant uploads is what left Windows with no cache at all in run
+        # 30947949103: 3.11 was the one cell the Hub cut off, so the two
+        # healthy Windows cells were not allowed to save what they had. The
+        # losers of the resulting race log "unable to reserve cache" and move
+        # on, which is far cheaper than an OS that never gets a cache.
+        if: always() && steps.warm.outputs.warmed == 'all' && steps.hf-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/hf-cache

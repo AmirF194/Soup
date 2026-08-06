@@ -1386,8 +1386,52 @@ claimed is that the failure is aliasing and that de-aliasing removes it.
 
 Practical consequence for a fix: the cheap-looking repair (clone the pooled
 tensors) costs one extra copy of every streamed layer per forward, which is the
-thing the pre-allocated pool exists to avoid. Whether that is cheaper than the
-6.56x of STEP 8 was not measured.
+thing the pre-allocated pool exists to avoid. It was then measured — see below,
+and the answer is not the one this paragraph expected.
+
+### What the real fix would cost — and why the cheap one is not a fix
+
+STEP 8 measured `pin=False` at 6.56x and concluded that a silent fallback was too
+expensive. Cloning looked much more promising on first principles: a clone is a
+device-to-device copy at HBM bandwidth, duplicating bytes that just arrived over
+PCIe, so it should be nearly free. Measured, same process, correctness asserted
+in each arm so a fast arm cannot quietly be the wrong one (synthetic 32-layer /
+5120 / 27648 NF4, seq 256, 15 timed steps after 4 warm-up, n=2):
+
+| arm | gradients | tok/s | vs control | **peak VRAM** |
+|---|---|---|---|---|
+| control *(shipped)* | **WRONG** 8/128 | 849.62 | 1.00x | **1,132 MiB** |
+| clone *(de-alias)* | correct 128/128 | 801.22 | **1.06x** | **9,070 MiB** |
+| `pin=False` | correct 128/128 | 114.70 | 7.41x | 1,129 MiB |
+
+The time cost was the easy half and it is indeed almost nothing: **6%**, against
+7.41x for turning pinning off. On wall-clock alone the clone wins overwhelmingly.
+
+**And it is still not a fix, because of the last column.** Peak VRAM goes
+1,132 -> 9,070 MiB, an **8x increase**, and 9,070 MiB is approximately the whole
+model (32 layers x 241 MiB = 7.7 GB). That is the entire premise of layer
+streaming deleted: peak VRAM is supposed to be bounded by one layer, and a
+private copy per layer makes it bounded by the model instead. A "fix" that makes
+the feature pointless is not a fix.
+
+That number is also the sharpest statement of the defect available. If every
+layer's weights must stay alive until the backward reaches that layer, then all
+of them are alive at once — which is precisely what streaming exists to avoid.
+The recompute is *supposed* to re-fetch instead, and the measurement says the
+re-fetched buffer does not survive to its own backward.
+
+So the fix has to keep a buffer alive across exactly its own
+recompute-plus-backward window and no longer. Raising `stream_buffers` is not
+that: at 8 buffers exactly 8 layers survive, so reaching correctness that way
+means one buffer per layer, i.e. the whole model again.
+
+**Handover, in one line:** the defect is aliasing; de-aliasing costs 6% time but
+8x VRAM; `pin=False` costs 7.41x time at no VRAM cost; the correct repair is
+neither, and was not found here.
+
+*(The 7.41x here and the 6.56x in STEP 8 are different models — this synthetic
+32-layer one versus the real Qwen2.5-32B — so they are two measurements of the
+same effect, not a discrepancy.)*
 
 ### Reproducing the mechanism arms
 

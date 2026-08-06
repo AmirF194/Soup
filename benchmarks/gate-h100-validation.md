@@ -1153,6 +1153,30 @@ indicative.
   streamed all fail on this torch before training starts (FINDING 2), so v0.72.4's
   claims are untested here.
 
+### Does any of this change the preprint?
+
+The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
+Laptop GPU*, DOI [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064))
+measures Llama-3.1-8B NF4 on a 4 GB card. A published DOI cannot be quietly
+corrected, so this is answered explicitly rather than left implicit.
+
+**No measured number in it changes, and nothing in it is invalidated.**
+
+- Its headline configuration is 8B NF4 at **105 MiB per layer**, comfortably
+  below the 163.8–171.5 MiB boundary found here, and it survives a 50-backward
+  soak with `worst_abs = 0.0`.
+- Its throughput claim is independently reproduced on different hardware, a
+  different OS and a much newer stack: 119.6 tok/s / 3.32 GB there against a
+  median 113.00 tok/s / 3.32 GB here.
+- Its exactness claim is *strengthened*, not weakened: what it could only assert
+  on 3-layer from-config checkpoints is now shown against resident references at
+  8B, 14B, 32B and 72B.
+
+What the session adds is **scope beyond** what the preprint claims — behaviour at
+32B and above, which it never asserted — plus the defect that lives there. If a
+future version widens its scope past 14B, this record's threshold and the
+pinning result have to go with it.
+
 ### Reproducing
 
 Harness scripts live in the session scratchpad, not in the repo. Each is small

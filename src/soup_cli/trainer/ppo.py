@@ -773,7 +773,7 @@ def _load_reward_model(
         requires_remote_code=requires,
     )
     console.print(f"[dim]Loading reward model: {model_path}[/]")
-    dev_map = "cpu" if device == "cpu" else "auto"
+    dev_map = resolve_device_map(device)
     model_kwargs: dict = {
         "trust_remote_code": resolved,
         "device_map": dev_map,

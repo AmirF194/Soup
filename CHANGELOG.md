@@ -12,6 +12,21 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+**Fixed — `accelerate launch` now works for every trainer, not six of them.**
+`device_map="auto"` shards one model across every visible GPU, and transformers
+refuses it outright under a distributed launch (`You can't train a model that has
+been loaded with device_map='auto' in any distributed mode`), so the exact
+`accelerate launch --num_processes 8` command `soup train --gpus 8` prints died on
+every rank. The first pass replaced that line in six trainers; nine sites still
+carried it — `bco`, `distill`, `embedding`, `ipo`, `online_dpo`, `orpo`,
+`reward_model`, `simpo` and PPO's own reward-model loader — and `orpo`/`simpo` are
+two of the four preference losses v0.72.4 ships layer streaming for, so the feature
+was half-fixed inside one release. All fifteen sites now go through
+`utils/gpu.resolve_device_map`, which returns `{"": LOCAL_RANK}` when `WORLD_SIZE>1`
+and `"auto"` otherwise. The regression guard no longer parametrizes over a
+hand-written list of trainer names — the list is what hid the nine — but scans every
+module in `soup_cli/trainer/`, with a control proving the scanner can fail.
+
 **Added — `--deepspeed zero3_offload`, a ZeRO-3 preset that offloads parameters to
 CPU.** `zero3` set `offload_param: none` and the only offload *preset* was stage 2,
 optimizer-only, so the configuration a user short of VRAM actually wants could not be

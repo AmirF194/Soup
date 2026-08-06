@@ -18,11 +18,28 @@ on the SFT path, and a one-GPU dev box cannot see it.
 These tests run everywhere: the distributed environment is just env vars.
 """
 
+import pathlib
+import re
+
 import pytest
 
 from soup_cli.utils.gpu import resolve_device_map
 
-TRAINERS = ["sft", "dpo", "grpo", "kto", "pretrain", "ppo"]
+_TRAINER_DIR = pathlib.Path(__file__).resolve().parents[1] / "src" / "soup_cli" / "trainer"
+_TRAINER_SOURCES = sorted(_TRAINER_DIR.glob("*.py"))
+
+#: The exact idiom this fix replaces: ``dev_map = "cpu" if <cond> else "auto"``.
+#: Written against the assignment rather than a variable name, so a copy that
+#: renames ``dev_map`` is still caught.
+_OLD_IDIOM = re.compile(r"""=\s*["']cpu["']\s+if\s+.+?\s+else\s+["']auto["']""")
+#: The other spelling PPO used: ``device_map="auto" if ... else None``.
+_INLINE_AUTO = re.compile(r"""device_map\s*=\s*["']auto["']""")
+
+
+def _code_without_comments(text: str) -> str:
+    """Strip trailing comments so the stale ``# ... from "auto"`` notes left
+    above the fixed lines do not read as violations."""
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
 
 
 @pytest.fixture(autouse=True)
@@ -86,15 +103,62 @@ class TestMalformedEnvironment:
 
 
 class TestNoTrainerStillHardcodesAuto:
-    """Guards the COVERAGE, not the helper: a seventh trainer copying the old
-    line back in would silently reopen a defect that is invisible on one GPU."""
+    """Guards the COVERAGE, and derives it from the sources rather than a list.
 
-    @pytest.mark.parametrize("name", TRAINERS)
-    def test_trainer_uses_the_shared_helper(self, name):
-        import importlib
-        import inspect
+    The first version of this class parametrized over six hand-written trainer
+    names -- exactly the six the original fix had touched -- and passed while
+    NINE more sites still carried the old line: bco, distill, embedding, ipo,
+    online_dpo, orpo, reward_model, simpo and PPO's own reward-model loader. So
+    `accelerate launch` still died on those tasks, and the guard that existed to
+    notice could not, because a hand-written list cannot report what it does not
+    name. The scan below covers every module in the package, so a tenth site --
+    or a new trainer copying the idiom back in -- fails here instead of on a
+    multi-GPU box nobody develops on."""
 
-        module = importlib.import_module("soup_cli.trainer.%s" % name)
-        source = inspect.getsource(module)
-        assert 'dev_map = "cpu" if self.device == "cpu" else "auto"' not in source
-        assert "resolve_device_map" in source
+    def test_the_scan_actually_sees_the_trainer_package(self):
+        """Without this, a moved source tree turns every check below into a
+        vacuous pass over an empty file list."""
+        assert _TRAINER_DIR.is_dir(), _TRAINER_DIR
+        names = {path.name for path in _TRAINER_SOURCES}
+        assert len(names) > 20
+        # the modules the H100 run proved are reachable with `--gpus`
+        assert {"sft.py", "dpo.py", "orpo.py", "simpo.py", "ppo.py"} <= names
+
+    @pytest.mark.parametrize(
+        "path", _TRAINER_SOURCES, ids=[p.stem for p in _TRAINER_SOURCES]
+    )
+    def test_module_does_not_hardcode_device_map_auto(self, path):
+        code = _code_without_comments(path.read_text(encoding="utf-8"))
+        assert not _OLD_IDIOM.search(code), (
+            f"{path.name} still picks device_map by hand; under `accelerate "
+            f"launch` transformers raises on 'auto'. Use resolve_device_map()."
+        )
+        assert not _INLINE_AUTO.search(code), (
+            f"{path.name} passes device_map='auto' literally; same defect."
+        )
+
+    @pytest.mark.parametrize(
+        "path", _TRAINER_SOURCES, ids=[p.stem for p in _TRAINER_SOURCES]
+    )
+    def test_module_that_sets_a_device_map_uses_the_shared_helper(self, path):
+        """The negative check above is satisfied by deleting the line entirely.
+        This is its positive half: whatever a module does pass must come from
+        the one helper that knows about LOCAL_RANK."""
+        code = _code_without_comments(path.read_text(encoding="utf-8"))
+        mentions = re.sub(r"hf_device_map|_device_map_value", "", code)
+        if "device_map" not in mentions:
+            return
+        assert "resolve_device_map" in code, (
+            f"{path.name} passes a device_map that does not come from "
+            "resolve_device_map()"
+        )
+
+    def test_the_patterns_would_catch_the_old_lines(self):
+        """A scanner nobody has seen fail is not evidence. Both spellings the
+        H100 run found, plus a renamed variant, must match -- and the fixed line
+        must not."""
+        assert _OLD_IDIOM.search('dev_map = "cpu" if self.device == "cpu" else "auto"')
+        assert _OLD_IDIOM.search('m = "cpu" if device == "cpu" else "auto"')
+        assert _INLINE_AUTO.search('device_map="auto" if self.device != "cpu" else None')
+        assert not _OLD_IDIOM.search("dev_map = resolve_device_map(self.device)")
+        assert not _INLINE_AUTO.search("device_map=resolve_device_map(self.device)")

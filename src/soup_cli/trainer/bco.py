@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Optional
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
-from soup_cli.utils.gpu import estimate_batch_size, model_size_from_name
+from soup_cli.utils.gpu import (
+    estimate_batch_size,
+    model_size_from_name,
+    resolve_device_map,
+)
 
 if TYPE_CHECKING:
     from soup_cli.config.schema import TrainingConfig  # noqa: F401
@@ -238,7 +242,7 @@ class BCOTrainerWrapper:
         )
 
         console.print(f"[dim]Loading model: {cfg.base}[/]")
-        dev_map = "cpu" if self.device == "cpu" else "auto"
+        dev_map = resolve_device_map(self.device)
         model_kwargs = {
             "trust_remote_code": self._trust_remote_code, "device_map": dev_map,
         }

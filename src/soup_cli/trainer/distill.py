@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
+from soup_cli.utils.gpu import resolve_device_map
 
 if TYPE_CHECKING:
     import torch as _torch_typ
@@ -226,7 +227,7 @@ class DistillTrainerWrapper:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         console.print(f"[dim]Loading student: {cfg.base}[/]")
-        dev_map = "cpu" if self.device == "cpu" else "auto"
+        dev_map = resolve_device_map(self.device)
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.base,
             trust_remote_code=self._trust_remote_code,

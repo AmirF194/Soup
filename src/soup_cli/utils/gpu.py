@@ -60,6 +60,40 @@ def _params_from_local_safetensors(path: str) -> float | None:
         return None  # unreadable/crafted -> fall back to the name guess
 
 
+def resolve_device_map(device: str):
+    """``device_map`` for ``from_pretrained``, correct under a distributed launch.
+
+    ``device_map="auto"`` shards one model across every visible GPU. Under
+    ``torchrun`` / ``accelerate launch`` / ``deepspeed`` that is wrong twice
+    over — every rank would try to shard across every card — and transformers
+    refuses outright:
+
+        ValueError: You can't train a model that has been loaded with
+        `device_map='auto'` in any distributed mode.
+
+    Each rank must pin its own GPU instead. Measured on 8x H100
+    (benchmarks/gate-h100-validation.md, FINDING 4): without this, the exact
+    ``accelerate launch --num_processes 8 soup train -c ...`` command that
+    ``soup train --gpus 8`` prints fails immediately, with and without
+    ``--deepspeed``.
+
+    A malformed ``LOCAL_RANK`` / ``WORLD_SIZE`` falls back to ``"auto"``: that is
+    the single-process behaviour, which is what a process with no usable
+    distributed environment actually is.
+    """
+    if str(device) == "cpu":
+        return "cpu"
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        return "auto"
+    try:
+        if int(os.environ.get("WORLD_SIZE", "1") or "1") <= 1:
+            return "auto"
+        return {"": int(local_rank)}
+    except (TypeError, ValueError):
+        return "auto"
+
+
 def detect_device() -> tuple[str, str]:
     """Detect available device. Returns (device_string, human_name)."""
     try:

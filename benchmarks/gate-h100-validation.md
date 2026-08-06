@@ -1571,16 +1571,158 @@ six runs** (+0.075 to +0.175) from a base of 0.0 — plausibly because the task
 teaches the model to emit a short bare answer instead of prose, which is what
 that scorer rewards. Not investigated.
 
+### Extended to n=5, and the n=3 reading did not survive
+
+Two more paired subsets (the training split holds 16 000 rows, so five disjoint
+3000-row subsets is the ceiling). The regenerated `train_s0.jsonl` and
+`task_eval.jsonl` checksums are unchanged, so the first three pairs stay valid.
+
+| pair | resident | streamed | difference |
+|---|---|---|---|
+| s0 | 0.9033 | 0.8867 | +0.0167 |
+| s1 | 0.9033 | 0.8933 | +0.0100 |
+| s2 | 0.9033 | 0.8967 | +0.0067 |
+| s3 | 0.8900 | 0.8900 | **0.0000** |
+| s4 | 0.8967 | 0.9000 | **−0.0033** |
+
+| | mean | spread |
+|---|---|---|
+| resident | 0.8993 | 0.0133 |
+| streamed | 0.8933 | 0.0133 |
+
+**Both readings from n=3 dissolved.**
+
+The "all three differences have the same sign" observation was an artifact of
+which three subsets ran first: at n=5 it is three positive, one exact tie and one
+negative. Mean paired difference **+0.0060** — 1.8 items out of 300 — against a
+within-arm spread of **0.0133 in both arms**, so the between-arm difference is
+**less than half** the noise the design measures it against.
+
+The resident arm's suspicious 0.0000 spread also dissolved: subsets 3 and 4 give
+0.8900 and 0.8967. Three identical values in a row was coincidence, and flagging
+it as an anomaly was right but it needed more data, not an explanation.
+
+That the two arms' spreads came out **identical** (0.0133 each) is the cleanest
+form this result could take: the same variability, means 0.6pp apart.
+
 ### What this establishes
 
 - A model trained through layer streaming **converges and reaches the same task
-  quality as a resident run**, to within a difference this experiment cannot
-  resolve (1.1pp, against a 1.0pp within-arm spread, n=3).
-- It **does not** show streaming is quality-neutral to arbitrary precision. It
-  shows no difference large enough to matter has been detected, with the
-  adapter-init seed still uncontrolled.
+  quality as a resident run**. Paired over five subsets: +0.0060 mean difference
+  against 0.0133 within-arm spread on both sides, 3 positive / 1 tie / 1
+  negative. **No difference is detectable at this resolution.**
+- It **does not** show streaming is quality-neutral to arbitrary precision — the
+  experiment resolves differences of roughly 1pp on a 300-item held-out set, and
+  the adapter-init seed remains uncontrolled because there is no config field
+  for it.
 - The general-capability regression both arms show is a property of the
   fine-tuning task, not of streaming, and the worst instance is resident.
+
+---
+
+## STEP 12 — ZeRO-3 on eight cards against streaming on one
+
+*Box at `9117da1` + the DataParallel guard + the `device_map` fix below.*
+
+The positioning question, in the form someone with a DGX asks it: *"I have eight
+cards — why would I stream on one instead of sharding across eight?"*
+
+### FINDING 4 — Soup's advertised multi-GPU path does not run at all
+
+The first attempt died on every rank before training started:
+
+```
+$ torchrun --nproc_per_node 8 -m soup_cli.cli train --config b_ds.yaml --deepspeed ...
+Error: ValueError: You can't train a model that has been loaded with
+`device_map='auto'` in any distributed mode.
+```
+
+This is not about DeepSpeed. `soup train --gpus 8` prints
+
+```
+To train on 8 GPUs, re-run under accelerate:
+    accelerate launch --num_processes 8 soup train -c /root/run/b_ds.yaml
+```
+
+and **that exact command fails the same way**, with and without `--deepspeed`,
+under `torchrun` and under `accelerate launch` alike. The cause is one line
+repeated across six trainers:
+
+```python
+dev_map = "cpu" if self.device == "cpu" else "auto"
+```
+
+`device_map="auto"` shards one model across every visible GPU; under a
+distributed launch every rank would try to do that, and transformers refuses
+outright. There was no distributed check anywhere in the trainer package.
+
+So the multi-GPU story the tool advertises has never worked on the SFT path.
+Like FINDING 1, it is invisible on a one-GPU dev box.
+
+**Fixed** — `utils/gpu.resolve_device_map(device)`, one shared helper replacing
+the line in `sft` (x3), `dpo`, `grpo`, `kto`, `pretrain` and `ppo` (x3): `"cpu"`
+on CPU, `{"": LOCAL_RANK}` when `WORLD_SIZE > 1`, `"auto"` otherwise, with a
+malformed environment falling back to `"auto"` because a process with no usable
+distributed environment *is* single-process. Verified on the real eight cards:
+the previously-failing command now trains to completion.
+
+### The comparison
+
+Everything identical: `Llama-3.1-8B-Instruct`, bf16, LoRA r=8, the STEP 11
+dataset (3000 rows, 3 epochs, `max_length` 128, `batch_size` 8 per device),
+**623,973 tokens** by the trainer's own count in every row. tok/s is
+`num_tokens / train_runtime`, i.e. division.
+
+| method | GPUs | train_runtime | tok/s | peak VRAM |
+|---|---|---|---|---|
+| **resident bf16** | **1** | **235.84 s** | **2645.4** | 30.0 GB |
+| ZeRO-3, no offload | 8 | 340.65 s | 1831.7 | 34.0 GB **per card** |
+| ZeRO-3 + CPU param offload | 8 | 356.10 s | 1752.2 | 38.0 GB per card |
+| layer streaming bf16 | 1 | 579.30 s | 1077.1 | **2.9 GB** |
+
+SM clock 1980 MHz median-while-busy in every row.
+
+**The headline is not the one the question expects: eight cards of ZeRO-3 are
+slower than one card training resident** — 340.65 s against 235.84 s. For a model
+that fits on a single card, sharding it across eight buys nothing and costs an
+all-gather per layer per step over PCIe. The 8-GPU runs use an effective batch of
+64 against the single-GPU 8, which is how anyone would actually use them, and
+they still lose.
+
+Against streaming, eight ZeRO-3 cards are **1.70x** faster than streaming on one
+(1831.7 / 1077.1) — not the 10x the question anticipated, and they spend 34 GB on
+each of eight cards to do it, against 2.9 GB on one.
+
+### What that means for positioning, stated plainly
+
+The right reading is **not** "streaming beats ZeRO-3". It is that this whole
+comparison is being run on hardware where the premise of streaming does not
+apply. An 8B model fits comfortably in one H100, so the correct choice on this
+box is the top row — resident on one card — and both sharding and streaming are
+worse than doing nothing clever at all.
+
+Layer streaming is for the case where **the one card you have cannot hold the
+model**. That case cannot be constructed on an 80 GB card with an 8B model, which
+is exactly why the feature's real evidence is on a 4 GB laptop. The honest claim
+is therefore the narrow one: *not "we are faster than DeepSpeed", but "we are for
+a different situation — one card, and it is too small"*.
+
+Two caveats that cut in ZeRO-3's favour and are stated rather than omitted: this
+box is **PCIe, PIX between all pairs, no NVLink**, and ZeRO-3's all-gather traffic
+is exactly what NVLink exists for — on an NVLink node these ZeRO-3 rows would
+improve and the streaming row would not. And 623,973 tokens over ~140 optimizer
+steps is a short run; a longer one amortises DeepSpeed's startup better.
+
+### One discarded measurement, kept
+
+The first 8-GPU attempt used the original 64-row benchmark set (`b_ds.yaml`,
+4 epochs, 8 optimizer steps) and produced ZeRO-3 **with** CPU offload at 86.29 s
+against ZeRO-3 **without** offload at 102.56 s — offloading to CPU apparently
+*faster* than keeping parameters on the GPUs. That is not a real effect; at eight
+optimizer steps the run is entirely startup and communication setup, and the
+measurement says nothing about throughput. Re-run on the 3000-row dataset the
+ordering reverses and becomes sensible. Left here because it is exactly the kind
+of number that would have looked publishable.
 
 ### Does any of this change the preprint?
 

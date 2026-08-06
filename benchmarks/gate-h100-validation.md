@@ -18,11 +18,16 @@ appear in the order they were run, not in the order they would read best.
 
 ## What this session established
 
-1. **Layer streaming is bit-exact at real model sizes, not just on toys.**
-   Logits `torch.equal` to a resident reference of matching numerics at 0.5B,
-   8B, 14B, 32B and 72B. Every previously published bit-exactness result was on
-   3-layer from-config checkpoints, because a 4 GB card cannot hold a resident 8B
-   to compare against.
+1. **Layer streaming's FORWARD is bit-exact at real model sizes, not just on
+   toys.** Logits `torch.equal` to a resident reference of matching numerics at
+   0.5B, 8B, 14B, 32B and 72B. Every previously published bit-exactness result
+   was on 3-layer from-config checkpoints, because a 4 GB card cannot hold a
+   resident 8B to compare against.
+   **The BACKWARD is a separate claim and it does not hold above ~165 MiB per
+   NF4 layer** — gradients are exact at 0.5B / 8B / 14B and wrong at 32B / 72B
+   (item 4). Nothing in this record says "bit-exact" about a model without
+   saying which half; see the table in STEP 6, which exists because two readers
+   took the unqualified phrase to cover both.
 2. **The published laptop throughput reproduces on completely different
    hardware.** Llama-3.1-8B NF4: 119.6 tok/s in 3.32 GB peak on an RTX 3050
    Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
@@ -1136,17 +1141,57 @@ from `soup.yaml`.
 
 ### Everything measured, one table
 
-| model | params | layers | store | forward bit-exact | grads bit-exact (pin on) | grads bit-exact (pin off) | tok/s | peak VRAM |
-|---|---|---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | 0.49 B | 24 | 0.18 GB | yes | yes | — | — | — |
-| Llama-3.1-8B | 8.03 B | 32 | 3.35 GB | yes | yes (128/128) | — | 113.00 | 3,397 MiB |
-| Qwen2.5-14B | 14.77 B | 48 | 6.35 GB | yes | yes (192/192) | — | 118.60 | 4,475 MiB |
-| Qwen2.5-32B | 32.76 B | 64 | 14.99 GB | yes | **no (8/256)** | yes (256/256) | 76.80 | 4,845 MiB |
-| Qwen2.5-72B | 72.71 B | 80 | 33.74 GB | yes | **no (8/320)** | yes (320/320) | 37.94 | 7,411 MiB |
+**Read the two exactness columns separately.** "Bit-exact" in this record is
+never a single verdict about a model: the **forward** (logits, `torch.equal`)
+and the **backward** (every LoRA gradient tensor, against a resident reference of
+matching numerics) are measured independently, and above the threshold they
+disagree — the forward is exact while the backward is not. Two external readers
+took an unqualified "bit-exact at 8B / 14B / 32B / 72B" to mean gradients too,
+computed 72B's NF4 layer at ~449 MiB against the 165 MiB threshold, and reported
+a contradiction. The record was literally correct and still misread; this table
+is the fix.
 
-tok/s and peak VRAM are medians over the repeat counts given in STEP 4 (n=5 for
-8B/14B/32B, n=2 for 72B). The 72B tok/s row is n=2 and should be read as
-indicative.
+| model | quant | MiB/layer | **forward** (logits) | **backward** (gradients), pinned | backward, `pin=False` | 5-step loss curve |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | NF4 | 7 | exact `0.0` | exact 96/96 | — | identical |
+| Llama-3.1-8B | NF4 | 105 | exact `0.0` | exact 128/128 *(50 backwards)* | — | identical |
+| Llama-3.1-8B | bf16 | 480 | exact `0.0` | exact 128/128 | — | — |
+| Qwen2.5-14B | NF4 | 132 | exact `0.0` | exact 192/192 *(50 backwards)* | — | identical |
+| Qwen2.5-14B | bf16 | 570 | exact `0.0` | exact 192/192 | — | — |
+| Qwen2.5-32B | NF4 | 234 | exact `0.0` | **WRONG 8/256** | exact 256/256 | **diverged**, rel 0.0586 |
+| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 |
+
+Throughput and peak VRAM, kept separate because they are a different claim:
+
+| model | tok/s (median) | peak VRAM | store (pinned) |
+|---|---|---|---|
+| Llama-3.1-8B NF4 | 113.00 *(n=5)* | 3,397 MiB | 3.35 GB |
+| Qwen2.5-14B NF4 | 118.60 *(n=5)* | 4,475 MiB | 6.35 GB |
+| Qwen2.5-32B NF4 | 76.80 *(n=5)* | 4,845 MiB | 14.99 GB |
+| Qwen2.5-72B NF4 | 37.94 *(n=2)* | 7,411 MiB | 33.74 GB |
+
+The 72B row is n=2 and should be read as indicative.
+
+### The loss curves independently confirm the split
+
+Protocol check (4) of STEP 2 was "5-step loss curves identical", and it is worth
+stating what it did rather than leaving it in a distant table. If the gradients
+above the threshold are wrong, the curves **must** diverge; if they were exact,
+the curves must match. They track perfectly:
+
+```
+model  forward diff   curves_equal   curve_max_rel
+8b     0.0            True           0
+14b    0.0            True           0
+32b    0.0            False          0.05857
+72b    0.0            False          0.12909
+```
+
+Step 0 of every curve is identical in every row — which it must be, given the
+bit-exact forward — and the divergence starts only after the first optimizer
+step, i.e. at the first point where a gradient can matter. That is an independent
+confirmation of the diagnosis using a quantity measured before the defect was
+even suspected.
 
 ---
 

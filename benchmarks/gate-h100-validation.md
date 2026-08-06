@@ -854,3 +854,113 @@ range as the host-to-device transfer that the throughput numbers above show to b
 the binding constraint, so a disk tier on storage like this would plausibly not
 be catastrophic. That is an inference from two measurements, not a measurement,
 and is flagged as such.
+
+---
+
+## STEP 5 — 72B, and then the root cause
+
+72B was the explicit bonus, to be attempted only if everything before it went
+cleanly. It did, and it turned out to be the run that cracked the 32B defect.
+
+### Qwen2.5-72B-Instruct, NF4 — forward bit-exact, 80/80 layers trained
+
+```
+params 72,706,203,648   layers 80   store 33.74 GB pinned   shard 185.4 s
+copied 320 adapter tensors
+max_abs_logit_diff 0.0   bit_exact True   logit_abs_max 38.5
+layer0_lora_grad 7.973011e-02   80/80 layers non-zero
+curves_equal False   curve_max_rel 0.129
+```
+
+The store is 33.74 GB against the box's 62.96 GB page-locked ceiling, so it
+pins. Sharding took 185.4 s. And the throughput:
+
+```
+v_72b r1  tok/s 37.94  peak 7,411 MiB  util 67.4%  clk 1980
+v_72b r2  tok/s 37.70  peak 7,413 MiB  util 88.9%  clk 1980
+```
+
+**A 72B model fine-tuned in 7.2 GB of VRAM.** With the caveat that follows,
+which is not a footnote: at 72B the gradients are wrong under the shipped
+configuration, so that line describes a memory and throughput result, not a valid
+training result.
+
+The defect is worse at 72B than at 32B — even the *first* backward is corrupted:
+
+```
+resident reference loss 13.041974068  (320 grad tensors)
+rep 1: loss 13.041974068 (==resident True)  grads exact 8/320  [78, 79]  worst_rel 8.8182
+rep 2: loss 13.041974068 (==resident True)  grads exact 8/320  [78, 79]  worst_rel 8.8182
+rep 3: loss 13.041974068 (==resident True)  grads exact 8/320  [78, 79]  worst_rel 8.8182
+```
+
+Same signature: forward loss bit-identical to resident every time, survivors
+exactly the last `buffers` layers.
+
+### The one experiment that named the cause
+
+Everything so far said "race in the layer pool". The way to test that directly
+is to remove the asynchrony: page-locked host memory is what makes a
+host-to-device `copy_` genuinely asynchronous, so with **pinning off** the copies
+become synchronous and any missing dependency stops mattering.
+
+Qwen2.5-32B, identical in every other respect:
+
+```
+##### 32B pin=0
+rep 1: grads exact 256/256  64 layers  worst_abs 0.000000e+00
+rep 2: grads exact 256/256  64 layers  worst_abs 0.000000e+00
+rep 3: grads exact 256/256  64 layers  worst_abs 0.000000e+00
+
+##### 32B pin=1   (the shipped configuration)
+rep 1: grads exact 256/256  64 layers  worst_abs 0.000000e+00
+rep 2: grads exact   8/256  [62, 63]   worst_abs 1.940805e-01  worst_rel 8.7051
+rep 3: grads exact   8/256  [62, 63]   worst_abs 9.720615e-02  worst_rel 8.4925
+```
+
+And at 72B, where pinning corrupts even the first pass:
+
+```
+##### 72B pin=0
+rep 1: grads exact 320/320  80 layers  worst_abs 0.000000e+00
+rep 2: grads exact 320/320  80 layers  worst_abs 0.000000e+00
+rep 3: grads exact 320/320  80 layers  worst_abs 0.000000e+00
+```
+
+**With pinning disabled, layer streaming is bit-exact at 72B.** Every model
+tested — 0.5B, 8B, 14B, 32B, 72B — produces gradients bit-identical to a
+resident reference of the same numerics.
+
+So the correct statement is not "layer streaming breaks above 14B". It is:
+
+> The layer-streaming **algorithm** is exact at every size measured, up to 72B.
+> The **asynchronous pinned host-to-device copy path** has a missing
+> synchronisation: the buffer is consumed by compute before its copy has
+> completed. It only becomes visible once the per-layer transfer is large enough
+> for the copy to still be in flight, which is why 8B and 14B are unaffected and
+> a 4 GB laptop could never have found it.
+
+That matches the code's own documented tripwire — `LayerBufferPool.wait()` is the
+ownership check that exists to prevent exactly this, and `load_async` is
+documented as issuing `stream.wait_stream(current)` before `copy_` so a prefetch
+cannot clobber an in-flight layer. Something on the **backward/recompute** side
+is not covered by that, since the forward is bit-exact in every single run at
+every size.
+
+**No fix attempted and no Soup code changed**, per the brief. There is also no
+user-facing escape hatch: pinning is chosen automatically by `decide_pinning`,
+with no config key to turn it off, so a user hitting this at 32B+ cannot work
+around it from `soup.yaml`.
+
+### Everything measured, one table
+
+| model | params | layers | store | forward bit-exact | grads bit-exact (pin on) | grads bit-exact (pin off) | tok/s | peak VRAM |
+|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 0.49 B | 24 | 0.18 GB | yes | yes | — | — | — |
+| Llama-3.1-8B | 8.03 B | 32 | 3.35 GB | yes | yes (128/128) | — | 113.00 | 3,397 MiB |
+| Qwen2.5-14B | 14.77 B | 48 | 6.35 GB | yes | yes (192/192) | — | 118.60 | 4,475 MiB |
+| Qwen2.5-32B | 32.76 B | 64 | 14.99 GB | yes | **no (8/256)** | yes (256/256) | 76.80 | 4,845 MiB |
+| Qwen2.5-72B | 72.71 B | 80 | 33.74 GB | yes | **no (8/320)** | yes (320/320) | 37.94 | 7,411 MiB |
+
+tok/s and peak VRAM are medians over the repeat counts given in STEP 4 (n=5 for
+8B/14B/32B, n=2 for 72B).

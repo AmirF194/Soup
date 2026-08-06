@@ -1153,6 +1153,88 @@ indicative.
   streamed all fail on this torch before training starts (FINDING 2), so v0.72.4's
   claims are untested here.
 
+---
+
+## STEP 7 — is the NF4 defect the same bug as #328? **No.**
+
+Proposed after the fact, and worth testing because the two look alike: #328's
+traceback dies inside `torch.utils.checkpoint.backward` on a weight still on
+`meta`, and the NF4 defect has the same shape of symptom — forward bit-exact,
+backward wrong on every layer but the last `stream_buffers`. Both are "the second
+pass sees something the first one did not". If they shared a root, one fix would
+close both.
+
+### Attempt 1 — turn gradient checkpointing off. Inconclusive, and the reason is interesting
+
+`StreamedDecoderLayer` already carries a `use_checkpoint` attribute that its
+`forward` reads, so it can be flipped on a built model without touching `src/`.
+Single variable, both arms every time, synthetic reproducer (32 layers, hidden
+5120, intermediate 27648, NF4, `pin=True`):
+
+```
+checkpointing ON  (control) -> WRONG  ['128/128', '8/128', '8/128']   layers flipped=32
+checkpointing OFF (test)    -> ERROR  RuntimeError: one of the variables needed for
+    gradient computation has been modified by an inplace operation:
+    [CUDABFloat16Type [5120]] is at version 16; expected version 15
+```
+
+The control reproduces the defect, so the arm is live. The test arm did not turn
+bit-exact and did not stay wrong — **it crashed**, which answers neither branch
+of the hypothesis as posed.
+
+But the crash says something precise. `[5120]` is a bf16 tensor of exactly
+`hidden_size` — a layernorm weight, which an NF4 shard keeps in bf16 inside the
+pooled buffer. Autograd's version counter caught that buffer being **overwritten
+while the backward still needed it**. So the pool does recycle buffers that the
+backward depends on, and gradient checkpointing is what converts that from a
+detected error into silently wrong numbers.
+
+That also makes the arm *invalid as a test of the hypothesis*: the pooled-buffer
+design **requires** recompute, because without it autograd holds views into
+buffers that are guaranteed to be reused. Turning checkpointing off is not a
+configuration the design supports, so its failure is the documented consequence
+of the design, not evidence about where the bug lives.
+
+Kept as run. It is also the most useful by-product of the session for whoever
+fixes this: **autograd will detect the reuse on its own when checkpointing is
+not hiding it**, which is a ready-made assertion for a regression test.
+
+### Attempt 2 — separate them by trigger conditions instead. Decisive
+
+If the two bugs were one, they would fire under the same conditions. They do not
+share a single one. The #328 reproducer runs on the *tiny* test checkpoint
+(hidden 64, 2 layers, **0.05 MiB per layer**), which is four orders of magnitude
+below the NF4 defect's threshold, and `_stream_cfg` sets `quantization: none`:
+
+```
+torch 2.13.0+cu130
+quant=none  task=sft   OK
+quant=none  task=dpo   FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+quant=none  task=kto   FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+quant=4bit  task=sft   OK
+quant=4bit  task=dpo   FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+quant=4bit  task=kto   FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+```
+
+(The `orpo` rows are missing from this capture — a harness output problem, not a
+result. The earlier full reproducer had orpo and simpo failing identically.)
+
+| | #328 | the NF4 defect |
+|---|---|---|
+| quantisation | fires on **both** `none` and `4bit` | **NF4 only** — bf16 exact at 935 MiB/layer |
+| model size | fires at **0.05 MiB/layer** | needs **> ~165 MiB/layer** |
+| task | **preference losses only**; SFT passes | fires on **SFT** |
+| manifestation | **crashes** with a `meta` tensor | **silent** wrong gradients |
+| pinning off | not tested — it crashes before that matters | **fixes it** |
+
+Not one axis in common, and each is the other's control: SFT is the task where
+#328 does not fire and the NF4 defect does; bf16-tiny is the configuration where
+#328 fires and the NF4 defect cannot.
+
+**Hypothesis rejected. Two different bugs**, joined onto the list with the four
+already rejected in STEP 6. They may still share an ancestor — both are the
+streamed layer misbehaving on a second pass — but they are not one fix.
+
 ### Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB

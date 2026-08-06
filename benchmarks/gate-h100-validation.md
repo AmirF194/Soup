@@ -31,7 +31,8 @@ appear in the order they were run, not in the order they would read best.
 3. **Against DeepSpeed ZeRO-3 CPU offload, same box, same data, same model:
    2.93x the throughput in 9.7x less peak VRAM** at matched numerics.
 4. **A silent correctness defect, found and isolated.** With an NF4 base and
-   layers above roughly 137–187 MiB, the streamed *backward* produces gradients
+   layers above a threshold bracketed at 163.8–171.5 MiB, the streamed
+   *backward* produces gradients
    that disagree with a resident reference on every layer but the last
    `stream_buffers` — while the forward stays bit-exact and the loss curve looks
    healthy. It affects 32B and 72B, not 8B or 14B; it disappears when host memory
@@ -1031,11 +1032,16 @@ bf16 is exact while moving **3.9x more bytes per layer** than the NF4 run that
 fails. Whatever this is, it is not a transfer-size race in the general copy path.
 It is in the NF4 path.
 
-Bracketing the NF4 threshold, at a fixed 48 layers:
+Bracketing the NF4 threshold, at a fixed 48 layers, hidden 5120, varying only
+`intermediate_size`:
 
 | intermediate | MiB/layer | store | result |
 |---|---|---|---|
 | 13,824 *(Qwen2.5-14B's own shape)* | 136.7 | 6,563 MiB | **EXACT** `192/192 x3` |
+| 15,360 | 148.3 | — | **EXACT** `192/192 x3` |
+| 17,408 | 163.8 | — | **EXACT** `192/192 x3` |
+| 18,432 | **171.5** | — | **WRONG** `192/192, 8/192, 8/192` |
+| 19,456 | 179.3 | — | **WRONG** `8/192 x3` |
 | 20,480 | 187.0 | 8,977 MiB | **WRONG** `192/192, 8/192, 8/192` |
 | 27,648 *(Qwen2.5-32B's own shape)* | 241.2 | 11,577 MiB | **WRONG** `8/192 x3` |
 
@@ -1045,8 +1051,15 @@ it is exact, exactly as the real 14B is; the 27,648 row reconstructs the real
 **shape**, not the checkpoint — so this is reproducible without downloading a
 32B model.
 
-**Threshold: somewhere between 136.7 and 187.0 MiB per NF4 layer.** Not narrowed
-further.
+**Threshold: between 163.8 and 171.5 MiB per NF4 layer** — a 4.7%-wide bracket,
+monotone on both sides with no exceptions in seven points. The real models sit
+either side of it exactly as predicted: 8B at 105 and 14B at 132 MiB/layer are
+below and exact, 32B at 234 and 72B at 432 are above and broken.
+
+That the boundary is this sharp, and this reproducible on synthetic weights,
+argues against a pure timing race — a race would smear across a range and vary
+between runs at the boundary. Something is switching behaviour at a size, and
+what it is was not identified here.
 
 Note the 48-layer/187 MiB row also kills the last version of the depth story: it
 is broken at 48 layers, the same depth at which the real 14B is exact.
@@ -1070,8 +1083,13 @@ LlamaConfig(vocab_size=4096, hidden_size=5120, intermediate_size=27648,
   both quantisations, broken or not. Nothing in a loss curve can reveal this.
 - The **backward** produces gradients that disagree with a deterministic resident
   reference on every layer except the last `stream_buffers`, when the base is
-  **NF4** and the layer exceeds roughly 137–187 MiB. Usually from the second
-  backward onward; at 72B from the first.
+  **NF4** and the layer exceeds a threshold measured at **163.8–171.5 MiB**.
+  Usually from the second backward onward; at 72B from the first.
+- **Below that threshold it does not drift with use.** 50 consecutive backwards
+  at 8B (105 MiB/layer) and at 14B (132 MiB/layer), each diffed against the same
+  resident reference: `worst_abs = 0.0` on all 50 of each, all tensors. The
+  published claims sit on the safe side of the boundary with margin, and stay
+  there under repetition.
 - **Turning pinning off makes it exact**, at 32B and at 72B. Pinned memory is
   what makes a host-to-device `copy_` genuinely asynchronous, so the missing
   dependency is between the NF4 layer's arrival and its use — most plausibly the
@@ -1116,9 +1134,10 @@ indicative.
   CUDA toolkit this box does not have. The chosen configuration is the fairer
   one — streaming also keeps its optimizer on the GPU — but a full
   parameter-and-optimizer offload run is not in this record.
-- **The defect's threshold is a bracket, not a number.** 136.7 MiB/layer exact,
-  187.0 MiB/layer broken, nothing measured between them. The mechanism inside the
-  NF4 path is a hypothesis pointed at plausible code, not a diagnosis.
+- **The defect's threshold is a bracket, not a number** — 163.8 MiB/layer exact,
+  171.5 broken, 4.7% wide. The mechanism inside the NF4 path is a hypothesis
+  pointed at plausible code, not a diagnosis; the sharpness of the boundary
+  argues against the timing-race story but does not replace it with anything.
 - **The defect is not demonstrated end-to-end through `soup train`.** Both
   attempts were confounded, because the CLI does not pin the adapter-init seed
   and the streamed and resident paths seed LoRA independently. The evidence is

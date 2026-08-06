@@ -66,7 +66,7 @@ cache that a control disproved, two inconclusive user-level attempts at the
 defect, an invalid pair of VRAM numbers, an experiment whose test arm crashed
 and could not answer the question it was built for, a wrong SM-clock column, an
 8-GPU benchmark so short it reported CPU offload as *faster* than no offload, a
-reading of the quality result that n=3 supported and n=5 destroyed, and six
+reading of the quality result that n=3 supported and n=5 destroyed, and seven
 hypotheses about the defect's trigger that measurement rejected.
 
 ## Why this run exists
@@ -1411,6 +1411,46 @@ means one buffer per layer, i.e. the whole model again.
 8x VRAM; `pin=False` costs 7.41x time at no VRAM cost; the correct repair is
 neither, and was not found here.
 
+### Two more attempts on the NF4-only asymmetry, both negative
+
+**Rejected 7 — the number of tensors per layer.** An NF4 layer arrives as many
+tensors (packed weights plus `::absmax`, and under double quant also
+`::nested_absmax` and `::nested_offset`), where a bf16 layer is one tensor per
+weight. Turning double quant off removes two sidecars per weight, so if tensor
+count were the trigger it should move the outcome. It does not — it makes it
+worse:
+
+```
+double_quant=1  241.2 MiB/layer  ->  WRONG  ['16/128', '8/128', '8/128']
+double_quant=0  263.0 MiB/layer  ->  WRONG  [' 0/128', '0/128', '0/128']
+```
+
+With double quant off not even the last two layers survive. No explanation for
+that offered; it is recorded because it is the opposite of what the hypothesis
+predicted.
+
+**Confirmed — correctness returns exactly when nothing is ever evicted.** STEP 6
+observed that the survivor count tracks `stream_buffers`; taken to its limit on
+the 32-layer synthetic model, the relationship is exactly linear and closes at
+one buffer per layer:
+
+| `stream_buffers` | exact gradient tensors | = 4 x buffers? |
+|---|---|---|
+| 2 | 8 / 128 | yes |
+| 16 | 64 / 128 | yes |
+| **32** *(= `n_layers`)* | **128 / 128 — EXACT** | pool holds everything |
+
+Four tensors per layer are what this LoRA configuration trains (`q_proj` and
+`v_proj`, A and B each), so "exact tensors = 4 x buffers" is "the last `buffers`
+layers are correct" restated. At `buffers == n_layers` nothing is ever recycled
+and the model is bit-exact.
+
+That turns the earlier prediction into a measurement, and it is the mechanism's
+tightest confirmation: **the defect is exactly the eviction**. It also closes off
+the "just raise `stream_buffers`" route quantitatively — the pool would have to
+hold all 32 layers, 7.7 GB, which is the whole model resident and therefore the
+feature's negation. Same conclusion as the clone route, reached independently.
+
 *(The 7.41x here and the 6.56x in STEP 8 are different models — this synthetic
 32-layer one versus the real Qwen2.5-32B — so they are two measurements of the
 same effect, not a discrepancy.)*
@@ -1760,7 +1800,7 @@ of number that would have looked publishable.
   synthetic reproducer.
 - **Why the defect is NF4-only, and why its boundary is so sharp, is not
   explained.** The bf16 path aliases the pool identically and is exact at 3.9x
-  the bytes. Six hypotheses were tested and rejected; none replaced them.
+  the bytes. Seven hypotheses were tested and rejected; none replaced them.
 - **The threshold is a bracket, not a number** — 163.8 MiB/layer exact, 171.5
   broken, 4.7% wide.
 - **The defect is not demonstrated end-to-end through `soup train`.** Both

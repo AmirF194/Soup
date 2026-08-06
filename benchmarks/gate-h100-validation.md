@@ -13,9 +13,39 @@ resident reference for.
 
 # H100 validation — external-hardware gate
 
-**Status: IN PROGRESS.** This file is written as the work happens and committed
-after each measurement. Sections appear in the order they were run, not in the
-order they will eventually read best.
+Written as the work happened and committed after each measurement. Sections
+appear in the order they were run, not in the order they would read best.
+
+## What this session established
+
+1. **Layer streaming is bit-exact at real model sizes, not just on toys.**
+   Logits `torch.equal` to a resident reference of matching numerics at 0.5B,
+   8B, 14B, 32B and 72B. Every previously published bit-exactness result was on
+   3-layer from-config checkpoints, because a 4 GB card cannot hold a resident 8B
+   to compare against.
+2. **The published laptop throughput reproduces on completely different
+   hardware.** Llama-3.1-8B NF4: 119.6 tok/s in 3.32 GB peak on an RTX 3050
+   Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
+   H100. The method is bound by host-to-device transfer, not by the GPU, and this
+   is the first evidence of that from outside the original box.
+3. **Against DeepSpeed ZeRO-3 CPU offload, same box, same data, same model:
+   2.93x the throughput in 9.7x less peak VRAM** at matched numerics.
+4. **A silent correctness defect, found and isolated.** With an NF4 base and
+   layers above roughly 137–187 MiB, the streamed *backward* produces gradients
+   that disagree with a resident reference on every layer but the last
+   `stream_buffers` — while the forward stays bit-exact and the loss curve looks
+   healthy. It affects 32B and 72B, not 8B or 14B; it disappears when host memory
+   is not page-locked; and it is reproducible in about a minute on a synthetic
+   7.7 GB model. Nothing was changed in Soup to work around it.
+5. **Three Linux/multi-GPU findings** the single-GPU Windows dev box could not
+   have surfaced: `nn.DataParallel` versus `meta` parameters, the `#328` meta
+   leak reaching CUDA and all four preference losses, and `detect_disk_kind`
+   classifying a 1.5 GB/s virtio disk as an HDD.
+
+Also here, because the record is the working one: a false alarm about the HF
+cache that a control disproved, two inconclusive user-level attempts at the
+defect, an invalid pair of VRAM numbers, and four hypotheses about the defect's
+trigger that measurement rejected.
 
 ## Why this run exists
 
@@ -567,6 +597,12 @@ the copy is complete. That is a **race**, not a missing load, and the
 is not catching it at this transfer size (32B ≈ 234 MB/layer, against 14B ≈
 132 MB and 8B ≈ 105 MB).
 
+> **Written at this point in the session and left as written.** The parenthetical
+> above attributes the trigger to transfer size in general. STEP 6 tests that and
+> refutes it: bf16 is exact at 935 MiB per layer, nearly four times the NF4 size
+> that fails. The trigger is the NF4 path specifically. The "race" half of the
+> sentence survives; the "at this transfer size" half does not.
+
 Severity varies run to run, which is the signature of a race rather than a logic
 error: in one run rep 1 was 256/256 exact, in another 20/256 (`worst_rel 0.8169`),
 and rep 3's `worst_rel` came out 8.5330 in one run and 55.9389 in another.
@@ -1064,4 +1100,53 @@ from `soup.yaml`.
 | Qwen2.5-72B | 72.71 B | 80 | 33.74 GB | yes | **no (8/320)** | yes (320/320) | 37.94 | 7,411 MiB |
 
 tok/s and peak VRAM are medians over the repeat counts given in STEP 4 (n=5 for
-8B/14B/32B, n=2 for 72B).
+8B/14B/32B, n=2 for 72B). The 72B tok/s row is n=2 and should be read as
+indicative.
+
+---
+
+## What was not done, and what these numbers do not say
+
+- **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK
+  section for the measurement taken and the decision not to bypass the guard.
+- **No multi-GPU comparison.** Layer streaming is a single-GPU technique and
+  DeepSpeed was run at `world_size 1`, outside its intended regime. A sharded
+  multi-GPU ZeRO-3 run answers a different question and was not attempted.
+- **DeepSpeed's optimizer stayed on the GPU.** `offload_optimizer: cpu` needs a
+  CUDA toolkit this box does not have. The chosen configuration is the fairer
+  one — streaming also keeps its optimizer on the GPU — but a full
+  parameter-and-optimizer offload run is not in this record.
+- **The defect's threshold is a bracket, not a number.** 136.7 MiB/layer exact,
+  187.0 MiB/layer broken, nothing measured between them. The mechanism inside the
+  NF4 path is a hypothesis pointed at plausible code, not a diagnosis.
+- **The defect is not demonstrated end-to-end through `soup train`.** Both
+  attempts were confounded, because the CLI does not pin the adapter-init seed
+  and the streamed and resident paths seed LoRA independently. The evidence is
+  the controlled harness.
+- **The 8B reproduction is a throughput and memory reproduction, not a training
+  one.** No model was trained to convergence and no downstream quality was
+  evaluated anywhere in this session.
+- **Every number is one machine, one session**, on a stack (torch 2.13.0+cu130,
+  bnb 0.50.0, trl 0.26.2, peft 0.20.0) that differs from the published records in
+  everything but `transformers`. SM clock was 1980 MHz median-while-busy in all
+  26 timed runs, so no clock correction is applied anywhere.
+- **Preference losses were not benchmarked at all** — `dpo`/`orpo`/`simpo`/`kto`
+  streamed all fail on this torch before training starts (FINDING 2), so v0.72.4's
+  claims are untested here.
+
+### Reproducing
+
+Harness scripts live in the session scratchpad, not in the repo. Each is small
+and self-contained:
+
+| script | what it does |
+|---|---|
+| `bitexact.py` | shard -> stream -> compare logits/gradients/loss curve against a resident reference of matching numerics |
+| `graddiff.py` | gradients after one backward + each model's own curve twice |
+| `determinism.py` | forward, backward and curve reproducibility of one model |
+| `repeat_backward.py` | N streamed backwards against one deterministic resident reference; `--pin`, `--buffers`, `--order` |
+| `layercount.py` / `depth_vs_bytes.py` | synthetic Llamas sweeping depth, per-layer bytes and quantisation |
+| `runbench.sh` / `variance.sh` | one `soup train` on one GPU with VRAM and SM-clock sampling; n repeats |
+
+All of them import `soup_cli` unmodified. Nothing under `src/` was changed at any
+point in this session.

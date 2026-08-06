@@ -726,4 +726,131 @@ not diverging.
 against an untuned competitor would be worthless. A second run tightened every
 memory knob it has (`stage3_max_live_parameters` 1e9 -> 1e7,
 `stage3_max_reuse_distance` 1e9 -> 1e7, `stage3_param_persistence_threshold`
-auto -> 0, `stage3_prefetch_bucket_size` auto -> 5e6). Result below.
+auto -> 0, `stage3_prefetch_bucket_size` auto -> 5e6).
+
+```
+ds_z3tight  tok/s 19.09   peak 35,997 MiB   train_runtime 429.15 s   util 41.8%   exit 0
+```
+
+Tightening every knob bought **5.6% less VRAM for 12% less throughput**
+(38,135 -> 35,997 MiB, 21.65 -> 19.09 tok/s). It does not change the comparison,
+and the tuned row is the one to quote against streaming if only one is quoted.
+
+**The honest caveat, stated rather than buried:** this is a *single-GPU*
+comparison. ZeRO-3 is designed to shard across ranks, and with `world_size = 1`
+there is no partner to shard to, so it is being used outside its intended
+regime. That regime is precisely layer streaming's home ground — the question
+both are answering here is "one GPU, weights that do not fit" — so the
+comparison is the relevant one, but a multi-GPU ZeRO-3 run would answer a
+different question and was not attempted. No multi-GPU claim is made either way.
+
+---
+
+## STEP 4 — variance, and the size sweep
+
+Every previously published throughput number for this feature is n=1. Five
+repeats per configuration, each a full `soup train` (4 epochs, 256 steps),
+runs of different configurations on different cards so nothing queues behind
+anything else. tok/s = `num_tokens / train_runtime`, both reported by the
+trainer; peak VRAM from `nvidia-smi` sampled at 2 Hz.
+
+| config | n | tok/s median | min | max | spread | peak VRAM median | store (pinned) |
+|---|---|---|---|---|---|---|---|
+| 8B NF4 streamed | 5 | **113.00** | 110.48 | 116.16 | 5.0% | 3,397 MiB | 3.35 GB |
+| 8B bf16 streamed | 5 | 62.43 | 62.20 | 63.03 | 1.3% | 3,935 MiB | 15.0 GB |
+| 14B NF4 streamed | 5 | 118.60 | 115.55 | 120.37 | 4.1% | 4,475 MiB | 6.35 GB |
+| 32B NF4 streamed | 5 | 76.80 | 75.71 | 78.70 | 3.9% | 4,845 MiB | 14.99 GB |
+| 8B bf16 ZeRO-3 offload | 2 | 19.79 | 19.74 | 19.84 | 0.5% | 38,111 MiB | — |
+
+SM clock 1980 MHz median-while-busy in all 26 runs; no clock variation to
+correct for, unlike the laptop record where it moved 13% between sessions.
+
+Three things fall out of this table.
+
+**Peak VRAM is flat in model size.** 8B -> 14B -> 32B moves peak VRAM
+3,397 -> 4,475 -> 4,845 MiB while the model grows 4x. That is the whole claim of
+the feature, measured across a 4x size range on one card, and it holds. The
+growth that does occur is the logits tensor and the per-layer buffers, not the
+weights.
+
+**14B is faster than 8B (118.60 vs 113.00), which is the opposite of the naive
+expectation.** Not investigated properly, so no mechanism is asserted; the
+obvious candidate is that these are different architectures (Llama-3.1 vs
+Qwen2.5) with different vocab sizes and layer shapes, so "8B vs 14B" is not a
+clean size sweep. The clean sweep is the three Qwen2.5 rows, and there
+14B -> 32B does drop throughput 118.60 -> 76.80 as the per-layer transfer grows.
+
+**Streaming NF4 on an H100 runs at essentially the speed it ran on a laptop.**
+The v0.72.2 record has Llama-3.1-8B NF4 at **119.6 tok/s in a 3.32 GB peak** on
+an RTX 3050 Laptop. Here, on a card with roughly two orders of magnitude more
+compute, the same model and configuration give a median **113.00 tok/s in a
+3.32 GB peak** (3,397 MiB). Within a few percent of each other, and the H100 is
+if anything slightly slower.
+
+That is not a disappointing result, it is the mechanism being confirmed: the
+method is bound by host-to-device transfer of the layer store, not by the GPU.
+The 54.1% mean GPU utilisation on the NF4 rows says the same thing — the card is
+idle half the time waiting for weights. It also explains why bf16 streaming is
+*slower* than NF4 streaming (62.43 vs 113.00) despite being simpler arithmetic:
+NF4 moves roughly a quarter of the bytes.
+
+This is the strongest cross-hardware evidence in the record that the published
+laptop numbers were not an artefact of that laptop.
+
+---
+
+## DISK — the RAM-vs-NVMe question, and why it is not answered here
+
+The brief said not to bypass the gate silently: measure the disk first, then
+decide, then write the decision down.
+
+**The device.** One virtual `vda`, and the kernel reports it as rotational:
+
+```
+$ lsblk -d -o NAME,ROTA,MODEL,SIZE
+NAME ROTA MODEL         SIZE
+vda     1                 1T
+$ cat /sys/block/vda/queue/rotational
+1
+```
+
+**What it actually does**, with O_DIRECT so the page cache is out of the way:
+
+```
+$ dd if=/dev/zero of=/root/ddtest bs=1M count=2048 oflag=direct
+2147483648 bytes (2.1 GB) copied, 3.92109 s, 548 MB/s
+$ dd if=/root/ddtest of=/dev/null bs=1M iflag=direct
+2147483648 bytes (2.1 GB) copied, 1.44622 s, 1.5 GB/s
+```
+
+1.5 GB/s sequential read is not a spinning disk. It is a virtio device backed by
+something fast on the host, exposing no rotational hint, so the guest kernel
+defaults `rotational` to 1.
+
+**What Soup decides:**
+
+```
+>>> from soup_cli.utils.layer_stream import detect_disk_kind
+>>> detect_disk_kind()
+'hdd'
+```
+
+So `stream_source: disk` is refused, and this is a **third finding, milder than
+the first two**: `detect_disk_kind` classifies from `BusType`/`MediaType`, which
+a virtio device does not supply, and the fallback lands on `hdd`. On a cloud VM —
+which is where most people who need this feature will run it — a genuinely
+NVMe-backed disk can be refused the overflow tier. The guard is not wrong to be
+conservative, but it currently cannot see through virtio.
+
+**Decision: not bypassed.** Two reasons, and the second is the real one.
+Bypassing needs the shipped classifier overridden, and a number measured on a
+1.5 GB/s virtio device would not be an answer about NVMe anyway — it would be an
+answer about this hypervisor's storage, published under a heading people would
+read as "NVMe". The v0.72.3 record's statement that the RAM-vs-disk gap is
+unmeasured stands, and this box does not change it.
+
+What can be said, and is worth saying: the measured 1.5 GB/s read is in the same
+range as the host-to-device transfer that the throughput numbers above show to be
+the binding constraint, so a disk tier on storage like this would plausibly not
+be catastrophic. That is an inference from two measurements, not a measurement,
+and is flagged as such.

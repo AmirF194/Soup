@@ -596,3 +596,54 @@ is not trustworthy at 32B** until the pool synchronisation is fixed. The
 published claims — all at 8B and below — are unaffected, and the 8B row of this
 session independently reproduces them on different hardware, a different OS and a
 much newer torch.
+
+### Two attempts to confirm it at the user level, both inconclusive — kept
+
+The controlled harness is one thing; a reviewer will ask whether a real
+`soup train` is affected. Two attempts, neither of which supports a claim.
+
+**Attempt 1 — streamed vs resident through `soup train`.** Same data, same
+hyper-parameters, 32B, one epoch of 64 rows:
+
+```
+32B stream    train_loss 1.2372903674840927   grad_norm 2.96875
+32B resident  train_loss 1.1320892516523600   grad_norm 1.89843750
+```
+
+A 9.3% gap and a grad_norm nearly 60% apart, both runs finishing clean with no
+warning — which looks like exactly the predicted silent failure. **It is not
+valid evidence.** The 8B control is what exposed the flaw:
+
+```
+8B stream     train_loss 0.032066941927041626  grad_norm 0.031494140625
+8B resident   train_loss 0.030412952972255880  grad_norm 0.019042968750
+```
+
+8B is bit-exact under the controlled harness (128/128 gradients), yet differs
+here by 5.4%. So the gap cannot be the gradient defect. The cause is that the
+two paths **initialise LoRA independently** — `build_streamed_model` seeds its
+adapter init itself, the resident path takes the global seed — so the runs start
+from different `lora_A` matrices and must diverge whatever the gradients do. The
+bit-exactness harness controls for this by copying adapters across; `soup train`
+has no reason to.
+
+**Attempt 2 — run-to-run reproducibility of the same config.** If the streamed
+backward races, two identical streamed runs should scatter more than two
+identical resident runs:
+
+```
+32B stream   run1 1.1927178781479597   run2 1.2143159396946430   (1.8% apart)
+32B resident run1 1.1417463254183530   run2 1.1260867975652218   (1.4% apart)
+```
+
+Also inconclusive: the resident path is not reproducible across *processes*
+either — 1.4% — even though it reproduced itself 256/256 *within* a process.
+`soup train` does not pin the adapter-init seed, so process-to-process scatter
+swamps the effect being looked for. 1.8% vs 1.4% with n=2 separates nothing.
+
+Both left in. The honest position is that the defect is established by the
+controlled harness (a deterministic reference, adapters synced, the survivor
+count tracking the buffer count) and **is not yet demonstrated end-to-end
+through the CLI**, because the CLI has no seed control that would make such a
+comparison mean anything. That gap is itself worth reporting: two `soup train`
+runs of one unchanged config do not reproduce each other.

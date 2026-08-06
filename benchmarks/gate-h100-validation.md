@@ -71,7 +71,7 @@ cache that a control disproved, two inconclusive user-level attempts at the
 defect, an invalid pair of VRAM numbers, an experiment whose test arm crashed
 and could not answer the question it was built for, a wrong SM-clock column, an
 8-GPU benchmark so short it reported CPU offload as *faster* than no offload, a
-reading of the quality result that n=3 supported and n=5 destroyed, and seven
+reading of the quality result that n=3 supported and n=5 destroyed, and eight
 hypotheses about the defect's trigger that measurement rejected.
 
 ## Why this run exists
@@ -1455,6 +1455,67 @@ means one buffer per layer, i.e. the whole model again.
 **Handover, in one line:** the defect is aliasing; de-aliasing costs 6% time but
 8x VRAM; `pin=False` costs 7.41x time at no VRAM cost; the correct repair is
 neither, and was not found here.
+
+### Hypothesis 8 — separate forward / backward pools. **Rejected, and it says where the fix is**
+
+ZeRO-3 and FSDP2 have the same collect-use-release structure and do not solve it
+by holding the buffer. DeepSpeed re-fetches in the backward
+(`pre_sub_module_backward_function -> fetch_sub_module(sub_module, forward=False)`)
+and — the load-bearing detail — gates `release_sub_module` on that sub-module's
+**backward finishing**, counting inputs with `requires_grad` in
+`ds_grads_remaining`, not on the next prefetch arriving. FSDP2 does the same with
+`resize_(0)` after forward and a refill in the pre-backward hook; the RFC
+(pytorch#114299) describes our exact situation — autograd packs a reference to
+the unsharded parameter, FSDP frees the storage behind its back and restores it
+before the backward. Peak memory is O(window), not O(model).
+
+So the 8x of the clone route was the price of the *wrong* repair, not of repair.
+The cheapest test of the cheap half: give the backward its own pool, so what the
+graph looks at is not in the rotation the forward evicts from.
+
+Prototyped by replacing `_body` at runtime (nothing under `src/`): when
+`prefetcher.direction == -1`, read from a second `LayerBufferPool` filled
+**synchronously** from the same source. Synchronous deliberately — a dedicated
+CUDA stream would open a genuine cross-stream race, which is a *different* bug
+class from the aliasing diagnosed here and must not be mixed into it
+(cf. torchtune#1867: NaNs from a race deleting a tensor in a streamed offload).
+
+```
+control  bwd=0  -> WRONG  grads 8/128  866.86 tok/s  peak 1132 MiB
+seppool  bwd=2  -> WRONG  grads 8/128  540.21 tok/s  peak 1612 MiB   branches={'fwd': 170, 'bwd': 150, 'bwd_fill': 150}
+seppool  bwd=4  -> WRONG  grads 8/128  547.06 tok/s  peak 2094 MiB
+```
+
+**The patch fired** — 150 backward-branch calls, and `bwd_fill == bwd` means every
+one of them had to fetch, i.e. the backward pool never already held the layer.
+That instrumentation matters: without it an unfired patch is indistinguishable
+from a failed hypothesis, and the first (uninstrumented) run of this experiment
+returned exactly the control's `8/128` in all three arms, which is precisely what
+an inert patch would also produce.
+
+**Why it fails, and this is the useful part.** The second pool rotates on the
+same `slot_for(idx) = idx % n`, so layer *i* is evicted from the *backward* pool
+when layer *i-2* is filled. The eviction is not between the forward and the
+backward — it is **inside the backward walk**. Separating the pools duplicated
+the eviction rather than removing it.
+
+Which isolates the load-bearing half of the ZeRO-3 design: **the re-fetch is not
+the fix, the release-gating is.** A layer's weights are still required after its
+own recompute, during the gradient computation that consumes them, and the very
+next layer's fetch takes the slot. Gating release on "this sub-module's backward
+has finished" is exactly the piece this prototype omitted, and exactly the piece
+DeepSpeed spends a gradient counter on.
+
+Two numbers worth keeping for whoever builds it: the extra host-to-device fetch
+per layer per step cost **1.60x** here (866.86 -> 540.21 tok/s), in the same range
+as the ~+50% I/O predicted from the method being bus-bound; and peak VRAM grew by
+exactly one extra pool (1,132 -> 1,612 MiB), i.e. **O(window)** as intended — not
+the 8x of the clone. So the memory shape of the ZeRO-3 approach is confirmed even
+though this prototype's correctness is not.
+
+Hypothesis 2 (explicit re-fetch with gated release) and the
+`saved_tensors_hooks` alternative are **not attempted here** — both need changes
+inside `src/`, and `src/` currently carries another agent's uncommitted work.
 
 ### Two more attempts on the NF4-only asymmetry, both negative
 

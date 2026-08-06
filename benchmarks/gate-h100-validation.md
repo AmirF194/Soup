@@ -931,26 +931,127 @@ rep 3: grads exact 320/320  80 layers  worst_abs 0.000000e+00
 tested — 0.5B, 8B, 14B, 32B, 72B — produces gradients bit-identical to a
 resident reference of the same numerics.
 
-So the correct statement is not "layer streaming breaks above 14B". It is:
+So the correct statement is not "layer streaming breaks above 14B" — the
+algorithm is exact at every size measured, up to 72B, once pinning is off. The
+next step was to find what actually triggers it.
 
-> The layer-streaming **algorithm** is exact at every size measured, up to 72B.
-> The **asynchronous pinned host-to-device copy path** has a missing
-> synchronisation: the buffer is consumed by compute before its copy has
-> completed. It only becomes visible once the per-layer transfer is large enough
-> for the copy to still be in flight, which is why 8B and 14B are unaffected and
-> a 4 GB laptop could never have found it.
+---
 
-That matches the code's own documented tripwire — `LayerBufferPool.wait()` is the
-ownership check that exists to prevent exactly this, and `load_async` is
-documented as issuing `stream.wait_stream(current)` before `copy_` so a prefetch
-cannot clobber an in-flight layer. Something on the **backward/recompute** side
-is not covered by that, since the forward is bit-exact in every single run at
-every size.
+## STEP 6 — isolating the trigger, including four hypotheses that were wrong
+
+The natural first story — *a race whose window opens once the per-layer transfer
+is large enough* — is wrong. It was tested four ways and survived none of them.
+All of the following are on synthetic from-config Llamas unless a real model is
+named, streamed vs a resident reference of matching numerics, adapters synced,
+pinning on.
+
+**Rejected 1 — compute-vs-transfer ratio.** If a longer forward gave the copy
+time to land, sequence length would move the outcome. It does not, in either
+direction:
+
+```
+14B NF4  seq 8    exact 192/192   (shorter compute -- should have broken it)
+14B NF4  seq 16   exact 192/192
+14B NF4  seq 128  exact 192/192
+14B NF4  seq 512  exact 192/192
+32B NF4  seq 128  WRONG  8/256
+32B NF4  seq 512  WRONG  8/256    (4x the compute -- should have fixed it)
+```
+
+**Rejected 2 — per-layer bytes.** 8B in bf16 moves 480 MiB per layer, more than
+twice what a broken 32B NF4 layer moves, and is exact:
+
+```
+8B  bf16  32 layers  ~480 MiB/layer  exact 128/128 x3
+14B bf16  48 layers  ~570 MiB/layer  exact 192/192 x3
+32B nf4   64 layers   234 MiB/layer  WRONG   8/256
+```
+
+**Rejected 3 — total store bytes.** 8B bf16's store is 15.0 GB and exact; 32B
+NF4's is 14.99 GB and broken. Near-identical stores, opposite outcomes.
+
+**Rejected 4 — layer count.** Synthetic Llamas swept across the 48 -> 64
+boundary are exact at every depth, in both quantisations, as long as the layers
+are small:
+
+```
+tiny   bf16  0.05 MiB/layer   32, 48, 56, 64, 80, 96 layers -> all EXACT
+tiny   nf4   0.01 MiB/layer   32, 48, 56, 60, 64, 80 layers -> all EXACT
+synth  bf16  84.5 MiB/layer   32, 48, 56, 64, 80 layers     -> all EXACT
+synth  bf16   338 MiB/layer   32, 48, 64 layers             -> all EXACT
+```
+
+### What it actually is: the NF4 path, above a per-layer size threshold
+
+The discriminating experiment holds the model shape **identical** and changes
+only the quantisation. 32 layers, hidden 5120, intermediate 27648:
+
+| quant | MiB/layer | store | result |
+|---|---|---|---|
+| bf16 | **935.0** | 29,921 MiB | **EXACT** `128/128 x3` |
+| NF4 | 241.2 | 7,718 MiB | **WRONG** `24/128, 8/128, 8/128` |
+
+bf16 is exact while moving **3.9x more bytes per layer** than the NF4 run that
+fails. Whatever this is, it is not a transfer-size race in the general copy path.
+It is in the NF4 path.
+
+Bracketing the NF4 threshold, at a fixed 48 layers:
+
+| intermediate | MiB/layer | store | result |
+|---|---|---|---|
+| 13,824 *(Qwen2.5-14B's own shape)* | 136.7 | 6,563 MiB | **EXACT** `192/192 x3` |
+| 20,480 | 187.0 | 8,977 MiB | **WRONG** `192/192, 8/192, 8/192` |
+| 27,648 *(Qwen2.5-32B's own shape)* | 241.2 | 11,577 MiB | **WRONG** `8/192 x3` |
+
+The 13,824 row is a synthetic reconstruction of the real 14B's layer shape and
+it is exact, exactly as the real 14B is; the 27,648 row reconstructs the real
+32B's and is broken, exactly as the real 32B is. The behaviour follows the
+**shape**, not the checkpoint — so this is reproducible without downloading a
+32B model.
+
+**Threshold: somewhere between 136.7 and 187.0 MiB per NF4 layer.** Not narrowed
+further.
+
+Note the 48-layer/187 MiB row also kills the last version of the depth story: it
+is broken at 48 layers, the same depth at which the real 14B is exact.
+
+### The smallest reproducer found
+
+```python
+LlamaConfig(vocab_size=4096, hidden_size=5120, intermediate_size=27648,
+            num_hidden_layers=32, num_attention_heads=40, num_key_value_heads=10,
+            tie_word_embeddings=False, max_position_embeddings=512)
+# shard NF4, stream with pin=True, buffers=2
+# backward twice on the same input -> second one disagrees with a resident
+#   NF4 reference on every layer except the last 2
+```
+
+7.7 GB store, runs in about a minute, no download.
+
+### Stated as precisely as the evidence allows
+
+- The **forward is bit-exact in every configuration tested**, at every size, in
+  both quantisations, broken or not. Nothing in a loss curve can reveal this.
+- The **backward** produces gradients that disagree with a deterministic resident
+  reference on every layer except the last `stream_buffers`, when the base is
+  **NF4** and the layer exceeds roughly 137–187 MiB. Usually from the second
+  backward onward; at 72B from the first.
+- **Turning pinning off makes it exact**, at 32B and at 72B. Pinned memory is
+  what makes a host-to-device `copy_` genuinely asynchronous, so the missing
+  dependency is between the NF4 layer's arrival and its use — most plausibly the
+  `Params4bit` / `quant_state` views that `rebuild_quant_state` and
+  `rebuild_params4bit` construct over the pooled buffer, which for an NF4 layer
+  means several sidecar tensors (`::absmax`, `::nested_absmax`, `::nested_offset`)
+  per weight rather than one. That last clause is a hypothesis pointing at the
+  likely code, not a measurement.
+- `LayerBufferPool.wait()` is documented as the ownership check that prevents
+  exactly this, and `load_async` as issuing `stream.wait_stream(current)` before
+  `copy_`. Both are evidently insufficient on this path.
 
 **No fix attempted and no Soup code changed**, per the brief. There is also no
 user-facing escape hatch: pinning is chosen automatically by `decide_pinning`,
-with no config key to turn it off, so a user hitting this at 32B+ cannot work
-around it from `soup.yaml`.
+with no config key to disable it, so a user hitting this cannot work around it
+from `soup.yaml`.
 
 ### Everything measured, one table
 

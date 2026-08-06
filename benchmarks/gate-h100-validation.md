@@ -30,18 +30,29 @@ appear in the order they were run, not in the order they would read best.
    is the first evidence of that from outside the original box.
 3. **Against DeepSpeed ZeRO-3 CPU offload, same box, same data, same model:
    2.93x the throughput in 9.7x less peak VRAM** at matched numerics.
-4. **A silent correctness defect, found and isolated.** With an NF4 base and
+4. **A silent correctness defect, found and diagnosed.** With an NF4 base and
    layers above a threshold bracketed at 163.8–171.5 MiB, the streamed
    *backward* produces gradients
    that disagree with a resident reference on every layer but the last
    `stream_buffers` — while the forward stays bit-exact and the loss curve looks
-   healthy. It affects 32B and 72B, not 8B or 14B; it disappears when host memory
-   is not page-locked; and it is reproducible in about a minute on a synthetic
-   7.7 GB model. Nothing was changed in Soup to work around it.
-5. **Three Linux/multi-GPU findings** the single-GPU Windows dev box could not
-   have surfaced: `nn.DataParallel` versus `meta` parameters, the `#328` meta
-   leak reaching CUDA and all four preference losses, and `detect_disk_kind`
-   classifying a 1.5 GB/s virtio disk as an HDD.
+   healthy. It affects 32B and 72B, not 8B or 14B; it is reproducible in about a
+   minute on a synthetic 7.7 GB model. The mechanism is **aliasing, not a race**:
+   a full `cuda.synchronize()` does not fix it and de-aliasing the pooled buffers
+   does. Six competing hypotheses were tested and rejected along the way.
+5. **A model trained by streaming is as good as one trained resident.** Paired
+   over five disjoint training subsets and judged by Soup's own `soup ship`:
+   mean difference +0.006 against an identical 0.013 within-arm spread on both
+   sides. This had never been measured anywhere in the project.
+6. **Four Linux/multi-GPU findings** the single-GPU Windows dev box could not
+   have surfaced: `nn.DataParallel` versus `meta` parameters; **`device_map="auto"`
+   making the multi-GPU path the tool itself advertises fail on every rank**;
+   the `#328` meta leak reaching CUDA and all four preference losses; and
+   `detect_disk_kind` classifying a 1.5 GB/s virtio disk as an HDD. The first two
+   are fixed here, with tests that run on CPU-only CI as well as on eight cards.
+7. **Eight cards of ZeRO-3 are slower than one card training resident** for a
+   model that fits — which makes the honest positioning narrow: layer streaming
+   is not "faster than DeepSpeed", it is for the case where the one card you have
+   is too small.
 
 6. **The defect is not issue #328**, and the two share no trigger axis —
    quantisation, model size, task and manifestation all differ, and each is the
@@ -53,8 +64,10 @@ appear in the order they were run, not in the order they would read best.
 Also here, because the record is the working one: a false alarm about the HF
 cache that a control disproved, two inconclusive user-level attempts at the
 defect, an invalid pair of VRAM numbers, an experiment whose test arm crashed
-and could not answer the question it was built for, a wrong SM-clock column, and
-five hypotheses about the defect's trigger that measurement rejected.
+and could not answer the question it was built for, a wrong SM-clock column, an
+8-GPU benchmark so short it reported CPU offload as *faster* than no offload, a
+reading of the quality result that n=3 supported and n=5 destroyed, and six
+hypotheses about the defect's trigger that measurement rejected.
 
 ## Why this run exists
 

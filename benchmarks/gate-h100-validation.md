@@ -328,6 +328,10 @@ existence for this project was an RTX 3050. The probe is fine; the assertion doe
 not generalize to datacenter GPUs. Cosmetic, but it means the shipped suite
 cannot go green on this class of machine.
 
+> **Fixed while this session was still running**, in `f715218` — the bound is now
+> a named `_MAX_PLAUSIBLE_GEMM_TFLOPS` chosen to catch a wrong *order of
+> magnitude* rather than to encode one generation of hardware.
+
 ---
 
 ## STEP 2 — bit-exactness at real model sizes
@@ -714,6 +718,8 @@ Soup's own `--deepspeed` flag, so this is one tool against itself.
    `offload_param: none`, and the only offload preset is stage 2 optimizer-only.
    The configuration a memory-constrained user actually wants is not among them.
    Supplied here as a hand-written JSON, which `--deepspeed <path>` accepts.
+   **Fixed while this session was still running**, in `9ae7a9b`, which adds a
+   `zero3_offload` preset holding exactly the config measured below.
 2. **`offload_optimizer: cpu` cannot work on this box.** DeepSpeed JIT-builds
    its `cpu_adam` op and needs a matching CUDA toolkit; the machine has no
    `nvcc`. Installing `ninja` moved the error along to

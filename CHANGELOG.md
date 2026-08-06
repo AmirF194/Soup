@@ -13,14 +13,18 @@ reproducing 70+ versions of notes.
 ## [Unreleased]
 
 **Added — `--deepspeed zero3_offload`, a ZeRO-3 preset that offloads parameters to
-CPU.** `zero3` set `offload_param: none` and the only offload preset shipped was
-stage 2, optimizer-only — so the configuration a user short of VRAM actually wants
-was not in the tool, and the DeepSpeed comparison in
+CPU.** `zero3` set `offload_param: none` and the only offload *preset* was stage 2,
+optimizer-only, so the configuration a user short of VRAM actually wants could not be
+named on the command line — the DeepSpeed comparison in
 `benchmarks/gate-h100-validation.md` (STEP 3) had to be run from hand-written JSON.
 Measured there on one H100 (Llama-3.1-8B, bf16, LoRA r=8, 256 steps): 21.65 tok/s at
 a 38,135 MiB peak. `offload_optimizer` deliberately stays `none` — turning it on
 makes DeepSpeed JIT-build `cpu_adam`, which needs a matching CUDA toolkit and fails
-without one; copy the emitted JSON and flip it if you have `nvcc`.
+without one (`CUDAMismatchException`, then `'DeepSpeedCPUAdam' object has no
+attribute 'ds_opt_adam'`); copy the emitted JSON and flip it if you have `nvcc`. Note
+the pre-existing `soup fetch deepspeed_configs zero3-cpu-offload` example is *not*
+this config: it turns optimizer offload on, so it is the variant that needs a
+toolkit, and it is a file to edit rather than a `--deepspeed` name.
 
 **Fixed — the GEMM-ceiling test could not pass on a datacenter GPU.** The
 plausibility bound on `measure_gemm_tflops` was `< 200 TFLOPS`, written when the only

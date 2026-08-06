@@ -433,3 +433,166 @@ contradict the entire feature.
 Left in the record rather than deleted. It does not touch the bit-exactness
 claim — that comparison requires both models in memory *by construction* — but a
 real streamed-peak number has to come from a separate single-model run.
+
+### 14B and 32B — logits bit-exact, and then 32B's loss curve did not match
+
+Run in parallel on separate cards (GPU 1 and GPU 2). Parallelism cannot affect
+an equality claim, only a timing one, and no timing is claimed here.
+
+| model | params | layers | store (pinned) | shard | copied | max abs logit diff | bit-exact | layer-0 grad | layers w/ grad | curves equal |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 494,032,768 | 24 | 0.18 GB | 1.0 s | 96 | 0.0 | yes | 9.093866e-01 | 24/24 | yes |
+| Llama-3.1-8B | 8,030,261,248 | 32 | 3.35 GB | 23.3 s | 128 | 0.0 | yes | 1.736659e-01 | 32/32 | yes |
+| Qwen2.5-14B | 14,770,033,664 | 48 | 6.35 GB | 35.9 s | 192 | 0.0 | yes | 1.185666e-02 | 48/48 | yes |
+| Qwen2.5-32B | 32,763,876,352 | 64 | 14.99 GB | 79.2 s | 256 | 0.0 | yes | 6.008708e-03 | 64/64 | **no** |
+
+All four are bit-exact in the **forward**. 32B is the odd one: `curves_equal:
+false`, `curve_max_rel: 0.0586`.
+
+```
+streamed               resident                diff
+13.05783462524414      13.05783462524414       +0.000000e+00
+12.815812110900879     12.571563720703125      +2.442484e-01
+12.531695365905762     12.131075859069824      +4.006195e-01
+12.24169921875         11.740943908691406      +5.007553e-01
+11.970612525939941     11.308257102966309      +6.623554e-01
+```
+
+Step 0 is identical, as it must be given bit-exact logits. Divergence begins
+after the first optimizer step, so the gradients are what differ.
+
+## STEP 2b — chasing the 32B divergence
+
+This turned into the most important thread of the session, and it took four
+measurements and one self-contradiction to land.
+
+### Measurement 1 — gradients matched, and both models failed to reproduce themselves
+
+Direct comparison of all LoRA gradients after **one** backward, plus each model's
+own 5-step curve run twice:
+
+```
+A grads: 256/256 bit-exact, worst abs 0.000000e+00 rel 0.000000e+00
+B streamed self-identical: False
+C resident self-identical: False
+```
+
+Read naively this says "gradients are fine, both models are just
+non-deterministic, nothing to see". That reading is wrong, and it is wrong in a
+way worth keeping: **it is internally inconsistent**. If the backward were
+non-deterministic, two independently computed backwards would not agree
+bit-exactly across 256 tensors. Both statements cannot hold.
+
+### Measurement 2 — which stage actually varies
+
+Repeating forward and backward on the same model with the same input:
+
+```
+                       forward reproducible   grads rep1 vs rep3   curve reproducible
+Qwen2.5-32B streamed   yes                    8/256 bit-exact      no
+Qwen2.5-32B resident   yes                    256/256 bit-exact    yes
+```
+
+So the **forward is deterministic in both**, the **resident backward is
+deterministic**, and the **streamed backward is not**. That also explains
+measurement 1's contradiction: `graddiff` compared each model's *first* backward,
+and the first one happened to be right.
+
+Not the GPU and not the activation size — it reproduces on a different card and
+at `seq 32`:
+
+```
+32B on GPU 6:   grad repeat worst abs 7.917519e-01  bit-exact 8/256
+32B at seq 32:  grad repeat worst abs 5.827999e-01  bit-exact 8/256
+```
+
+And it is size-dependent. 0.5B, 8B and 14B are perfectly reproducible:
+
+```
+0.5B  grad repeat worst abs 0.000000e+00  bit-exact 96/96   curves identical=True
+8B    grad repeat worst abs 0.000000e+00  bit-exact 128/128 curves identical=True
+14B   grad repeat worst abs 0.000000e+00  bit-exact 192/192 curves identical=True
+```
+
+### Measurement 3 — not "different", **wrong**
+
+Non-reproducibility on its own is survivable; bf16 atomics do it. Being wrong is
+not. The resident model reproduces itself 256/256, so it is a valid fixed
+reference. Taking resident's gradients once and diffing every streamed
+repetition against that same reference (streamed backwards run first, so nothing
+about the resident run can be blamed):
+
+```
+resident reference loss 13.048010826  (256 grad tensors)
+rep 1: loss 13.048010826 (==resident True)  grads exact 256/256  64 layers  worst_rel  0.0000
+rep 2: loss 13.048010826 (==resident True)  grads exact   8/256  [62, 63]   worst_rel 55.9389
+rep 3: loss 13.048010826 (==resident True)  grads exact   8/256  [62, 63]   worst_rel 55.9389
+rep 4: loss 13.048010826 (==resident True)  grads exact   8/256  [62, 63]   worst_rel 55.9389
+rep 5: loss 13.048010826 (==resident True)  grads exact   8/256  [62, 63]   worst_rel 55.9389
+```
+
+The loss is bit-identical to resident on **every** repetition — the forward is
+never wrong — while the gradients for 62 of 64 layers are off by up to 56x
+relative. This is the silent-failure class the codebase's own notes name: *"a
+recycled buffer yields silently WRONG gradients not a crash."* Nothing in a
+training log would show it. The loss still falls.
+
+The surviving layers are 62 and 63: the **last two**, i.e. the first two the
+backward touches.
+
+### Measurement 4 — the survivor count is exactly the buffer count
+
+```
+buffers=2  rep2+  exact  8/256   layers [62, 63]
+buffers=3  rep2+  exact 12/256   layers [61, 62, 63]
+buffers=4  rep2+  exact 16/256   layers [60, 61, 62, 63]
+buffers=8  rep2+  exact 32/256   8 layers
+```
+
+One layer of survivors per buffer, always the last ones. Those are precisely the
+layers still sitting in the pool when the backward starts — the ones that need
+**no transfer**. Every layer that has to be fetched is wrong.
+
+The layers *are* being fetched — the counter rules out "the backward simply
+doesn't reload":
+
+```
+8B    layer_loads  0 -> 62  (delta 62)   then 61, 61      # 32 fwd + 32 bwd - 2 pooled
+32B   layer_loads  0 -> 126 (delta 126)  then 125, 125    # 64 fwd + 64 bwd - 2 pooled
+```
+
+So the transfers are issued and counted; the compute consumes the buffer before
+the copy is complete. That is a **race**, not a missing load, and the
+`LayerBufferPool.wait()` ownership check that exists specifically to prevent this
+is not catching it at this transfer size (32B ≈ 234 MB/layer, against 14B ≈
+132 MB and 8B ≈ 105 MB).
+
+Severity varies run to run, which is the signature of a race rather than a logic
+error: in one run rep 1 was 256/256 exact, in another 20/256 (`worst_rel 0.8169`),
+and rep 3's `worst_rel` came out 8.5330 in one run and 55.9389 in another.
+
+### What this means, stated carefully
+
+- **Confirmed:** at Qwen2.5-32B, NF4, bf16, on an H100, the streamed backward
+  produces gradients that disagree with a deterministic resident reference on
+  every layer that requires a transfer, from the second backward pass onward.
+  The forward stays bit-exact throughout.
+- **Confirmed:** 0.5B, 8B and 14B do not show it — 96/96, 128/128 and 192/192
+  gradients bit-exact across repeated passes, and 5-step curves identical to
+  resident.
+- **Not established:** the exact threshold, whether it is per-layer bytes,
+  layer count, or transfer-vs-compute ratio; whether it appears at 8B under a
+  longer sequence or larger batch (which lengthen compute, and would *narrow* the
+  window, so probably not) or under a slower host-to-device path; whether the
+  torch 2.13 stack matters. The dev box could not have seen this: it never ran a
+  model this large, because it could not hold the resident reference to compare
+  against.
+- **Not done:** no Soup code was changed. The brief forbids editing the code to
+  make a measurement pass, and this is a finding to hand over, not a patch to
+  smuggle in.
+
+Practical reading for now: **layer streaming is verified exact through 14B and
+is not trustworthy at 32B** until the pool synchronisation is fixed. The
+published claims — all at 8B and below — are unaffected, and the 8B row of this
+session independently reproduces them on different hardware, a different OS and a
+much newer torch.

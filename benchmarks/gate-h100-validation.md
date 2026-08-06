@@ -43,10 +43,18 @@ appear in the order they were run, not in the order they would read best.
    leak reaching CUDA and all four preference losses, and `detect_disk_kind`
    classifying a 1.5 GB/s virtio disk as an HDD.
 
+6. **The defect is not issue #328**, and the two share no trigger axis —
+   quantisation, model size, task and manifestation all differ, and each is the
+   other's control. Two bugs, not one.
+7. **Turning pinning off costs 6.56x throughput** at 32B NF4, measured with
+   correctness asserted in the same process. That is too expensive to be a
+   silent automatic fallback.
+
 Also here, because the record is the working one: a false alarm about the HF
 cache that a control disproved, two inconclusive user-level attempts at the
-defect, an invalid pair of VRAM numbers, and four hypotheses about the defect's
-trigger that measurement rejected.
+defect, an invalid pair of VRAM numbers, an experiment whose test arm crashed
+and could not answer the question it was built for, a wrong SM-clock column, and
+five hypotheses about the defect's trigger that measurement rejected.
 
 ## Why this run exists
 
@@ -1235,6 +1243,75 @@ Not one axis in common, and each is the other's control: SFT is the task where
 already rejected in STEP 6. They may still share an ancestor — both are the
 streamed layer misbehaving on a second pass — but they are not one fix.
 
+---
+
+## STEP 8 — what does turning pinning off cost? **6.56x**
+
+`pin=False` is the only thing found that makes the NF4 defect go away, so it is
+the obvious candidate for an automatic mitigation: detect an NF4 layer above the
+threshold, fall back to pageable host memory. Whether that is a reasonable
+fallback or a configuration that should simply be refused is a question about a
+number, so here is the number.
+
+Both arms are the same harness on the same shards, alternating within one
+process, `Qwen2.5-32B-Instruct` NF4, seq 256, batch 1, 20 timed steps after 5
+warm-up, `torch.cuda.synchronize` around each step, n=3 per arm.
+**Correctness is asserted inside each arm**, so a fast arm cannot quietly be the
+wrong one — the gradient check runs in the same process as the timing.
+
+| arm | rep | tok/s | median step | gradients | verdict |
+|---|---|---|---|---|---|
+| `pin=True` | 1 | 408.88 | 0.6261 s | 8/256 | **WRONG** |
+| `pin=True` | 2 | 425.42 | 0.6018 s | 8/256 | **WRONG** |
+| `pin=True` | 3 | 425.07 | 0.6022 s | 8/256 | **WRONG** |
+| `pin=False` | 1 | 65.25 | 3.9232 s | 256/256 | correct |
+| `pin=False` | 2 | 64.41 | 3.9745 s | 256/256 | correct |
+| `pin=False` | 3 | 64.79 | 3.9513 s | 256/256 | correct |
+
+```
+median pin=True  425.07 tok/s
+median pin=False  64.79 tok/s
+cost of turning pinning off: 6.56x slower   (division of the two medians)
+```
+
+Spread within each arm is small (4.0% pinned, 1.3% pageable), so n=3 is enough to
+carry the ratio.
+
+**Reading it.** 6.56x is not a fallback, it is a different feature. The premise
+of layer streaming is that a model you could not otherwise train becomes
+trainable at a tolerable slowdown; multiplying that slowdown by another 6.6x
+silently, to work around a bug, spends the entire margin the method exists to
+provide. On the framing the question was posed with — cheap means fall back with
+a loud notice, expensive means refuse — this lands clearly on **refuse**:
+declining an NF4 configuration above the threshold, with the reason stated, is
+more honest than shipping something correct and six times slower without telling
+anyone. That said, the call belongs to whoever fixes this, and a *third* option
+now exists that neither branch of the question anticipated: STEP 7 showed
+autograd detects the underlying buffer reuse by itself once checkpointing is not
+masking it, so a real fix may be cheaper than either workaround.
+
+**Three caveats on these numbers, none of which touch the ratio.**
+
+1. **The tok/s are not comparable to the `soup train` figures elsewhere in this
+   record.** This harness replays one fixed padded batch with no data pipeline
+   and counts all 256 positions; `soup train` counts real tokens on short rows.
+   That is why 425 tok/s appears here against 76.80 tok/s for the same model in
+   STEP 4. Only the within-experiment ratio is being claimed.
+2. **The peak VRAM column was dropped from the table on purpose.** The harness
+   holds the resident reference alongside the streamed model in order to check
+   correctness, so its peak (26,713 MiB) measures both models, exactly the
+   invalid-measurement trap already recorded at 8B. It is not a streaming peak.
+3. **The SM clock this harness recorded is wrong** — it reads once immediately
+   after a `synchronize`, before the timed loop, and got 345 MHz (the idle
+   clock) on every row. The `nvidia-smi`-sampled runs elsewhere show 1980 MHz
+   while busy. Both arms are affected identically, so the comparison stands, but
+   no absolute throughput from this table should be quoted against a clock.
+
+Not measured: whether 6.56x holds on slower host-to-device links. This box is
+PCIe (PIX between all pairs, no NVLink); a machine with less host bandwidth
+would likely show a *smaller* ratio, because the pinned arm has less advantage
+to lose.
+
 ### Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
@@ -1270,6 +1347,8 @@ and self-contained:
 | `graddiff.py` | gradients after one backward + each model's own curve twice |
 | `determinism.py` | forward, backward and curve reproducibility of one model |
 | `repeat_backward.py` | N streamed backwards against one deterministic resident reference; `--pin`, `--buffers`, `--order` |
+| `ckpt_hypothesis.py` | flips `StreamedDecoderLayer.use_checkpoint` at runtime, both arms |
+| `pincost.py` | pinned vs pageable throughput, correctness asserted in the same process |
 | `layercount.py` / `depth_vs_bytes.py` | synthetic Llamas sweeping depth, per-layer bytes and quantisation |
 | `runbench.sh` / `variance.sh` | one `soup train` on one GPU with VRAM and SM-clock sampling; n repeats |
 

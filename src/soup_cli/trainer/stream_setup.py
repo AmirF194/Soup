@@ -21,10 +21,64 @@ NO top-level torch: this module is imported by five trainer modules.
 
 import contextlib
 import math
+import os
 
 from rich.console import Console
 
 console = Console()
+
+
+def _distributed_launch() -> bool:
+    """True when the process was launched by torchrun / accelerate / deepspeed.
+
+    Those set ``WORLD_SIZE`` and HF then reports ``n_gpu == 1`` per process, so
+    ``nn.DataParallel`` is never applied and the guard below must not fire.
+    A malformed value is treated as non-distributed: refusing with a clear
+    message beats proceeding into a raw torch error.
+    """
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1") or "1") > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def refuse_if_data_parallel(device) -> None:
+    """Refuse layer streaming when HF Trainer would wrap the model in DataParallel.
+
+    ``TrainingArguments`` sets ``_n_gpu = torch.cuda.device_count()`` for a
+    non-distributed run, and ``Trainer._wrap_model`` then does
+    ``model = nn.DataParallel(model)`` whenever ``n_gpu > 1``. DataParallel
+    replicates by requiring every parameter to live on ``device_ids[0]``, and
+    layer streaming keeps the decoder on ``meta`` by design — the two are
+    incompatible by construction, not by accident.
+
+    Without this the user gets torch's bare ``module must have its parameters
+    and buffers on device cuda:0 ... but found one of them on device: meta``,
+    which names nothing they set and points at nothing they can change.
+
+    Refusing rather than silently dropping to one GPU is deliberate and matches
+    the rest of this path (the VRAM fit decision refuses too): a run that
+    quietly used 1 of 8 visible cards would look like it was using all of them.
+    """
+    if not str(device).startswith("cuda"):
+        return
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    visible = torch.cuda.device_count()
+    if visible <= 1 or _distributed_launch():
+        return
+    raise ValueError(
+        f"training.stream_layers=true, but {visible} CUDA devices are visible. "
+        f"transformers wraps the model in nn.DataParallel whenever more than one "
+        f"GPU is visible and the run is not distributed, and DataParallel requires "
+        f"every parameter on cuda:0 — layer streaming keeps the decoder on 'meta' "
+        f"by design, so the two cannot be combined. Layer streaming is a "
+        f"single-GPU technique: re-run with one card visible, e.g. "
+        f"CUDA_VISIBLE_DEVICES=0, or set stream_layers=false to train resident "
+        f"across all {visible}."
+    )
 
 
 class StreamingSetupMixin:
@@ -74,6 +128,11 @@ class StreamingSetupMixin:
 
         from peft import LoraConfig, TaskType
         from transformers import AutoConfig, AutoTokenizer
+
+        # BEFORE the tokenizer load, the weight resolve and the shard write:
+        # this configuration cannot work, and finding out minutes into disk I/O
+        # is worse than finding out now.
+        refuse_if_data_parallel(self.device)
 
         from soup_cli.utils.layer_shard import (
             QUANT_NF4,

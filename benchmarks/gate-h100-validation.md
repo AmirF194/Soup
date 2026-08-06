@@ -1410,6 +1410,68 @@ was taken at.**
 
 ---
 
+## STEP 10 — the `nn.DataParallel` guard (FIX PHASE)
+
+*Measured on the box at `9117da1` plus the patch below, which is the only `src/`
+change in play. The box's clone predates `f715218` and `9ae7a9b`, so the
+GEMM-ceiling row still fails there; that is the old clone, not a regression.*
+
+FINDING 1 accounted for eight of STEP 1's nine failures and cannot be reproduced
+on a one-GPU machine, which is why it survived the whole of v0.72.0–v0.72.4.
+
+**Design choice: refuse, not silently drop to one card.** `Trainer._wrap_model`
+applies `nn.DataParallel` whenever `args.n_gpu > 1`, and `TrainingArguments`
+sets `_n_gpu = torch.cuda.device_count()` for a non-distributed run. Forcing
+`n_gpu = 1` would make streaming "work" on an 8-GPU box while silently using one
+eighth of it — the same class of silent degradation STEP 8 rejected for the
+pinning fallback. The rest of this path refuses rather than warns (the VRAM fit
+decision does), so the guard refuses, names `stream_layers`, states the
+incompatibility, and gives the exact fix.
+
+It fires **before** the tokenizer load, the weight resolve and the shard write:
+finding out minutes into disk I/O is strictly worse.
+
+Distributed launches are exempt: `torchrun` / `accelerate` give each process one
+GPU and HF reports `n_gpu == 1`, so `DataParallel` is never applied and refusing
+would ban a configuration that works. Detected via `WORLD_SIZE`; a malformed
+value counts as non-distributed, because refusing with a clear message beats
+proceeding into torch's `meta` error.
+
+**Verified on the real eight cards**, which is the point of doing it here:
+
+```
+$ python -m soup_cli.cli train --config stream05b.yaml --yes      # 8 visible
+Error: ValueError: training.stream_layers=true, but 8 CUDA devices are visible.
+... with one card visible, e.g. CUDA_VISIBLE_DEVICES=0, or set stream_layers=false
+
+$ CUDA_VISIBLE_DEVICES=6 python -m soup_cli.cli train --config stream05b.yaml --yes
+Layer streaming ready: 24 layers, 0.18 GB pinned RAM store, 2 x 8 MB VRAM buffers
+{'train_runtime': 14.6791, ..., 'train_loss': 0.47571421414613724, ...}
+```
+
+The single-card control still trains, and its `train_loss` is **byte-identical**
+to the pre-guard run recorded in STEP 2 (`0.47571421414613724`) — the guard
+changes nothing on the path that works.
+
+**Tests run on both classes of hardware.** `tests/test_stream_multi_gpu_guard.py`
+monkeypatches `torch.cuda.device_count`, so a CPU-only CI runner exercises the
+same branch as a datacenter node; the one test that genuinely needs several
+cards is skipped by hardware behind `SOUP_TEST_MULTI_GPU`, not left failing.
+
+```
+CUDA_VISIBLE_DEVICES=6 pytest tests/test_stream_multi_gpu_guard.py   13 passed, 1 skipped
+SOUP_TEST_MULTI_GPU=1  pytest tests/test_stream_multi_gpu_guard.py   14 passed
+```
+
+Controls carry the weight here: single GPU, `--device cpu` with 8 visible, CUDA
+unavailable, and a distributed launch must all be **allowed**, or the guard is
+satisfied by one that always raises and every single-GPU run breaks.
+
+Full streaming suite after the change, one card visible: **435 passed, 1 skipped,
+6 failed** — the same six as STEP 1 (five #328 preference-loss failures plus the
+GEMM-ceiling bound this clone predates the fix for), and +13 new passes. No
+regression.
+
 ### Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB

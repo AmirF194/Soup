@@ -326,17 +326,86 @@ class TestThroughputForecast:
             )
 
 
+#: Upper plausibility bound for the measured GEMM ceiling, in TFLOPS.
+#:
+#: The probe times a dense bf16 matmul, so it is bounded above by the card's
+#: dense bf16 tensor-core peak. Vendor dense bf16 peaks, for scale: RTX 3050
+#: Laptop ~18, A100 SXM 312, H100 SXM ~989, B200 ~2250. Measured *through this
+#: probe*: 6.75 TFLOPS on the RTX 3050 dev box at 952 MHz, and 786.5 TFLOPS on
+#: an H100 at 1980 MHz (`benchmarks/gate-h100-validation.md`, FINDING 3).
+#:
+#: The bound that belongs here is one that catches a BROKEN PROBE -- a unit slip
+#: (ms read as seconds) or a wrong FLOP count, both wrong by three orders of
+#: magnitude -- without encoding one generation of hardware. The 200.0 this
+#: replaces was written when the only card this project had ever run on was that
+#: laptop; it then failed an H100 at a correct 786.5, which made the shipped
+#: suite un-greenable on exactly the machines this feature gets audited on.
+#: 10_000 is >4x the fastest shipping accelerator and still ~100x below what any
+#: unit error would report.
+_MAX_PLAUSIBLE_GEMM_TFLOPS = 10_000.0
+
+
 @requires_cuda
 class TestMeasuredGemmCeiling:
     def test_returns_a_plausible_tflops_and_the_clock_it_was_taken_at(self):
         """A fraction-of-ceiling quoted without a stated clock is meaningless --
         this box's boost clock moved 442..952 MHz inside a single gate run."""
+        import math
+
         from soup_cli.utils.layer_stream_runtime import measure_gemm_tflops
 
         got = measure_gemm_tflops(device="cuda")
         assert got is not None
-        assert 0.5 < got.tflops < 200.0
+        assert math.isfinite(got.tflops)
+        assert 0.5 < got.tflops < _MAX_PLAUSIBLE_GEMM_TFLOPS, (
+            f"{got.tflops} TFLOPS is not a rate any shipping GPU produces -- "
+            "suspect the probe's timing or FLOP count, not the card"
+        )
         assert got.sm_clock_mhz is None or 100 <= got.sm_clock_mhz <= 4000
+        # the shape is reported so a fraction-of-ceiling can be shape-matched
+        assert got.size == 4096
+
+    def test_the_reported_rate_matches_an_independently_timed_matmul(self):
+        """The plausibility band above cannot be tight without pinning a
+        hardware generation, so the check that actually has teeth is a
+        hardware-INDEPENDENT one: time the same matmul here and require the
+        probe to agree to within an order of magnitude. A unit slip or a wrong
+        FLOP count is off by ~1000x and fails this on any card; a cold clock, a
+        busy GPU or best-of-N vs a single sample are worth at most a few x
+        (measured spread on the dev box: 38% within a session, 1.9x across
+        sessions at the same reported clock)."""
+        import torch
+
+        from soup_cli.utils.layer_stream_runtime import _GEMM_SIZE, measure_gemm_tflops
+
+        got = measure_gemm_tflops(device="cuda")
+        assert got is not None
+
+        size, iters = _GEMM_SIZE, 8
+        left = torch.randn(size, size, device="cuda", dtype=torch.bfloat16)
+        right = torch.randn(size, size, device="cuda", dtype=torch.bfloat16)
+        try:
+            for _ in range(3):  # warm up: the first matmul pays kernel selection
+                left @ right
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                left @ right
+            end.record()
+            torch.cuda.synchronize()
+            seconds = start.elapsed_time(end) / 1000.0
+        finally:
+            del left, right
+            torch.cuda.empty_cache()
+
+        assert seconds > 0
+        independent = 2.0 * (size**3) * iters / seconds / 1e12
+        assert 0.1 * independent <= got.tflops <= 10.0 * independent, (
+            f"probe reported {got.tflops} TFLOPS where an independent timing of "
+            f"the same {size}^3 bf16 matmul gives {independent}"
+        )
 
     def test_returns_none_on_cpu_rather_than_inventing_a_number(self):
         from soup_cli.utils.layer_stream_runtime import measure_gemm_tflops

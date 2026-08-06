@@ -647,3 +647,83 @@ count tracking the buffer count) and **is not yet demonstrated end-to-end
 through the CLI**, because the CLI has no seed control that would make such a
 comparison mean anything. That gap is itself worth reporting: two `soup train`
 runs of one unchanged config do not reproduce each other.
+
+---
+
+## STEP 3 — against DeepSpeed ZeRO-3 with CPU offload
+
+The comparison the record has never had. Both techniques answer the same
+question — *the weights do not fit in VRAM, now what* — by keeping parameters in
+host RAM and bringing them to the GPU as needed. ZeRO-3 gathers a shard per
+module; layer streaming copies a decoder layer into a pre-allocated buffer.
+
+Everything held equal: one H100, `Llama-3.1-8B-Instruct`, the same 64-row
+dataset, `max_length 256`, batch 1, 4 epochs (256 optimizer steps), LoRA r=8
+alpha=16, and the same `soup train` entry point — DeepSpeed is reached through
+Soup's own `--deepspeed` flag, so this is one tool against itself.
+
+### Getting DeepSpeed to run at all took three fixes, and they are findings
+
+1. **Soup ships no ZeRO-3 CPU-offload preset.** `utils/deepspeed.CONFIGS` has
+   `zero2`, `zero3`, `zero2_offload`, `zero++` — `zero3` sets
+   `offload_param: none`, and the only offload preset is stage 2 optimizer-only.
+   The configuration a memory-constrained user actually wants is not among them.
+   Supplied here as a hand-written JSON, which `--deepspeed <path>` accepts.
+2. **`offload_optimizer: cpu` cannot work on this box.** DeepSpeed JIT-builds
+   its `cpu_adam` op and needs a matching CUDA toolkit; the machine has no
+   `nvcc`. Installing `ninja` moved the error along to
+   `CUDAMismatchException: Installed CUDA version ...` and then
+   `AttributeError: 'DeepSpeedCPUAdam' object has no attribute 'ds_opt_adam'`.
+   Dropped to `offload_optimizer: none`, which is the **fairer** comparison
+   anyway: layer streaming also keeps its optimizer on the GPU, because with a
+   frozen base the optimizer only covers LoRA.
+3. **torch 2.13 + DeepSpeed 0.19.4 + transformers 4.57.6 crash on the LR
+   scheduler.**
+   ```
+   transformers/trainer.py:2750 in _inner_training_loop -> self.lr_scheduler.step()
+   torch/optim/lr_scheduler.py:296 in _update_lr
+     for param_group, lr in zip(self.optimizer.param_groups, values, strict=True)
+   ValueError: zip() argument 2 is longer than argument 1
+   ```
+   torch 2.13 passes `strict=True` to that `zip`; the DeepSpeed-wrapped optimizer
+   does not expose one param group per scheduler value. Nothing in Soup is in
+   that call path. Worked around by letting DeepSpeed own both the optimizer and
+   the scheduler (`"optimizer": {"type": "AdamW"}`, `"scheduler": {"type":
+   "WarmupLR"}`), which is a supported DeepSpeed configuration.
+
+Also required: `apt install libopenmpi-dev` + `pip install mpi4py`, absent from
+the box.
+
+### The numbers
+
+VRAM sampled from `nvidia-smi` every 0.5 s for the whole run; tok/s is
+`num_tokens / train_runtime`, i.e. division, from the values the trainer itself
+reports. Same card class, SM clock 1980 MHz median-while-busy in every row.
+
+| run | base dtype | tok/s | peak VRAM | train_runtime | mean GPU util | exit |
+|---|---|---|---|---|---|---|
+| layer streaming | NF4 | **121.46** | **3,399 MiB** | 67.44 s | 54.1% | 0 |
+| layer streaming | bf16 | 63.52 | 3,935 MiB | 128.97 s | 72.4% | 0 |
+| DeepSpeed ZeRO-3, param offload | bf16 | 21.65 | 38,135 MiB | 378.41 s | 45.5% | 0 |
+
+At **matched numerics** (bf16 vs bf16), layer streaming is **2.93x** the
+throughput (63.52 / 21.65) in **9.7x** less peak VRAM (38,135 / 3,935). Both
+ratios are division of the measured values in the table.
+
+Against the configuration Soup actually recommends (NF4), it is 5.61x the
+throughput at 11.2x less VRAM — but that row changes two variables at once and
+is quoted only as the practical end-to-end difference, not as a controlled
+comparison.
+
+Loss after 4 epochs lands in the same place for all three (0.0114 / 0.0105 /
+0.0134), which is the sanity check that all three are training the same task and
+not diverging.
+
+### The competitor was given a second, memory-tuned chance
+
+38 GB of peak VRAM is not ZeRO-3 doing its best — with 80 GB available and
+`stage3_max_live_parameters: 1e9`, it has no reason to be frugal, and comparing
+against an untuned competitor would be worthless. A second run tightened every
+memory knob it has (`stage3_max_live_parameters` 1e9 -> 1e7,
+`stage3_max_reuse_distance` 1e9 -> 1e7, `stage3_param_persistence_threshold`
+auto -> 0, `stage3_prefetch_bucket_size` auto -> 5e6). Result below.

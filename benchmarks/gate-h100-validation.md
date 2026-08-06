@@ -1472,6 +1472,116 @@ Full streaming suite after the change, one card visible: **435 passed, 1 skipped
 GEMM-ceiling bound this clone predates the fix for), and +13 new passes. No
 regression.
 
+## STEP 11 — convergence and downstream quality
+
+*Training and evaluation on the box at `9117da1`; the DataParallel guard of STEP
+10 is inert here (one card visible per run), so these numbers are unaffected by
+it.*
+
+The largest gap in the whole project, and this record said so itself: *"No model
+was trained to convergence and no downstream quality was evaluated anywhere in
+this session."* That was true of the project, not just the session. Bit-exactness
+proves the mechanism does not corrupt the arithmetic. It does not prove a model
+trained by streaming is as **good** — and the entire project rests on the
+principle that "the loss went down" is not enough.
+
+**Setup.** `Llama-3.1-8B-Instruct`, **bf16 both arms** (the cleanest possible
+claim — matched numerics, so any difference is the streaming path itself).
+`dair-ai/emotion`, 6-way single-label classification: a closed label set that
+`soup ship --task-mode metric` scores with plain exact match, no judge and no
+network. 3000 training rows, 3 epochs, batch 8, `max_length` 128, LoRA r=8
+alpha=16. Held-out is a fixed 300-row sample of the `test` split, never trained
+on, identical for every run. Majority-class baseline 0.3333.
+
+The judge is **Soup's own `soup ship`**, not a hand-rolled script — that was the
+point of the exercise.
+
+**The seed trap, and what was done about it.** This record already noted that the
+CLI does not pin the adapter-init seed: `stream_setup` seeds its LoRA init at 0
+(`tcfg.seed ... else 0`) while the resident path takes HF's global seed, and
+`TrainingConfig` has **no `seed` field** to align them. Fixing that means editing
+the schema, which was off-limits in the measurement phase. So the second option
+was taken: **replicates paired by training subset**. Streamed run *i* and
+resident run *i* see byte-identical data (verified: the subsets are disjoint and
+their checksums stable across regeneration), and the within-arm spread across
+subsets is what the between-arm difference has to beat. All ten adapters have
+distinct checksums, so the pairing did what it was meant to.
+
+### Leg 1 — task win
+
+| run | tuned accuracy | base |
+|---|---|---|
+| resident s0 / s1 / s2 | 0.9033 / 0.9033 / 0.9033 | 0.4200 |
+| streamed s0 / s1 / s2 | 0.8867 / 0.8933 / 0.8967 | 0.4200 |
+
+Both arms win leg 1 decisively — 0.42 → ~0.89–0.90 against a 0.3333
+majority-class floor, so both learned the task.
+
+| | mean | min | max | spread |
+|---|---|---|---|---|
+| resident | 0.9033 | 0.9033 | 0.9033 | **0.0000** |
+| streamed | 0.8922 | 0.8867 | 0.8967 | 0.0100 |
+
+Paired differences (resident − streamed): **+0.0167, +0.0100, +0.0067**, mean
++0.0111. All three have the same sign, which is worth stating plainly rather than
+burying — but 0.0111 is 3.3 items out of 300, and it is barely larger than the
+streamed arm's own spread of 0.0100, which is exactly the comparison this design
+exists to make. **On n=3 these arms are not distinguishable.** A sign test on
+three same-sign pairs gives p = 0.125 one-sided; suggestive, not significant.
+Extended to n=5 pairs (running).
+
+Two honest caveats. The gap **cannot be attributed to streaming** while the two
+paths still seed their adapters independently — that variable is uncontrolled by
+construction, and it is the same one flagged earlier. And the resident arm's
+spread of **exactly 0.0000** across three *different* 3000-row subsets with three
+*different* adapters (271/300 each time) is anomalous; it is not explained here,
+and it makes "the between-arm difference beats the within-arm spread" a weaker
+test than it looks, because one arm's spread is degenerate.
+
+### Leg 2 — general-capability regression, and it is not about streaming
+
+Five of six runs came back **DON'T SHIP**, so the interesting question is which
+arm. It is neither:
+
+| run | decision | failed | task | arith | common_sense | format_json | instr | mmlu | safety | tool_call |
+|---|---|---|---|---|---|---|---|---|---|---|
+| resident s0 | **SHIP** | — | 0.9033 | −0.028 | +0.083 | +0.150 | 0.000 | +0.115 | −0.050 | 0.000 |
+| resident s1 | DON'T SHIP | regression | 0.9033 | 0.000 | **−0.083** | +0.100 | 0.000 | **−0.077** | +0.050 | 0.000 |
+| resident s2 | DON'T SHIP | regression | 0.9033 | 0.000 | **−0.417** | +0.100 | −0.042 | **−0.077** | −0.025 | 0.000 |
+| streamed s0 | DON'T SHIP | regression | 0.8867 | −0.028 | **−0.167** | +0.175 | 0.000 | +0.038 | −0.050 | 0.000 |
+| streamed s1 | DON'T SHIP | regression | 0.8933 | 0.000 | **−0.208** | +0.075 | 0.000 | 0.000 | +0.100 | 0.000 |
+| streamed s2 | DON'T SHIP | regression | 0.8967 | 0.000 | **−0.333** | +0.125 | 0.000 | **−0.077** | +0.050 | 0.000 |
+
+Bold = the suite `ship` flagged as regressed against its 0.05 threshold.
+
+**The single worst regression in the matrix belongs to a resident run**
+(`resident_s2`, −0.417 on common sense). The failure mode is symmetric across
+arms and it is the expected one: turning a chat model into a one-word classifier
+on 3000 narrow examples costs general ability. `soup ship` caught it, in both
+arms, which is the tool working.
+
+Read carefully, though: `mini_common_sense` has 24 items, so one item is 4.2% and
+`−0.417` is ten items. These bundled suites are coarse by design (they are meant
+to be runnable offline, not to be precise), and a 0.05 threshold against a
+24-item suite trips on two items. The verdicts are directionally right and
+numerically blunt.
+
+One consistent side effect worth recording: `mini_format_json` **improved in all
+six runs** (+0.075 to +0.175) from a base of 0.0 — plausibly because the task
+teaches the model to emit a short bare answer instead of prose, which is what
+that scorer rewards. Not investigated.
+
+### What this establishes
+
+- A model trained through layer streaming **converges and reaches the same task
+  quality as a resident run**, to within a difference this experiment cannot
+  resolve (1.1pp, against a 1.0pp within-arm spread, n=3).
+- It **does not** show streaming is quality-neutral to arbitrary precision. It
+  shows no difference large enough to matter has been detected, with the
+  adapter-init seed still uncontrolled.
+- The general-capability regression both arms show is a property of the
+  fine-tuning task, not of streaming, and the worst instance is resident.
+
 ### Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB

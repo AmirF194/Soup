@@ -1318,6 +1318,98 @@ PCIe (PIX between all pairs, no NVLink); a machine with less host bandwidth
 would likely show a *smaller* ratio, because the pinned arm has less advantage
 to lose.
 
+---
+
+## STEP 9 — the mechanism: **aliasing, not a race**
+
+STEP 6 rejected four hypotheses and STEP 7 rejected a fifth, but none of them
+produced a mechanism. Two facts made the obvious "race" story suspect: reading
+the shipped code shows `_body` calls `pool.wait(idx)` **and** builds the
+substituted weights *inside* the checkpointed function, so the recompute does
+re-wait and does rebuild — and the 163.8/171.5 MiB boundary is far too sharp for
+a timing window, which would smear.
+
+So the two candidate mechanisms were separated by two patches to `_body`,
+applied to the generated class at runtime (nothing under `src/` touched), each
+with the unpatched control in the same run:
+
+| arm | what it changes | fixes a race? | fixes aliasing? |
+|---|---|---|---|
+| `control` | nothing | — | — |
+| `sync` | `torch.cuda.synchronize()` immediately after `pool.wait` | yes | no |
+| `clone` | hand `functional_call` a private copy of every pooled tensor | no | yes |
+
+```
+control  -> WRONG  ['48/128', '8/128', '8/128']
+sync     -> WRONG  ['12/128', '12/128', '8/128']
+clone    -> EXACT  ['128/128', '128/128', '128/128']
+```
+
+**A full device synchronise does not fix it. Cloning the buffers fixes it
+completely.** This is not a timing race. It is **aliasing**: an autograd node
+still holds a reference to a pooled buffer when a later prefetch overwrites it,
+so the backward reads another layer's bytes. That is also exactly what STEP 7's
+`use_checkpoint=False` crash was — autograd's version counter catching the same
+overwrite once checkpointing stopped hiding it — and it retires the "race"
+wording used earlier in this record.
+
+It also explains fact (3) directly: the only layers that survive are the last
+`stream_buffers`, which are the ones never evicted before the backward reaches
+them.
+
+### Which tensors are aliased: both kinds, and neither alone is enough
+
+An NF4 layer arrives as packed `uint8` weights plus small sidecars
+(`::absmax`, `::nested_absmax`, `::nested_offset`). Cloning one group and leaving
+the other aliased:
+
+```
+control          -> WRONG  ['40/128', '8/128', '8/128']
+clone_quantstate -> WRONG  ['8/128',  '8/128', '8/128']   (sidecars only)
+clone_packed     -> WRONG  ['8/128',  '8/128', '8/128']   (packed weights only)
+```
+
+Neither half is sufficient; only cloning **everything** is. So the aliasing is a
+property of the whole pooled NF4 tensor set, not of one forgotten sidecar — which
+rules out the tidiest possible fix (copy the tiny quant-state, keep the big
+weights zero-copy) and matters for anyone costing a real repair.
+
+### What is still not explained
+
+Facts (1) and (2) — NF4-only, and the sharp size threshold — remain open. The
+bf16 path aliases the pool in exactly the same way (`_substituted_weights`
+returns `buffers[ckpt]` itself) and is exact at 935 MiB/layer, 3.9x the bytes at
+which NF4 fails. Something about how bitsandbytes' 4-bit matmul retains its
+operands across the backward differs from a plain `F.linear`, and this session
+did not establish what. **No mechanism is claimed for (1) and (2)**; what is
+claimed is that the failure is aliasing and that de-aliasing removes it.
+
+Practical consequence for a fix: the cheap-looking repair (clone the pooled
+tensors) costs one extra copy of every streamed layer per forward, which is the
+thing the pre-allocated pool exists to avoid. Whether that is cheaper than the
+6.56x of STEP 8 was not measured.
+
+### Reproducing the mechanism arms
+
+`mechanism.py`, arms `control,sync,clone` and `control,clone_quantstate,clone_packed`,
+on the synthetic 32-layer / 5120 / 27648 NF4 model. Each run re-verifies its own
+control.
+
+---
+
+# ── END OF THE MEASUREMENT PHASE ──
+
+Everything above was measured against **unmodified Soup at `2c9a078`** (plus the
+two fixes another agent landed on `main` mid-session, `f715218` and `9ae7a9b`,
+neither of which touches the streaming path). No `src/` change of mine exists
+above this line.
+
+Below this line the brief changes: a `nn.DataParallel` guard cannot be written
+without editing `src/`. **Every measurement from here on names the revision it
+was taken at.**
+
+---
+
 ### Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB

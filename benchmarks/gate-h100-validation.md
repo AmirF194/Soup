@@ -288,3 +288,148 @@ below 200 TFLOPS as a sanity bound, a bound written when the only hardware in
 existence for this project was an RTX 3050. The probe is fine; the assertion does
 not generalize to datacenter GPUs. Cosmetic, but it means the shipped suite
 cannot go green on this class of machine.
+
+---
+
+## STEP 2 — bit-exactness at real model sizes
+
+The point of the whole trip. The shipped gates compare a streamed model against
+a **resident** model of the same numerics, and on a 4 GB card the largest thing
+with a resident reference is a 3-layer toy. Here the reference fits.
+
+**Protocol** — copied from `gate-v0.72.3-breadth.md` GATE 1 and
+`tests/test_v07202.py::TestNF4BitExactVsResident`, changed in exactly two ways:
+the checkpoint is a real downloaded model rather than a from-config toy, and the
+device is CUDA/bf16 rather than CPU/float32. Everything else is verbatim,
+including the **vacuity defence**: PEFT initialises `lora_B = 0`, so a completely
+detached adapter is byte-identical to a fresh one and every parity assertion
+passes for the wrong reason. Each run randomises `lora_B` on the reference,
+copies the adapters across the `.inner.` wrapper difference, and asserts a
+non-zero number of tensors were copied.
+
+Reference numerics always match: **streamed NF4 is compared against resident
+NF4**, never against resident bf16, whose quantisation error is wider than a real
+bug and would hide one inside it.
+
+Checks per model: (1) `torch.equal` on logits; (2) layer-0 LoRA gradient
+non-zero and every layer non-zero (plan P2 — a severed graph still lowers loss);
+(3) decoder parameters still on `meta`; (4) 5-step loss curves identical.
+
+### A false alarm I raised and had to withdraw
+
+The first attempt pointed the script at the raw HF snapshot directory and died:
+
+```
+layer-stream sharder: skipping symlinked shard model.safetensors
+FileNotFoundError: no .safetensors weight files found in
+/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae5576...
+ — layer streaming needs a safetensors checkpoint
+```
+
+`snapshot_download` on Linux populates `snapshots/<rev>/` with **symlinks** into
+`blobs/`, and `layer_shard._discover_safetensors` deliberately skips symlinked
+shards. On Windows the HF cache copies rather than symlinks without developer
+mode, so this could not have shown up on the dev box. I wrote it down as a major
+Linux finding: *layer streaming cannot shard anything in the standard HF cache*.
+
+**That is wrong, and the check that settled it was running the real CLI.** A
+genuine `soup train` with `stream_layers: true` on the same model works:
+
+```
+Layer streaming ready: 24 layers, 0.18 GB pinned RAM store, 2 x 8 MB VRAM buffers
+LoRA applied: 540,672 trainable / 494,032,768 total (0.11%)
+{'train_runtime': 15.3764, 'train_samples_per_second': 4.162, ...}
+```
+
+because `stream_setup` does not pass a snapshot path at all — it calls
+`spectrum_scan.resolve_model_weights`, which materialises real files under
+`~/.soup/spectrum/weights/<slug>/`:
+
+```
+resolved: /root/.soup/spectrum/weights/Qwen__Qwen2.5-0.5B-Instruct
+   config.json        symlink= False
+   model.safetensors  symlink= False
+```
+
+So the defect was in my harness, not in Soup, and the symlink guard is doing its
+job. Kept here because I had already written the finding down, and because it has
+one real consequence: **weights exist twice on disk**, once in the HF cache and
+once under `~/.soup`. For this session's four models that is ~250 GB duplicated,
+which is a live constraint against 886 GB.
+
+That run is also the milestone the brief asked for on its own terms — the first
+real `soup train` layer-streaming run on Linux, and it worked unmodified.
+
+### Smoke — Qwen2.5-0.5B-Instruct, NF4, CUDA bf16
+
+```
+CUDA_VISIBLE_DEVICES=0 python /root/gate/bitexact.py \
+  --weights Qwen/Qwen2.5-0.5B-Instruct --shards /root/shards/qwen05b_nf4 \
+  --quant nf4 --seq 64
+```
+
+```
+max_abs_logit_diff  0.0        bit_exact  true
+adapter_tensors_copied  96     (non-vacuous)
+layer0_lora_grad  9.093866e-01  24/24 layers non-zero
+curves_equal  true             curve_max_rel  0.0
+meta_params  288               store 0.18 GB pinned, tier ram
+```
+
+### **Llama-3.1-8B-Instruct, NF4, CUDA bf16 — bit-exact**
+
+The result this trip existed for.
+
+```
+CUDA_VISIBLE_DEVICES=0 python /root/gate/bitexact.py \
+  --weights NousResearch/Meta-Llama-3.1-8B-Instruct \
+  --shards /root/shards/llama8b_nf4 --quant nf4 --seq 128
+```
+
+```json
+{
+  "weights": "/root/.soup/spectrum/weights/NousResearch__Meta-Llama-3.1-8B-Instruct",
+  "quant": "nf4", "dtype": "bfloat16", "seq": 128,
+  "torch": "2.13.0+cu130", "gpu": "NVIDIA H100 80GB HBM3",
+  "shard_seconds": 23.3,
+  "stream_stats": {"n_layers": 32, "buffers": 2, "buffer_bytes": 225058872,
+                   "store_bytes": 3600941952, "pinned": true, "tier": "ram",
+                   "device": "cuda:0", "total_params": 8030261248},
+  "meta_params": 288,
+  "adapter_tensors_copied": 128,
+  "max_abs_logit_diff": 0.0,
+  "bit_exact": true,
+  "logit_abs_max": 26.875,
+  "layer0_lora_grad": 0.173665851354599,
+  "layers_with_grad": 32, "n_layers_seen": 32,
+  "curve_streamed":  [11.953645706176758, 11.442726135253906, 10.979948043823242,
+                      10.62893295288086, 9.73975944519043],
+  "curve_resident":  [11.953645706176758, 11.442726135253906, 10.979948043823242,
+                      10.62893295288086, 9.73975944519043],
+  "curves_equal": true, "curve_max_rel": 0.0,
+  "sm_clock_mhz_at_start": 345, "sm_clock_mhz_at_end": 1980
+}
+```
+
+`max_abs_logit_diff` is exactly `0.0` and `torch.equal` is true over a
+`[1, 128, 128256]` logits tensor whose largest element is 26.875 — so this is
+equality on real values, not equality of two zeros. 128 adapter tensors copied,
+so it is not the vacuous comparison. All 32 layers receive gradient.
+
+`total_params` reports 8,030,261,248, i.e. the honest count from the sharder
+rather than PEFT's inflated NF4 figure — the v0.72.2 display defect is fixed and
+stays fixed at 8B.
+
+### An invalid measurement in that same JSON — the VRAM peaks
+
+The script also records `peak_vram_streamed_bytes: 8386682880` and
+`peak_vram_resident_bytes: 8004792832`. **Neither is a peak-VRAM measurement of
+anything, and they must not be quoted as one.** The script loads the resident
+reference and never frees it before timing the streamed loss curve, so the
+"streamed" peak contains a whole resident NF4 8B sitting alongside. That is why
+the streamed number is *larger* than the resident one, which would otherwise
+contradict the entire feature.
+
+Left in the record rather than deleted. It does not touch the bit-exactness
+claim — that comparison requires both models in memory *by construction* — but a
+real streamed-peak number has to come from a separate single-model run.

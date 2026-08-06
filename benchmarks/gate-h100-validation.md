@@ -1150,37 +1150,6 @@ indicative.
 
 ---
 
-## What was not done, and what these numbers do not say
-
-- **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK
-  section for the measurement taken and the decision not to bypass the guard.
-- **No multi-GPU comparison.** Layer streaming is a single-GPU technique and
-  DeepSpeed was run at `world_size 1`, outside its intended regime. A sharded
-  multi-GPU ZeRO-3 run answers a different question and was not attempted.
-- **DeepSpeed's optimizer stayed on the GPU.** `offload_optimizer: cpu` needs a
-  CUDA toolkit this box does not have. The chosen configuration is the fairer
-  one — streaming also keeps its optimizer on the GPU — but a full
-  parameter-and-optimizer offload run is not in this record.
-- **The defect's threshold is a bracket, not a number** — 163.8 MiB/layer exact,
-  171.5 broken, 4.7% wide. The mechanism inside the NF4 path is a hypothesis
-  pointed at plausible code, not a diagnosis; the sharpness of the boundary
-  argues against the timing-race story but does not replace it with anything.
-- **The defect is not demonstrated end-to-end through `soup train`.** Both
-  attempts were confounded, because the CLI does not pin the adapter-init seed
-  and the streamed and resident paths seed LoRA independently. The evidence is
-  the controlled harness.
-- **The 8B reproduction is a throughput and memory reproduction, not a training
-  one.** No model was trained to convergence and no downstream quality was
-  evaluated anywhere in this session.
-- **Every number is one machine, one session**, on a stack (torch 2.13.0+cu130,
-  bnb 0.50.0, trl 0.26.2, peft 0.20.0) that differs from the published records in
-  everything but `transformers`. SM clock was 1980 MHz median-while-busy in all
-  26 timed runs, so no clock correction is applied anywhere.
-- **Preference losses were not benchmarked at all** — `dpo`/`orpo`/`simpo`/`kto`
-  streamed all fail on this torch before training starts (FINDING 2), so v0.72.4's
-  claims are untested here.
-
----
 
 ## STEP 7 — is the NF4 defect the same bug as #328? **No.**
 
@@ -1781,7 +1750,44 @@ measurement says nothing about throughput. Re-run on the 3000-row dataset the
 ordering reverses and becomes sensible. Left here because it is exactly the kind
 of number that would have looked publishable.
 
-### Does any of this change the preprint?
+## What was not done, and what these numbers do not say
+
+- **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK
+  section for the measurement taken and the decision not to bypass the guard.
+- **The NF4 defect has a diagnosis but no repair.** The mechanism is aliasing
+  (STEP 9), and both obvious workarounds were measured and rejected: de-aliasing
+  costs 8x peak VRAM, `pin=False` costs 7.41x throughput. Filed as #331 with the
+  synthetic reproducer.
+- **Why the defect is NF4-only, and why its boundary is so sharp, is not
+  explained.** The bf16 path aliases the pool identically and is exact at 3.9x
+  the bytes. Six hypotheses were tested and rejected; none replaced them.
+- **The threshold is a bracket, not a number** — 163.8 MiB/layer exact, 171.5
+  broken, 4.7% wide.
+- **The defect is not demonstrated end-to-end through `soup train`.** Both
+  attempts were confounded because the CLI does not pin the adapter-init seed.
+  The evidence is the controlled harness.
+- **The quality result resolves ~1pp, not less.** 300 held-out items, five
+  paired subsets, and an uncontrolled adapter-init seed. "No difference detected"
+  is not "no difference".
+- **`soup ship`'s leg-2 suites are coarse.** `mini_common_sense` has 24 items, so
+  one item is 4.2% against a 0.05 threshold. The verdicts are directionally right
+  and numerically blunt.
+- **The 8-GPU comparison is on hardware where streaming's premise does not
+  apply**, and on a PCIe box with no NVLink, which is the interconnect ZeRO-3
+  most depends on.
+- **Preference losses were not benchmarked at all** — `dpo`/`orpo`/`simpo`/`kto`
+  streamed all fail on this torch before training starts (FINDING 2), so
+  v0.72.4's claims are untested here.
+- **Every number is one machine, one session**, on a stack (torch 2.13.0+cu130,
+  bnb 0.50.0, trl 0.26.2, peft 0.20.0) that differs from the published records in
+  everything but `transformers`. SM clock was 1980 MHz median-while-busy in every
+  timed run, so no clock correction is applied anywhere.
+- **Post-fix numbers are marked with the revision they were taken at**; see the
+  measurement/fix boundary above.
+
+---
+
+## Does any of this change the preprint?
 
 The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
 Laptop GPU*, DOI [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064))
@@ -1805,7 +1811,7 @@ What the session adds is **scope beyond** what the preprint claims — behaviour
 future version widens its scope past 14B, this record's threshold and the
 pinning result have to go with it.
 
-### Reproducing
+## Reproducing
 
 Harness scripts live in the session scratchpad, not in the repo. Each is small
 and self-contained:
@@ -1816,10 +1822,15 @@ and self-contained:
 | `graddiff.py` | gradients after one backward + each model's own curve twice |
 | `determinism.py` | forward, backward and curve reproducibility of one model |
 | `repeat_backward.py` | N streamed backwards against one deterministic resident reference; `--pin`, `--buffers`, `--order` |
-| `ckpt_hypothesis.py` | flips `StreamedDecoderLayer.use_checkpoint` at runtime, both arms |
-| `pincost.py` | pinned vs pageable throughput, correctness asserted in the same process |
 | `layercount.py` / `depth_vs_bytes.py` | synthetic Llamas sweeping depth, per-layer bytes and quantisation |
-| `runbench.sh` / `variance.sh` | one `soup train` on one GPU with VRAM and SM-clock sampling; n repeats |
+| `ckpt_hypothesis.py` | flips `StreamedDecoderLayer.use_checkpoint` at runtime, both arms |
+| `mechanism.py` / `mechanism_cost.py` | `sync` vs `clone` vs control, and what each costs |
+| `pincost.py` | pinned vs pageable throughput, correctness asserted in the same process |
+| `prep_convergence.py` | the emotion-classification subsets and held-out set |
+| `runbench.sh` / `variance.sh` / `runbench8.sh` | one `soup train` with VRAM and SM-clock sampling; n repeats; 8-GPU variant under torchrun |
 
-All of them import `soup_cli` unmodified. Nothing under `src/` was changed at any
-point in this session.
+All of them import `soup_cli` unmodified: every measurement above the
+measurement/fix boundary was taken against untouched Soup. The two `src/` changes
+made afterwards (STEP 10's guard, STEP 12's `device_map` fix) are commits in
+their own right, each with tests, and neither is exercised by the harnesses
+above.

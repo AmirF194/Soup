@@ -212,7 +212,8 @@ def train(
         None,
         "--deepspeed",
         help=(
-            "Enable DeepSpeed: zero2, zero3, zero2_offload, zero++ (ZeRO++), "
+            "Enable DeepSpeed: zero2, zero3, zero2_offload, zero3_offload "
+            "(stage 3 + CPU parameter offload), zero++ (ZeRO++), "
             "or path to config JSON"
         ),
     ),

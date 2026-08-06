@@ -12,6 +12,25 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+**Added — `--deepspeed zero3_offload`, a ZeRO-3 preset that offloads parameters to
+CPU.** `zero3` set `offload_param: none` and the only offload preset shipped was
+stage 2, optimizer-only — so the configuration a user short of VRAM actually wants
+was not in the tool, and the DeepSpeed comparison in
+`benchmarks/gate-h100-validation.md` (STEP 3) had to be run from hand-written JSON.
+Measured there on one H100 (Llama-3.1-8B, bf16, LoRA r=8, 256 steps): 21.65 tok/s at
+a 38,135 MiB peak. `offload_optimizer` deliberately stays `none` — turning it on
+makes DeepSpeed JIT-build `cpu_adam`, which needs a matching CUDA toolkit and fails
+without one; copy the emitted JSON and flip it if you have `nvcc`.
+
+**Fixed — the GEMM-ceiling test could not pass on a datacenter GPU.** The
+plausibility bound on `measure_gemm_tflops` was `< 200 TFLOPS`, written when the only
+hardware this project had run on was an RTX 3050 Laptop. An H100 returns a correct
+786.5 TFLOPS and the assertion fired, making the streaming suite un-greenable on
+server cards. The bound is now documented against real silicon peaks, and a second
+test times the same matmul independently and requires the probe to agree within 10x —
+so the check still catches a unit or FLOP-count error on any card instead of
+degenerating into `assert > 0`.
+
 **Fixed — the `trl` bounds shipped in v0.72.4 were wrong at both ends.**
 
 - **The ceiling was over-tight by five releases.** v0.72.4 capped `trl<0.25` from a

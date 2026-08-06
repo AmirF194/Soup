@@ -132,3 +132,159 @@ Models chosen non-gated, because no HF token is available on this box and
 `NousResearch/Meta-Llama-3.1-8B-Instruct` is an ungated mirror of the exact
 checkpoint the v0.72.2 record used, so the 8B row is a genuine cross-hardware
 reproduction rather than a different model of the same size.
+
+Whole download chain, for the record:
+
+| repo | fp16 | wall time | implied rate |
+|---|---|---|---|
+| `Qwen/Qwen2.5-0.5B-Instruct` | 0.95 GB | 6.1 s | — |
+| `NousResearch/Meta-Llama-3.1-8B-Instruct` | ~16 GB | 68.4 s | 234 MB/s |
+| `Qwen/Qwen2.5-14B-Instruct` | ~28 GB | 138.2 s | 203 MB/s |
+| `Qwen/Qwen2.5-32B-Instruct` | ~64 GB | 303.0 s | 211 MB/s |
+
+Rates are division, not sustained-bandwidth measurements.
+
+### The installed stack is much newer than every published number
+
+```
+torch 2.13.0+cu130   cuda 13.0   ngpu 8
+bitsandbytes 0.50.0
+transformers 4.57.6  trl 0.26.2  peft 0.20.0  accelerate 1.14.0
+```
+
+Against the dev box that produced every prior record (torch 2.5.1+cu121,
+bnb 0.49.2, trl 0.19.1, peft 0.18.1, transformers 4.57.6). Only `transformers`
+matches. `pip install -e ".[train]"` resolved this on its own; it was not pinned.
+That is worth stating up front because the first two findings below are both
+version-sensitive, and neither would have appeared on the dev stack.
+
+Note `trl 0.26.2` sits directly under the `<0.27` cap the v0.72.4 record derived
+by construction. The cap holds: all six preference configs build.
+
+---
+
+## STEP 1 — the shipped streaming test suites on CUDA
+
+The brief: run the existing suites, because a chunk of them are CUDA-gated and
+have only ever run on a 4 GB card or been skipped. Any failure is a finding.
+
+```
+$ /root/venv/bin/python -m pytest tests/test_v07200.py tests/test_v07202.py \
+      tests/test_v07203.py tests/test_v07204.py -v --no-cov
+9 failed, 419 passed, 65 warnings in 36.12s
+```
+
+**9 failures.** They are three distinct defects, not one.
+
+### FINDING 1 — layer streaming is broken on any multi-GPU box (`nn.DataParallel` vs `meta`)
+
+Eight of the nine failed with the identical error:
+
+```
+RuntimeError: module must have its parameters and buffers on device cuda:0
+(device_ids[0]) but found one of them on device: meta
+  .../torch/nn/parallel/data_parallel.py:180
+```
+
+HF `Trainer` wraps the model in `nn.DataParallel` whenever
+`torch.cuda.device_count() > 1` and the run was not launched distributed.
+`DataParallel` validates that every parameter lives on `device_ids[0]` — and
+layer streaming's entire design is that the decoder parameters stay on `meta`.
+So the two are incompatible by construction.
+
+Confirmed by re-running the same suites with a single card visible:
+
+```
+$ CUDA_VISIBLE_DEVICES=0 python -m pytest <same four files> --no-cov -q
+6 failed, 422 passed, 72 warnings in 36.43s
+```
+
+The two end-to-end training-step tests
+(`test_v07200::test_one_training_step_actually_runs`,
+`test_v07202::test_one_nf4_training_step_actually_runs`) flip to pass, as does
+`test_v07202::test_the_saved_adapter_is_canonical`.
+
+**This is not a Linux finding, it is a multi-GPU finding.** The dev box had one
+GPU, so `device_count() > 1` was never true and the branch was never taken. It
+would fail identically on a two-GPU Windows machine. Since streaming exists to
+fit a model on *one* small card, a user with several cards is not the target
+case — but they get a raw torch error naming `meta`, with nothing pointing at
+`stream_layers`, which is the actual defect. Every measurement below therefore
+runs with `CUDA_VISIBLE_DEVICES` pinned, and that pinning is stated each time.
+
+### FINDING 2 — the meta leak (#328) is far wider than the issue records
+
+The remaining five preference-loss failures share one signature:
+
+```
+RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+  .../torch/_prims_common/__init__.py:931 in check_same_device
+```
+
+`tests/test_v07204.py::TestKtoNeedsMoreThanOneRow::test_kto_streams_at_batch_two`
+carries a long docstring describing exactly this as known issue **#328**,
+tolerated *on CPU only*, with "the same signature on CUDA is a hard failure" and
+"the variable is the torch version, not the device". On this box it fires **on
+CUDA**, so that tolerance is doing its job: the test failed rather than hiding it.
+
+**A hypothesis I formed and then had to discard.** The four failing parametrized
+cases were `[dpo]` and `[kto]` — precisely the two preference losses that take a
+reference model — so I wrote down that the leak was reachable from the reference
+forward, which would have been a sharp localization. It is wrong. That test class
+is only parametrized over dpo/kto in the first place, so it could not have
+reported anything else. Testing the claim directly:
+
+```
+$ CUDA_VISIBLE_DEVICES=0 python /root/repro_328.py
+torch 2.13.0+cu130 cuda_devices 1
+sft    OK
+dpo    FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+orpo   FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+simpo  FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+kto    FAIL RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+```
+
+**All four fail. SFT passes.** ORPO and SimPO are genuinely reference-free
+(v0.72.4 verified they have no `ref_model` attribute at all), so the reference
+forward is not the mechanism. The reason the suite reported only dpo/kto is a
+coverage gap: there is no CUDA `train()` test for orpo or simpo.
+
+Real localization, from the full traceback:
+
+```
+transformers/trainer.py:4071  training_step
+accelerate/accelerator.py:2850  backward
+torch/autograd/graph.py:979   _engine_run_backward
+torch/utils/checkpoint.py:314  backward          <-- recompute
+transformers/models/llama/modeling_llama.py:292  LlamaDecoderLayer.forward
+transformers/models/llama/modeling_llama.py:67   LlamaRMSNorm.forward
+torch/_refs/__init__.py:1801  mul
+torch/_prims_common/__init__.py:931  check_same_device
+RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+```
+
+Line 67 is `return self.weight * hidden_states.to(input_dtype)`. So the failure
+is in the **backward recompute of gradient checkpointing**, where the RMSNorm
+weight is still the `meta` placeholder — i.e. that recompute did not get the
+streamed substitution the original forward got. It is a *backward-pass* defect,
+not a loss-formulation one, which is consistent with SFT passing only on the dev
+torch and with "newer torch decomposes more ops" in the issue text.
+
+Not investigated further and **no Soup code changed** — the brief forbids editing
+the code to make a measurement pass, and SFT is what the size sweep and the
+DeepSpeed comparison need. Recorded so #328 can be re-scoped: it is not
+CPU-only and not KTO-only.
+
+### FINDING 3 — the GEMM-ceiling plausibility bound is calibrated to a laptop
+
+```
+E  assert 786.4800164584345 < 200.0
+E   +where 786.4800164584345 = GemmCeiling(tflops=786.48, sm_clock_mhz=1980, size=4096).tflops
+```
+
+`utils/layer_stream_runtime.measure_gemm_tflops` works correctly — 786.5 TFLOPS
+at 1980 MHz is a sane bf16 number for an H100. The *test* asserts the result is
+below 200 TFLOPS as a sanity bound, a bound written when the only hardware in
+existence for this project was an RTX 3050. The probe is fine; the assertion does
+not generalize to datacenter GPUs. Cosmetic, but it means the shipped suite
+cannot go green on this class of machine.

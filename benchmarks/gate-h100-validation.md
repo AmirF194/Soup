@@ -2399,6 +2399,96 @@ Shipped as `install_dequant_forward` in `src/soup_cli/utils/layer_stream_runtime
 with a CI test asserting the streamed path makes zero `MatMul4Bit` calls and a
 resident control asserting the counter can see such calls at all.
 
+## STEP 15 — #328 diagnosed and fixed: nobody was setting `gradient_checkpointing`
+
+STEP 1 recorded five failures in `tests/test_v07204.py` on this box's CUDA stack —
+all four preference losses dead with `RuntimeError: Tensor on device cuda:0 is not
+on the expected device meta!`, SFT passing — and left it as "known #328, torch 2.13
+only". It has a cause, and the cause is in Soup.
+
+### Where the meta tensor enters
+
+The failing op is `LlamaRMSNorm.forward`'s `self.weight * hidden_states`.
+Instrumenting that method over a DPO step: RMSNorm is called 13 times and **exactly
+one** call has `weight.device == meta` against `hidden_states.device == cuda:0` — the
+last one, under `grad_enabled=True`, i.e. a checkpoint recompute. The SFT control
+makes 9 RMSNorm calls with **zero** meta weights.
+
+Three independent lines say the checkpoint doing that recompute is **not Soup's**:
+
+1. the frame is `CheckpointFunction.backward`, the *reentrant* path, while
+   `StreamedDecoderLayer.forward` calls `checkpoint(..., use_reentrant=False)`;
+2. `ctx.run_function` lands on `LlamaDecoderLayer.forward` through
+   `nn.Module.__call__` with **no `_body` frame**, so what is being recomputed is
+   `self.inner` itself, not the `functional_call` closure that substitutes the
+   streamed weights;
+3. at step-begin the inner raw `LlamaDecoderLayer` — a `GradientCheckpointingLayer`
+   in transformers 4.57 — already has `gradient_checkpointing=True` and
+   `_gradient_checkpointing_func` set, with `input_layernorm.weight.is_meta` True.
+
+So HF's `gradient_checkpointing_enable()` reaches *inside* the wrapper and makes the
+inner layer checkpoint its own forward. That inner checkpoint is created while
+`functional_call`'s reparametrisation context is open (weights real) and recomputed
+during backward long after it has exited and restored the `meta` placeholders.
+
+### Why SFT passed — established by control, not left as a coincidence
+
+`args.gradient_checkpointing` is `False` for SFT and `True` for all four preference
+losses, although `training.gradient_checkpointing` is `False` in the config for both.
+
+`should_enable_hf_gradient_checkpointing` exists precisely to stop HF double-
+checkpointing a streamed model. **Only `sft.py` ever called it.** `dpo.py`,
+`orpo.py`, `simpo.py` and `kto.py` did not mention the flag at all, so its value was
+decided entirely by TRL's default.
+
+| arm | `args.gradient_checkpointing` | result |
+|---|---|---|
+| sft, default | false | **OK** |
+| dpo, default | true | FAIL `expected device meta` |
+| **dpo, forced false** | false | **OK — the failure disappears** |
+| sft, forced true | true | FAIL, but a *different* error |
+
+The load-bearing row is dpo-forced-false: with the wrapper's own `use_reentrant=False`
+checkpoint still active, removing HF's checkpointing removes the failure entirely.
+Reported honestly, the sft-forced-true row is **not** a clean symmetric control —
+flipping the flag after `setup()` skips the input-require-grads wiring that path
+would otherwise do, so it fails earlier for an unrelated reason and neither confirms
+nor refutes sufficiency.
+
+### One omission, two opposite symptoms
+
+TRL's default is not stable across versions. Measured directly:
+
+| trl | `DPOConfig(...).gradient_checkpointing` | symptom |
+|---|---|---|
+| 0.19.1 (dev box) | `False` | a user's explicit `gradient_checkpointing: true` was **silently dropped** for all four preference tasks |
+| 0.26.2 (this box) | `True` | HF's checkpointing arrived **uninvited** and killed every streamed preference run on torch 2.13 |
+
+That is why it survived: on the machine where the tests are usually run, the bug's
+sign is inverted and produces no crash at all.
+
+### The fix, and what the failing test had to be
+
+All four wrappers now pass the flag explicitly through the shared guard, so it
+tracks the config and never TRL's default.
+
+The TDD step is worth recording because the obvious test does not fail. On trl
+0.19.1 the *streamed* assertion (`args.gradient_checkpointing is False`) **already
+passed**, since that version's default is False. The test that was red locally is
+the CONTROL: a NON-streaming run that asks for checkpointing must GET it. Written
+parametrized over both `True` and `False`, and deliberately NOT asserting TRL's own
+default — an assertion on the default would be red on one supported stack and green
+on the other while the real bug went unnoticed on both.
+
+Verified on this box, torch 2.13.0+cu130 / trl 0.26.2: `tests/test_v07204.py` goes
+from **5 failed, 62 passed** to **67 passed**.
+
+Reproducer and instrumentation: `/root/issue328_min.py` (six arms in one process —
+SFT control, the four preference losses, SFT control again; the control passes both
+before and after, so this is not ordering or poisoned CUDA state),
+`/root/issue328_probe.py`, `/root/issue328_control.py`. Results under
+`/root/results/issue328_*.json`.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

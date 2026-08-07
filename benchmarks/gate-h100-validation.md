@@ -2907,6 +2907,54 @@ everywhere — it establishes "the plumbing works", nothing about quality.
 
 Raw: `/root/results/issue77_*`.
 
+## STEP 21 — the export formats, first run on CUDA
+
+`--format gguf | awq | gptq | tensorrt` all need a CUDA box, so none had been
+exercised. Dependency dry-runs were taken first, because this project has been
+burned twice: `gguf`/`sentencepiece`/`protobuf` and `autoawq` are safe against the
+training venv, but **`tensorrt_llm` would have downgraded torch 2.13.0+cu130 ->
+2.9.1**, transformers 4.57.6 -> 4.57.3, numpy 2.5.1 -> 1.26.4. Everything ran in
+throwaway venvs; the training venv was verified unperturbed afterwards.
+
+**GGUF passes.** All six tiers exit 0, sizes are monotonic (q4_0 352 MB -> f32
+1.98 GB), and **all six load in `llama-cli` and emit correct text** — the artifact
+is verified usable, not merely present. Two defects around it, both fixed:
+
+- **Data loss.** The f16 intermediate was named `{model_name}.f16.gguf`, which is
+  exactly the default output name of a `--quant f16` export, and was unlinked when
+  quantisation finished. **Exporting q4_0 destroyed a previously exported f16
+  GGUF**, even with an unrelated `--output`. Reproduced. It now lives in a private
+  temp directory; a second test pins that the intermediate is still removed,
+  because trading data loss for a full disk is not a fix.
+- `_install_convert_deps()` ran only after an auto-clone, so `--llama-cpp` or an
+  existing `~/.soup/llama.cpp` died on `ModuleNotFoundError: sentencepiece` every
+  time. Now on every branch, skipped when the packages are importable.
+
+**AWQ: Soup's code is correct, the dependency set is impossible** (#338). At
+transformers <= 4.52.4 the export runs and the artifact loads and generates
+correctly. At 4.53–4.56 it fails on `'Catcher' object has no attribute
+'attention_type'`; at >= 4.57 it fails at import. Soup's own trl 0.26.2 needs
+transformers >= 4.56.1, so **no version satisfies both `[train]` and `[awq]`** —
+the extra cannot be reached from a clean install.
+
+**GPTQ: uninstallable, with two real bugs behind it** (#338). `auto-gptq>=0.7.0`
+has no cp312 wheel. Forced through on python 3.11: the *documented* command
+crashes because a tokenizer is passed where `List[Dict]` is expected, and with
+calibration data it exits 0 but writes `gptq_model-4bit-128g.safetensors`, so
+`from_pretrained` cannot find it. The weights are fine — the native loader works
+and renaming the shard fixes it — so this is packaging, not numerics.
+
+**TensorRT-LLM produces zero artifact bytes** (#337). `export.py` runs
+`python -m tensorrt_llm.commands.convert_checkpoint`; **that module does not
+exist** — `tensorrt_llm.commands` is `bench, build, eval, prune, refit, serve`,
+and upstream ships conversion as per-architecture `examples/<arch>/` scripts. It
+has never been able to work as written.
+
+The last one is worth stating plainly: **it was not hardware-blocked at all.** The
+API call is simply wrong, and the box was needed only to *prove* it, not to find
+it. That is an argument for running documented paths at all, more than for owning
+big GPUs.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

@@ -119,6 +119,19 @@ def serve(
         "--gpu-memory",
         help="Fraction of GPU memory to use (vLLM only, 0.0-1.0)",
     ),
+    max_model_len: Optional[int] = typer.Option(
+        None,
+        "--max-model-len",
+        # NOTE: deliberately no ``min=`` — click renders it as an
+        # "INTEGER RANGE [x>=1]" metavar, which widens the type column and
+        # truncates every other option name in ``serve --help``. Bounds are
+        # checked in the body instead.
+        help=(
+            "Maximum sequence length for the vLLM engine (vLLM only). Lower "
+            "this when the engine refuses to start because the KV cache does "
+            "not fit. Default: the model's own maximum."
+        ),
+    ),
     speculative_model: Optional[str] = typer.Option(
         None,
         "--speculative-decoding",
@@ -474,6 +487,26 @@ def serve(
         )
         raise typer.Exit(1)
 
+    # #333 — --dashboard used to be accepted and then do nothing on backends
+    # whose app has no /metrics route. Say so instead of no-opping.
+    if dashboard:
+        _dashboard_note = _dashboard_warning(backend)
+        if _dashboard_note:
+            console.print(f"[yellow]Warning:[/] {_dashboard_note}")
+
+    # #333 — --max-model-len is a vLLM engine argument. Bounds are checked
+    # here (see the flag definition for why not via ``min=``), and using it on
+    # another backend warns rather than being silently dropped.
+    if max_model_len is not None:
+        if max_model_len < 1:
+            console.print("[red]--max-model-len:[/] must be >= 1.")
+            raise typer.Exit(1)
+        if backend != "vllm":
+            console.print(
+                "[yellow]Warning:[/] --max-model-len applies to "
+                f"--backend vllm only; ignored for the {backend} backend."
+            )
+
     # DeepSpeed-MII v0.27.0: dependency check only — live pipeline wiring
     # ships in v0.27.1 once we stabilize the OpenAI-compat shim. We exit
     # with code 1 (not 0) so scripts / CI fail loudly rather than silently
@@ -775,6 +808,8 @@ def serve(
             enable_prefix_caching=prefix_cache,
             quantization=auto_quant_kwargs.get("quantization"),
             trust_remote_code=resolved_trust,
+            max_model_len=max_model_len,
+            enable_dashboard=dashboard,
         )
     elif backend == "sglang":
         app = _serve_sglang(
@@ -1082,6 +1117,8 @@ def _serve_vllm(
     enable_prefix_caching: bool = False,
     quantization: Optional[str] = None,
     trust_remote_code: bool = False,
+    max_model_len: Optional[int] = None,
+    enable_dashboard: bool = False,
 ):
     """Set up vLLM engine and create FastAPI app."""
     from soup_cli.utils.vllm import create_vllm_app, create_vllm_engine
@@ -1098,10 +1135,34 @@ def _serve_vllm(
         enable_prefix_caching=enable_prefix_caching,
         quantization=quantization,
         trust_remote_code=trust_remote_code,
+        max_model_len=max_model_len,
     )
     console.print("[bold green]vLLM engine ready![/]")
 
     adapter_path = str(model_path) if is_adapter else None
+
+    # #332 — the served model's own chat template. Loaded from the adapter /
+    # model dir first (soup writes the tokenizer beside the adapter), then the
+    # base model. A failure here is announced, never silent: falling back to
+    # the legacy role-prefixed prompt is what made Llama-3.1-8B loop.
+    tokenizer = _load_serve_tokenizer(
+        model_path=model_path,
+        base_model=base_model,
+        trust_remote_code=trust_remote_code,
+    )
+    if tokenizer is None:
+        console.print(
+            "[yellow]Warning:[/] no tokenizer could be loaded for this model — "
+            "falling back to a generic 'User:/Assistant:' prompt. Chat-tuned "
+            "models can run on past their stop token with this format."
+        )
+    elif not getattr(tokenizer, "chat_template", None):
+        console.print(
+            "[yellow]Warning:[/] this model ships no chat template — using the "
+            "generic 'User:/Assistant:' prompt format."
+        )
+    else:
+        console.print("[green]Chat template:[/] applying the model's own template.")
 
     app = create_vllm_app(
         engine=engine,
@@ -1109,9 +1170,54 @@ def _serve_vllm(
         model_name=str(model_path.name),
         adapter_path=adapter_path,
         max_tokens_default=max_tokens_default,
+        tokenizer=tokenizer,
+        enable_dashboard=enable_dashboard,
     )
 
     return app
+
+
+def _load_serve_tokenizer(
+    model_path: Path,
+    base_model: Optional[str],
+    trust_remote_code: bool = False,
+):
+    """Load the tokenizer whose chat template the vLLM backend applies (#332).
+
+    Returns None when neither the model dir nor the base model yields one —
+    the caller warns and the prompt builder degrades to the legacy format.
+    """
+    from transformers import AutoTokenizer
+
+    candidates = [str(model_path)]
+    if base_model and str(base_model) != str(model_path):
+        candidates.append(str(base_model))
+
+    for candidate in candidates:
+        try:
+            return AutoTokenizer.from_pretrained(
+                candidate, trust_remote_code=trust_remote_code
+            )
+        except Exception as exc:  # noqa: BLE001 — any load failure is a fallback
+            logger.debug("tokenizer load failed for %s: %s", candidate, exc)
+    return None
+
+
+# Backends whose FastAPI app actually serves /metrics (#333). ``--dashboard``
+# on anything else used to no-op in silence.
+_METRICS_BACKENDS = frozenset({"transformers", "vllm"})
+
+
+def _dashboard_warning(backend: str) -> Optional[str]:
+    """Return the operator warning for ``--dashboard`` on a backend that does
+    not serve ``/metrics``, or None when the backend does."""
+    if backend in _METRICS_BACKENDS:
+        return None
+    return (
+        f"--dashboard: the {backend} backend does not serve /metrics — "
+        "no metrics will be collected. Use --backend transformers or vllm "
+        "for the dashboard."
+    )
 
 
 def _serve_sglang(
@@ -1351,24 +1457,11 @@ def _generate_response(
     """Generate a response from the model."""
     import torch
 
-    # Apply chat template
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    else:
-        parts = []
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(f"System: {content}")
-            elif role == "user":
-                parts.append(f"User: {content}")
-            elif role == "assistant":
-                parts.append(f"Assistant: {content}")
-        parts.append("Assistant:")
-        text = "\n".join(parts)
+    from soup_cli.utils.vllm import build_chat_prompt
+
+    # Apply chat template. #332 — THE shared builder; the vLLM backend calls
+    # the same function so the two backends cannot drift apart again.
+    text = build_chat_prompt(messages, tokenizer)
 
     inputs = tokenizer(text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(model.device)

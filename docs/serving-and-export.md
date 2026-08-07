@@ -263,9 +263,19 @@ soup serve --model ./output --backend vllm --tensor-parallel 2
 
 # Control GPU memory usage
 soup serve --model ./output --backend vllm --gpu-memory 0.8
+
+# Cap the sequence length when the KV cache does not fit
+soup serve --model ./output --backend vllm --max-model-len 8192
 ```
 
 > **Tip:** Soup auto-detects vLLM. When installed, you'll see a hint during `soup serve` if you haven't enabled it yet.
+
+The vLLM backend applies the **model's own chat template**, exactly like the
+transformers backend — both call one shared prompt builder. A model that ships
+no chat template falls back to a generic `User:` / `Assistant:` prompt, and the
+server says so at startup. `finish_reason` reports `"length"` when a response
+hits `max_tokens` and `"stop"` otherwise (`/v1/messages` maps those to
+`max_tokens` / `end_turn`).
 
 ### SGLang Backend
 
@@ -457,6 +467,11 @@ curl http://localhost:8000/metrics
 #   "latency_samples": 1000
 # }
 ```
+
+`/metrics` is served by the **transformers** and **vLLM** backends (on both,
+whether or not `--dashboard` is passed — the flag only records intent). The
+**SGLang** and **MII** backends do not expose it; passing `--dashboard` there
+prints a warning at startup rather than silently collecting nothing.
 
 Latency percentiles are computed from the last 1000 requests; counters include failure paths so the dashboard shows true reliability, not just success rate.
 
@@ -659,8 +674,10 @@ is_domain_allowed("[::1]", config.domain_allowlist)                   # False
 
 ## Anthropic Messages Endpoint
 
-Both `soup serve --backend transformers` and `soup serve --backend vllm` now expose
-a POST `/v1/messages` route that accepts Anthropic Messages-shaped payloads:
+`soup serve --backend transformers` and `soup serve --backend vllm` expose
+a POST `/v1/messages` route that accepts Anthropic Messages-shaped payloads
+(the **SGLang** backend does not — it serves `/v1/chat/completions`, `/v1/models`
+and `/health` only):
 
 ```bash
 curl http://localhost:8000/v1/messages -H "Content-Type: application/json" -d '{

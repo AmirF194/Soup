@@ -506,6 +506,7 @@ class TestServeVllmIntegration:
                 enable_prefix_caching=False,
                 quantization=None,  # v0.35.0 #61 — auto-quant default
                 trust_remote_code=False,  # v0.71.33 — default-deny gate
+                max_model_len=None,  # #333 — new --max-model-len lever
             )
             mock_create_app.assert_called_once()
 

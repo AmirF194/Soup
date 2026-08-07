@@ -69,7 +69,8 @@ soup serve --model <m> --auto-spec            Auto-pair draft model for speculat
 soup serve --model <m> --backend vllm --prefix-cache  vLLM prefix caching (RAG/agent)
 soup serve --model <m> --structured-output json --json-schema s.json  Constrained output
 soup serve --model <m> --structured-output regex --regex-pattern '...'  Regex-constrained output
-soup serve --model <m> --dashboard            Live dashboard + /metrics endpoint
+soup serve --model <m> --dashboard            Live dashboard + /metrics endpoint (transformers + vllm only; warns on sglang/mii)
+soup serve --model <m> --backend vllm --max-model-len 8192  Cap the vLLM sequence length (lower it when the KV cache does not fit)
 soup serve --model <m> --trace --trace-endpoint http://localhost:4317  OpenTelemetry tracing
 soup serve --model <m> --trace-log ./serve.jsonl  Per-request JSONL log + rotation + secret redaction
 soup serve --model <m> --record-thumbs ./rl.db  Capture 👍/👎 feedback into local-RL SQLite + POST /v1/thumbs (transformers)

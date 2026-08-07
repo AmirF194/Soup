@@ -920,6 +920,14 @@ class TestGgufWindowsFixes:
             return R()
 
         monkeypatch.setattr(export_mod.subprocess, "run", _fake_run)
+        # #144 G2 gave _install_convert_deps an early return when the packages
+        # are already importable, so an ordinary export no longer shells out to
+        # pip. This test is about the SHAPE of the command when it does run, so
+        # it forces the install path rather than depending on whether the machine
+        # running the suite happens to have gguf and sentencepiece installed —
+        # which is exactly the kind of environment dependence that made this
+        # assertion pass locally and fail on the box.
+        monkeypatch.setattr(export_mod, "_convert_deps_present", lambda: False)
         export_mod._install_convert_deps()
         cmd = calls["cmd"]
         assert "-r" not in cmd  # never a requirements file

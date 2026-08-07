@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -295,18 +296,28 @@ def export(
             console.print(f"[dim]Converting to GGUF ({outtype})...[/]")
             _run_convert(convert_script, model_path, output_path, outtype)
         else:
-            # Convert to f16 first, then quantize
-            f16_path = output_path.parent / f"{model_name}.f16.gguf"
-            console.print("[dim]Converting to GGUF (f16)...[/]")
-            _run_convert(convert_script, model_path, f16_path, "f16")
+            # Convert to f16 first, then quantize.
+            #
+            # #144 G1 — the intermediate used to be `{model_name}.f16.gguf` next to
+            # the output, which is EXACTLY the default output name of a
+            # `--quant f16` export, and it was unlinked when quantisation finished.
+            # So exporting q4_0 DELETED a previously exported f16 GGUF, even with an
+            # unrelated --output. A private temp directory cannot collide with any
+            # file the user owns, and removing the whole directory keeps the
+            # multi-gigabyte intermediate from being left behind.
+            tmp_dir = Path(
+                tempfile.mkdtemp(prefix=".soup_gguf_", dir=str(output_path.parent))
+            )
+            try:
+                f16_path = tmp_dir / f"{model_name}.f16.gguf"
+                console.print("[dim]Converting to GGUF (f16)...[/]")
+                _run_convert(convert_script, model_path, f16_path, "f16")
 
-            # Quantize
-            console.print(f"[dim]Quantizing to {quant}...[/]")
-            _run_quantize(llama_dir, f16_path, output_path, quant)
-
-            # Clean up intermediate f16 file
-            if f16_path.exists() and f16_path != output_path:
-                f16_path.unlink()
+                # Quantize
+                console.print(f"[dim]Quantizing to {quant}...[/]")
+                _run_quantize(llama_dir, f16_path, output_path, quant)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     finally:
         # Clean up temporary merge directory
@@ -415,8 +426,27 @@ def _merge_adapter(
 _CONVERT_EXTRA_DEPS = ("gguf", "sentencepiece", "protobuf")
 
 
+def _convert_deps_present() -> bool:
+    """Are the convert script's extra deps already importable?"""
+    import importlib.util
+
+    for module in ("gguf", "sentencepiece"):
+        if importlib.util.find_spec(module) is None:
+            return False
+    return True
+
+
 def _install_convert_deps() -> None:
-    """Install the convert script's extra deps without disturbing torch."""
+    """Install the convert script's extra deps without disturbing torch.
+
+    #144 G2 — this used to run ONLY after an auto-clone, so `--llama-cpp /path`
+    and an already-present `~/.soup/llama.cpp` both skipped it and every
+    conversion died on `ModuleNotFoundError: No module named 'sentencepiece'`.
+    It is now called on every path, and returns immediately when the packages are
+    already importable so an ordinary export does not shell out to pip.
+    """
+    if _convert_deps_present():
+        return
     try:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", *_CONVERT_EXTRA_DEPS],
@@ -436,13 +466,18 @@ def _install_convert_deps() -> None:
 
 
 def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
-    """Find or clone llama.cpp directory."""
+    """Find or clone llama.cpp directory.
+
+    Every branch that returns a usable checkout installs the convert
+    dependencies first (#144 G2); the call is a no-op when they are present.
+    """
     from soup_cli.utils.constants import SOUP_DIR
 
     # 1. User-specified path
     if user_path:
         path = Path(user_path)
         if path.exists():
+            _install_convert_deps()
             return path
         console.print(f"[red]llama.cpp not found at: {path}[/]")
         raise typer.Exit(1)
@@ -454,6 +489,7 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     if env_path:
         path = Path(env_path)
         if path.exists():
+            _install_convert_deps()
             return path
 
     # 3. Check ~/.soup/llama.cpp
@@ -464,6 +500,7 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     # directory the user happened to run from (v0.71.35 GGUF validation).
     soup_llama = Path.home() / SOUP_DIR / LLAMA_CPP_DIR_NAME
     if soup_llama.exists() and (soup_llama / "convert_hf_to_gguf.py").exists():
+        _install_convert_deps()
         return soup_llama
 
     # 4. Auto-clone

@@ -2607,6 +2607,52 @@ three invalid measurement attempts, and re-encountered here.
 
 Raw: `/root/results/issue327b/*.json` (72 records), `/root/results/issue327_summary.json`.
 
+### The mechanism, measured afterwards: 14 = 12 + 2
+
+The grid above left the discrepancy as a fitted number. A second pass named it,
+stage by stage, 3 repeats, spread exactly 0 in every cell:
+
+| after logits alloc | loss-forward peak | after the loss returns | backward peak |
+|---|---|---|---|
+| 2.0000 | 10.0000 | 6.0000 | **14.0000** |
+
+The peak holds the bf16 logits **plus three fp32 logits-shaped buffers**. That
+**corrects this record's own earlier decomposition** from v0.72.3 — "bf16 logits +
+fp32 upcast + log-softmax fp32 + fp32 grad live at once" is right in total and
+wrong in detail, because the fp32 upcast is freed when the function returns.
+
+Isolating the loss arithmetic gives **12.0000–12.0960 B/elt** across vocab
+{32000, 128256, 151936} x tokens {512, 1024, 2048}. A single-variable control
+names the remaining 2: holding the model output object across `backward()` instead
+of letting it die with the local — nothing else changed — costs **exactly
++2.0000 B/elt**.
+
+**The loss path is already stack-independent**, which is the opposite of what the
+grid suggested. Measured on torch 2.13.0+cu130 / trl 0.26.2 **and** on the v0.72.3
+stack's own torch 2.5.1+cu124 / trl 0.19.1, installed on this box to check:
+12.0000 isolated and 12.0955 / 12.0854 through a real trl training step, on both.
+Byte-identical. torch, trl and transformers are exonerated.
+
+What differs between the two published grids is a **retention**, and a synthetic
+pre-flight probe structurally cannot see it: it observes its own reference, not
+whether the training loop that will run still holds the logits when the loss
+backward peaks. It could not be reproduced here, so it was not modelled away.
+
+The counterfactual is why nothing was lowered:
+
+| slope | under-predicts (of the 10 v0.72.3 real runs) | worst error |
+|---|---|---|
+| **14, shipped** | **0 / 10** | +0.85%, over |
+| 12.311, this box's fit | **10 / 10** | **−10.49%** |
+| 12, the measured loss path | 10 / 10 | −12.58% |
+
+So #327's acceptance criterion — seq-768 DPO no longer refused — is deliberately
+**not met**, and the issue stays open saying so. What shipped instead is the
+constant split into its two measured terms (summing to the unchanged 14) plus an
+**opt-in, upward-only** calibration, which closes a hole that did exist: a future
+stack growing a fourth fp32 buffer would be under-budgeted by 12.5% today with
+nothing to catch it.
+
 ## STEP 17 — #78: the first measurement of FlashAttention and Liger, and what it found
 
 Neither had ever been measured, because neither installs on the maintainer's

@@ -246,6 +246,7 @@ class TestVllmAppPrompt:
     """The route that actually reached the H100."""
 
     def _post(self, tokenizer, max_tokens=16):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         capture = {}
@@ -321,6 +322,7 @@ class TestVllmAppFinishReason:
     """The observed defect: ``"stop"`` with completion_tokens == max_tokens."""
 
     def _post(self, output, max_tokens):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(
@@ -349,6 +351,7 @@ class TestVllmAppFinishReason:
         assert body["choices"][0]["finish_reason"] == "stop"
 
     def test_anthropic_route_maps_length_to_max_tokens(self):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(
@@ -368,6 +371,7 @@ class TestVllmAppFinishReason:
         assert resp.json()["stop_reason"] == "max_tokens"
 
     def test_control_anthropic_route_still_maps_stop_to_end_turn(self):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(
@@ -393,6 +397,7 @@ class TestVllmStreamFinishReason:
     def _final_chunk(self, output, max_tokens):
         import json
 
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(
@@ -427,6 +432,7 @@ class TestVllmStreamFinishReason:
         assert chunk["choices"][0]["finish_reason"] == "stop"
 
     def test_streamed_requests_are_counted_by_metrics(self):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(
@@ -466,6 +472,7 @@ class TestVllmMetrics:
         assert "/metrics" in [r.path for r in app.routes if hasattr(r, "path")]
 
     def test_metrics_counts_a_served_request(self):
+        pytest.importorskip("fastapi", reason="the [serve] extra is optional")
         from fastapi.testclient import TestClient
 
         app = _build_app(

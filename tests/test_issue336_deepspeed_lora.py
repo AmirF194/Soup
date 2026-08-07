@@ -338,20 +338,31 @@ class TestTheEmptyGroupIsRealAndLoraOnly:
 def _scheduler_zip_is_strict() -> bool:
     """Does this torch's LRScheduler refuse a base_lrs / param_groups mismatch?
 
-    `torch/optim/lr_scheduler.py` adopted `zip(..., strict=True)` after 2.5, so
-    the SAME defect is a hard ValueError on torch 2.13 and a silent wrong-LR on
-    2.5.1. Detected rather than assumed, so the control states the version
-    dependence instead of hiding it.
+    Probed BEHAVIOURALLY on a throwaway optimizer, not by reading
+    `inspect.getsource(LRScheduler.step)` for "strict=True" — the first version of
+    this helper did exactly that, and it was wrong on CI's torch, where the
+    strictness lives somewhere the source scan did not look. The test then stepped
+    an unguarded scheduler expecting no exception and got one.
+
+    The same defect is a hard ValueError on torch 2.13 and a silent wrong-LR on
+    2.5.1, so this has to be detected rather than assumed either way.
     """
-    import inspect
+    import torch
 
-    from torch.optim import lr_scheduler
-
+    first = torch.nn.Parameter(torch.zeros(1))
+    second = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD(
+        [{"params": [first]}, {"params": [second]}], lr=0.1
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    optimizer.param_groups.pop()  # 1 group against 2 base_lrs
     try:
-        source = inspect.getsource(lr_scheduler.LRScheduler.step)
-    except (OSError, TypeError):
-        return False
-    return "strict=True" in source
+        scheduler.step()
+    except ValueError:
+        return True
+    except Exception:  # noqa: BLE001 - any other refusal still counts as strict
+        return True
+    return False
 
 
 class TestTheGuardOnARealTrainer:

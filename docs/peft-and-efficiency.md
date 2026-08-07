@@ -382,7 +382,7 @@ Works with and without LoRA. When used with LoRA, LoRA is applied only to unfroz
 
 ## LISA — Layerwise Importance Sampling (v0.71.34)
 
-LISA (Layerwise Importance Sampled AdamW, [arXiv:2403.17919](https://arxiv.org/abs/2403.17919)) targets full-fine-tuning quality at LoRA-like memory. Instead of picking layers once (that's Spectrum's static `unfrozen_parameters`), LISA re-samples a small random set of decoder layers **every N steps** and freezes the rest; the input embeddings, the LM head, and the final norm stay trainable throughout.
+LISA (Layerwise Importance Sampled AdamW, [arXiv:2403.17919](https://arxiv.org/abs/2403.17919)) targets full-fine-tuning quality at LoRA-like memory. **Measured at 7B+, it delivers the first half and not the second** — see [what it actually costs](#what-lisa-actually-costs-measured-at-3b-and-8b) below before choosing it over LoRA. Instead of picking layers once (that's Spectrum's static `unfrozen_parameters`), LISA re-samples a small random set of decoder layers **every N steps** and freezes the rest; the input embeddings, the LM head, and the final norm stay trainable throughout.
 
 ```yaml
 task: sft
@@ -396,6 +396,56 @@ training:
 ```
 
 Because only a handful of layers train at any moment (and their optimizer state is cleared when they're re-frozen), peak optimizer memory is roughly `embeddings + head + lisa_num_layers` — far below a full fine-tune, while every layer still gets updated over the course of training. LISA is `sft` + `transformers` + `text` + `quantization: none` only, and is mutually exclusive with LoRA features, `freeze_layers`/`freeze_ratio`, and Spectrum's `unfrozen_parameters` (each independently decides what trains).
+
+### What LISA actually costs, measured at 3B and 8B
+
+Measured on one H100 80GB, Alpaca, 200 steps, 3 interleaved repeats per arm, SM
+clock pinned at 1980 MHz throughout. LISA engagement was verified rather than
+assumed: the trainable-layer set rotates exactly on the interval, the trainable
+parameter count matches the arithmetic to the unit, and `lisa_num_layers` set to
+*all* layers reproduces the full-fine-tuning arm to three decimals.
+
+**Llama-3.1-8B-Instruct:**
+
+| arm | peak VRAM | held-out loss |
+|---|---|---|
+| full fine-tuning | **does not fit** (OOM at 73.94 GB, also at `batch_size 1`) | – |
+| LISA (2 layers / 20 steps) | 52.14 GB | 1.294 |
+| LoRA r=16 | **34.56 GB** | **1.275** |
+
+**Qwen2.5-3B-Instruct, each arm at its own better learning rate:**
+
+| arm | peak VRAM | held-out loss |
+|---|---|---|
+| full fine-tuning | 57.60 GB | 1.2905 |
+| LISA | 19.37 GB | **1.2463** |
+| LoRA r=16 | **15.93 GB** | **1.2420** |
+
+**The quality claim holds — LISA beat full fine-tuning at both learning rates.**
+The memory claim does not: LISA is **1.22x LoRA at 3B and 1.51x at 8B**, and the
+gap *widens* with scale.
+
+The reason is structural rather than a tuning miss. The input embeddings, LM head
+and final norm stay trainable **every** interval, and at 8B those are **70.7%** of
+everything LISA trains (66.9% at 3B). So `lisa_num_layers` only controls about
+30% of the cost, and the other 70% grows with vocabulary x hidden size — an
+overhead LoRA never pays at all.
+
+**Choose LISA when you need full-rank updates on a model too large to
+full-fine-tune** — its real win is that 8B trains on a single 80 GB card where
+full fine-tuning needs about 120 GB. Otherwise prefer LoRA: at these sizes it
+matched or beat LISA on held-out loss while using a third less memory.
+
+Defaults are well chosen and need no change at 7B+. Raising `lisa_num_layers`
+degrades memory, speed **and** quality monotonically (3B held-out: 1.2504 at 2,
+1.2673 at 8, 1.2950 at 16), and above 8 it OOMs an 80 GB card at 8B.
+`lisa_interval_steps` sits in a wide flat optimum — 1 through 50 are
+indistinguishable, and only 200 (a single sample over the run) degrades.
+
+One caveat on the numbers: held-out quality here is in-distribution loss and token
+accuracy on an Alpaca validation split, not a downstream benchmark, so it cannot
+see capability regressions a task benchmark would. Full measurement record:
+[`benchmarks/gate-h100-validation.md`](../benchmarks/gate-h100-validation.md).
 
 Implementation note: the model is left fully trainable at trainer-setup time so HF's optimizer (built before the first callback fires) contains every decoder parameter; the LISA callback then toggles `requires_grad` per interval — frozen parameters produce no gradient and the optimizer skips them.
 

@@ -472,7 +472,22 @@ class SFTTrainerWrapper(StreamingSetupMixin):
                 f"update_gap={tcfg.galore_update_proj_gap}, scale={tcfg.galore_scale}"
             )
 
+        # #78 — only when Soup's own patch actually landed, so an unsupported
+        # architecture keeps today's warning instead of becoming an HF exception.
+        if getattr(self, "_liger_applied", False):
+            training_kwargs["use_liger_kernel"] = True
+
         training_args = TrainingArguments(**training_kwargs)
+
+        # #78 — `data.max_length` above 1024 was silently ignored on EVERY SFT run.
+        # `SFTTrainer.__init__` converts a plain `TrainingArguments` with
+        # `SFTConfig(**args.to_dict())`, and `max_length` is an SFT-only field that
+        # `TrainingArguments` does not carry, so it always took SFTConfig's own
+        # default of 1024. Measured before the fix: max_length=4096 produced 1024
+        # tokens per sample, with no warning. Building the SFTConfig here mirrors
+        # TRL's own conversion (including the hub_token dance it does) and adds the
+        # one field that was being dropped.
+        training_args = self._as_sft_config(training_args, cfg.data.max_length)
 
         # --- Trainer ---
         trainer_kwargs = {
@@ -743,6 +758,32 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         )
         return (mode == "bf16", mode == "fp16")
 
+    @staticmethod
+    def _as_sft_config(training_args, max_length):
+        """Convert `TrainingArguments` -> `SFTConfig`, carrying `max_length` over.
+
+        Mirrors what `SFTTrainer.__init__` does with a plain `TrainingArguments`,
+        so nothing else about the run changes. Falls back to the original object if
+        this TRL cannot be converted that way — the caller then gets exactly the
+        previous behaviour rather than a crash, and the shipped test pins the
+        conversion so a silent fallback cannot hide a regression.
+        """
+        try:
+            from trl import SFTConfig
+        except ImportError:
+            return training_args
+        if isinstance(training_args, SFTConfig):
+            training_args.max_length = max_length
+            return training_args
+        try:
+            dict_args = training_args.to_dict()
+            dict_args["hub_token"] = training_args.hub_token  # to_dict hides it
+            dict_args.pop("push_to_hub_token", None)
+            dict_args["max_length"] = max_length
+            return SFTConfig(**dict_args)
+        except (TypeError, ValueError):
+            return training_args
+
     def _setup_transformers(self, cfg, tcfg):
         """Load model via standard transformers + peft pipeline."""
         from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -754,7 +795,15 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         if tcfg.use_liger:
             from soup_cli.utils.liger import apply_liger_kernel
 
-            if apply_liger_kernel(cfg.base):
+            # #78 — record whether the patch actually landed. `_build_trainer`
+            # needs it: patching the model is only half the job, because TRL and
+            # HF read `TrainingArguments.use_liger_kernel` to know the fused path
+            # returns `logits=None`. Without that flag TRL's entropy metric is not
+            # guarded and `entropy_from_logits(None)` raises at step 0, so
+            # `use_liger: true` crashed instead of running. Reproduced on trl
+            # 0.26.2 and 0.19.1, i.e. across the whole supported pin.
+            self._liger_applied = bool(apply_liger_kernel(cfg.base))
+            if self._liger_applied:
                 console.print(
                     "[green]Liger Kernel enabled:[/] fused RMSNorm, SwiGLU, CrossEntropy, RoPE"
                 )

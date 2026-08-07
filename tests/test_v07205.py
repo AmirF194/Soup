@@ -286,3 +286,113 @@ class TestFixtureIsOutsideTheFusedKernelWindow:
             "no user runs — and the streamed arm, which always dequantises, differs "
             "from it by one bf16 ulp. Raise the fixture's sequence length."
         )
+
+
+# ==========================================================================
+# #78 — two defects the FlashAttention / Liger benchmark surfaced
+# ==========================================================================
+def _sft_wrapper(tmp_path, monkeypatch, **training):
+    """A NON-streaming SFT wrapper built through the real ``setup()`` path.
+
+    Deliberately not reusing ``_build_streamed_wrapper``: both defects below are
+    about what reaches TRL's ``SFTConfig`` on an ORDINARY run, which is what every
+    user gets, and routing through the streaming helper would test a narrower path
+    than the one that is broken.
+    """
+    import yaml
+    from test_v07202 import _tiny_llama_dir, _write_tiny_tokenizer
+
+    from soup_cli.config.loader import load_config_from_string
+    from soup_cli.trainer.sft import SFTTrainerWrapper
+
+    weights, _, _ = _tiny_llama_dir(tmp_path)
+    _write_tiny_tokenizer(weights)
+    monkeypatch.chdir(tmp_path)
+    max_length = training.pop("max_length", 64)
+    tcfg = {
+        "batch_size": 1,
+        "quantization": "none",
+        "epochs": 1,
+        "logging_steps": 1,
+        "save_steps": 1000,
+        "lora": {"r": 4, "alpha": 8, "target_modules": ["q_proj", "v_proj"]},
+    }
+    tcfg.update(training)
+    cfg = load_config_from_string(
+        yaml.safe_dump(
+            {
+                "base": weights,
+                "task": "sft",
+                "backend": "transformers",
+                "modality": "text",
+                "data": {
+                    "train": "train.jsonl",
+                    "max_length": max_length,
+                    "chat_template": "chatml",
+                },
+                "training": tcfg,
+                "output": str(tmp_path / "out"),
+            }
+        )
+    )
+    wrapper = SFTTrainerWrapper(cfg, device="cpu")
+    wrapper.setup({"train": [{"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+    ]}] * 4})
+    return wrapper
+
+
+class TestDataMaxLengthReachesTrl:
+    """``data.max_length`` above 1024 was silently ignored on every SFT run.
+
+    Soup builds a ``transformers.TrainingArguments``, not a ``trl.SFTConfig``.
+    ``SFTTrainer.__init__`` converts one to the other with
+    ``SFTConfig(**args.to_dict())``, and ``max_length`` is an SFT-specific field
+    that ``TrainingArguments`` does not carry — so it took ``SFTConfig``'s own
+    default of 1024 no matter what the config said.
+
+    Measured on 8xH100 before the fix: ``data.max_length=512`` gave 512 tokens per
+    sample, ``data.max_length=4096`` gave **1024**. Every long-context SFT run was
+    quietly truncated, and no warning was emitted. It also caps how much
+    FlashAttention can ever help, since its advantage grows with sequence length.
+    """
+
+    def test_max_length_above_the_trl_default_survives(self, tmp_path, monkeypatch):
+        wrapper = _sft_wrapper(tmp_path, monkeypatch, max_length=2048)
+        assert wrapper.trainer.args.max_length == 2048, (
+            f"TRL received max_length={wrapper.trainer.args.max_length} where the "
+            "config asked for 2048 — sequences are being truncated silently"
+        )
+
+    def test_max_length_below_the_trl_default_survives_too(self, tmp_path, monkeypatch):
+        """CONTROL. A fix that pinned max_length to some large constant would pass
+        the test above while breaking every short-sequence run."""
+        wrapper = _sft_wrapper(tmp_path, monkeypatch, max_length=128)
+        assert wrapper.trainer.args.max_length == 128
+
+
+class TestLigerTellsTrlItIsOn:
+    """``training.use_liger: true`` crashed at step 0 — the feature never ran.
+
+    Soup patches the model with ``apply_liger_kernel()`` but never set
+    ``TrainingArguments.use_liger_kernel``, which is the flag TRL and HF read to
+    know the fused path will return ``logits=None``. TRL guards its entropy metric
+    with ``if not self.args.use_liger_kernel:``; with the flag left False the guard
+    cannot fire and ``entropy_from_logits(None)`` raises
+    ``AttributeError: 'NoneType' object has no attribute 'shape'``.
+
+    Reproduced on trl 0.26.2 AND trl 0.19.1 — i.e. across the whole supported pin,
+    so this was never version-specific bad luck.
+    """
+
+    def test_flag_is_set_when_liger_is_requested(self, tmp_path, monkeypatch):
+        pytest.importorskip("liger_kernel", reason="use_liger needs the liger extra")
+        wrapper = _sft_wrapper(tmp_path, monkeypatch, use_liger=True)
+        assert wrapper.trainer.args.use_liger_kernel is True
+
+    def test_flag_stays_off_when_liger_is_not_requested(self, tmp_path, monkeypatch):
+        """CONTROL. Setting it unconditionally would make TRL expect None logits
+        from an unpatched model, which is the same crash with the arms swapped."""
+        wrapper = _sft_wrapper(tmp_path, monkeypatch)
+        assert wrapper.trainer.args.use_liger_kernel is False

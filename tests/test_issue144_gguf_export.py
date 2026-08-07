@@ -113,21 +113,59 @@ class TestConvertDepsAreInstalledOnEveryPath:
         self, tmp_path, monkeypatch
     ):
         """`--llama-cpp /path` and an already-cloned ~/.soup/llama.cpp both skipped
-        the dependency install, so every conversion died on `sentencepiece`."""
+        the dependency install, so every conversion died on `sentencepiece`.
+
+        Asserted through the EXPORT FLOW rather than through `_find_llama_cpp`,
+        because that is where the install now lives: a lookup function that
+        silently shells out to pip is a surprise, and an existing test that mocks
+        `subprocess.run` to catch clone attempts saw the pip call instead.
+        """
+        from soup_cli.commands import export as export_mod
+
+        model = tmp_path / "mymodel"
+        model.mkdir()
+        (model / "config.json").write_text('{"model_type": "llama"}', encoding="utf-8")
+        llama = tmp_path / "llama.cpp"
+        llama.mkdir()
+        (llama / "convert_hf_to_gguf.py").write_text("# stub", encoding="utf-8")
+
+        calls = []
+        monkeypatch.setattr(export_mod, "_find_llama_cpp", lambda p=None: llama)
+        monkeypatch.setattr(export_mod, "_install_convert_deps", lambda: calls.append(1))
+        monkeypatch.setattr(
+            export_mod, "_run_convert",
+            lambda script, src, dst, outtype: dst.write_bytes(b"i"),
+        )
+        monkeypatch.setattr(
+            export_mod, "_run_quantize",
+            lambda ldir, src, dst, quant: dst.write_bytes(b"q"),
+        )
+
+        _run_export(model, tmp_path / "out.q4_0.gguf")
+        assert calls, (
+            "the export never installed the convert dependencies, so a conversion "
+            "on a machine without sentencepiece dies (#144 G2)"
+        )
+
+    def test_looking_for_llama_cpp_does_not_shell_out(self, tmp_path, monkeypatch):
+        """CONTROL, and a regression guard for how this was first fixed wrongly.
+
+        `_find_llama_cpp` must stay a lookup. The first version of the fix called
+        the installer from inside it, which on a machine WITHOUT the packages
+        turned an existing clone-detection test into a false failure — and that
+        machine was CI, not this one.
+        """
         from soup_cli.commands import export as export_mod
 
         llama = tmp_path / "llama.cpp"
         llama.mkdir()
-        (llama / "convert_hf_to_gguf.py").write_text("# stub\n", encoding="utf-8")
+        (llama / "convert_hf_to_gguf.py").write_text("# stub", encoding="utf-8")
 
-        calls = []
-        monkeypatch.setattr(export_mod, "_install_convert_deps", lambda: calls.append(1))
-        resolved = export_mod._find_llama_cpp(str(llama))
-        assert resolved == llama
-        assert calls, (
-            "a user-supplied llama.cpp never triggered the convert-dependency "
-            "install, so conversion fails on a missing sentencepiece (#144 G2)"
-        )
+        def _explode(*args, **kwargs):
+            raise AssertionError("_find_llama_cpp must not run a subprocess")
+
+        monkeypatch.setattr(export_mod.subprocess, "run", _explode)
+        assert export_mod._find_llama_cpp(str(llama)) == llama
 
     def test_the_install_is_skipped_when_the_deps_are_already_importable(
         self, tmp_path, monkeypatch
@@ -141,3 +179,14 @@ class TestConvertDepsAreInstalledOnEveryPath:
         monkeypatch.setattr(export_mod, "_convert_deps_present", lambda: True)
         export_mod._install_convert_deps()
         assert calls == [], "pip was invoked although the deps were already importable"
+
+    def test_the_install_runs_when_they_are_not(self, tmp_path, monkeypatch):
+        """The other half. Without this, pinning "does not call pip" would be
+        satisfied by an installer that never installs anything."""
+        from soup_cli.commands import export as export_mod
+
+        calls = []
+        monkeypatch.setattr(export_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(export_mod, "_convert_deps_present", lambda: False)
+        export_mod._install_convert_deps()
+        assert calls, "the deps were missing and pip was never invoked"

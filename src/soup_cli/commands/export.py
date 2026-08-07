@@ -262,6 +262,11 @@ def export(
 
     # --- Find llama.cpp ---
     llama_dir = _find_llama_cpp(llama_cpp_path)
+    # #144 G2 — this used to run only after an auto-clone, so `--llama-cpp` and an
+    # already-present ~/.soup/llama.cpp died on `ModuleNotFoundError:
+    # sentencepiece`. Here it covers every branch, and returns immediately when
+    # the packages are already importable.
+    _install_convert_deps()
 
     # --- Convert to GGUF ---
     model_name = Path(model).name
@@ -468,8 +473,10 @@ def _install_convert_deps() -> None:
 def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     """Find or clone llama.cpp directory.
 
-    Every branch that returns a usable checkout installs the convert
-    dependencies first (#144 G2); the call is a no-op when they are present.
+    Looking only. The convert-script dependencies are installed by the caller,
+    once, just before conversion (#144 G2) — a lookup that silently shells out to
+    pip is a surprise, and it made an existing test that mocks ``subprocess.run``
+    to detect clone attempts see a pip call instead.
     """
     from soup_cli.utils.constants import SOUP_DIR
 
@@ -477,7 +484,6 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     if user_path:
         path = Path(user_path)
         if path.exists():
-            _install_convert_deps()
             return path
         console.print(f"[red]llama.cpp not found at: {path}[/]")
         raise typer.Exit(1)
@@ -489,7 +495,6 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     if env_path:
         path = Path(env_path)
         if path.exists():
-            _install_convert_deps()
             return path
 
     # 3. Check ~/.soup/llama.cpp
@@ -500,7 +505,6 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
     # directory the user happened to run from (v0.71.35 GGUF validation).
     soup_llama = Path.home() / SOUP_DIR / LLAMA_CPP_DIR_NAME
     if soup_llama.exists() and (soup_llama / "convert_hf_to_gguf.py").exists():
-        _install_convert_deps()
         return soup_llama
 
     # 4. Auto-clone
@@ -515,7 +519,6 @@ def _find_llama_cpp(user_path: Optional[str] = None) -> Path:
             capture_output=True,
             text=True,
         )
-        _install_convert_deps()
         console.print("[green]llama.cpp cloned successfully.[/]")
         return soup_llama
     except subprocess.CalledProcessError as exc:

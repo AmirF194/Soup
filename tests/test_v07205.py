@@ -194,3 +194,95 @@ class TestStreamedPreferenceLossesDisableHfGradientCheckpointing:
             gradient_checkpointing=asked,
         )
         assert wrapper.trainer.args.gradient_checkpointing is asked
+
+
+# ==========================================================================
+# the CI fixture must exercise the kernel path production actually takes
+# ==========================================================================
+def _cuda_available():
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="the fused-kernel window is a CUDA dispatch")
+class TestFixtureIsOutsideTheFusedKernelWindow:
+    """The streamed-vs-resident gate was comparing a code path no real model uses.
+
+    ``bitsandbytes::gemm_4bit`` dispatches on M. Measured on this fixture (hidden 64,
+    so every projection is [64x64] or [32x64]), on an H100:
+
+    ==========  ==========================  ================
+    tokens      resident calls via fallback  streamed-vs-resident
+    ==========  ==========================  ================
+    8, 16, 32   0 of 14 — all FUSED          3.906250e-03 (= 2^-8, one bf16 ulp)
+    64 and up   14 of 14 — all fallback      0.0
+    ==========  ==========================  ================
+
+    Real 8B / 32B projections take the fallback at every M from 8 to 2048, so the
+    fused branch is one the shipped models never reach — and the gate was sitting in
+    it, at 16 tokens. The window boundary and the bit-exactness boundary were
+    measured to coincide EXACTLY at 64, which is what identifies the dispatch as the
+    cause of the ulp rather than something else that merely correlates with size.
+
+    This test pins the fixture outside that window, so shrinking the sequence back
+    for speed fails here with the reason attached instead of silently returning the
+    gate to the wrong kernel.
+    """
+
+    def test_every_resident_4bit_call_takes_the_dequant_fallback(self, tmp_path):
+        import bitsandbytes as bnb
+
+        bnb_ops = pytest.importorskip(
+            "bitsandbytes.backends.cuda.ops",
+            reason="the M-dispatch lives in the CUDA backend module",
+        )
+        if not hasattr(bnb_ops, "_dequant_linear_fallback"):
+            pytest.skip(
+                "this bitsandbytes has no _dequant_linear_fallback (added around "
+                "0.50); the branch it names cannot be counted here. The property "
+                "still holds — TestNF4ParityOnCuda asserts the observable "
+                "consequence, an exactly-zero streamed-vs-resident difference."
+            )
+
+        model, _, weights, _, _ = _nf4_stream(tmp_path, device="cuda", dtype="bfloat16")
+        resident = _resident_nf4(weights, dtype="bfloat16", device=0)
+        del model
+
+        counts = {"fallback": 0, "total": 0}
+        real_fb = bnb_ops._dequant_linear_fallback
+        real_matmul = bnb.matmul_4bit
+
+        def counting_fb(*args, **kwargs):
+            counts["fallback"] += 1
+            return real_fb(*args, **kwargs)
+
+        def counting_matmul(*args, **kwargs):
+            counts["total"] += 1
+            return real_matmul(*args, **kwargs)
+
+        ids = torch.randint(
+            0, 64, (1, 128), generator=torch.Generator().manual_seed(11)
+        ).cuda()
+        bnb_ops._dequant_linear_fallback = counting_fb
+        bnb.matmul_4bit = counting_matmul
+        try:
+            with torch.no_grad():
+                resident(input_ids=ids, attention_mask=torch.ones_like(ids))
+            torch.cuda.synchronize()
+        finally:
+            bnb_ops._dequant_linear_fallback = real_fb
+            bnb.matmul_4bit = real_matmul
+
+        assert counts["total"] > 0, (
+            "the counter never intercepted bnb.matmul_4bit, so it cannot tell which "
+            "branch was taken either"
+        )
+        assert counts["fallback"] == counts["total"], (
+            f"{counts['total'] - counts['fallback']} of {counts['total']} resident "
+            "4-bit calls took the FUSED kernel at the token count the CUDA gates use. "
+            "Real models never take that branch, so the gate would be pinning a path "
+            "no user runs — and the streamed arm, which always dequantises, differs "
+            "from it by one bf16 ulp. Raise the fixture's sequence length."
+        )

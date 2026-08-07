@@ -1719,6 +1719,61 @@ first backward after construction is sometimes right, which is the same
 first-pass behaviour STEP 2b recorded. It is why every arm here is read across
 three repetitions rather than one.
 
+### Confirmed on the real Qwen2.5-32B, and then costed — the cost is the problem
+
+Same two arms on the real 32B checkpoint (not the synthetic reconstruction),
+five independent runs, three backward repetitions each:
+
+```
+run1 control         -> WRONG  ['256/256', '8/256', '8/256']
+run1 clone_fwd_quant -> EXACT  ['256/256', '256/256', '256/256']
+run2 .. run5         -> identical
+```
+
+**5/5 runs, 15/15 repetitions on a real model.** The diagnosis is not an artefact
+of the synthetic reproducer.
+
+Then the price, measured on the same model with correctness asserted in the same
+process so a fast arm cannot quietly be the wrong one (5 repeats, seq 256, 15
+timed steps after 4 warm-up):
+
+| arm | gradients | tok/s (median) | vs control | **peak VRAM** |
+|---|---|---|---|---|
+| control *(shipped)* | **WRONG** 8/256 | 416.04 | 1.00x | **4,220 MiB** |
+| `clone_fwd_quant` | correct 256/256 | 405.09 | **1.03x** | **19,720 MiB** |
+| `clone` (everything, every call) | correct 256/256 | 389.41 | 1.07x | 19,720 MiB |
+
+**Three percent of throughput, and 4.67x the peak VRAM.** 19,720 MiB is
+approximately the entire NF4 store (14.99 GB) — which is not a surprise once the
+mechanism is named, it is a *consequence* of it. bitsandbytes holds each layer's
+forward-time reference until the backward reaches that layer, so a private copy
+per layer must stay alive across the whole forward-to-backward span. Any
+de-aliasing repair is therefore **O(model), not O(window)**, by construction.
+
+That is the same wall the first `clone` measurement hit, reached again from the
+opposite direction and now with a reason rather than a number. It closes the
+whole clone family: correct, nearly free in time, and it deletes the premise of
+layer streaming.
+
+### What is left, and it is specific
+
+The memory cost is forced by bnb holding the reference. So the repair has to stop
+it holding one:
+
+1. **Upstream**: `MatMul4Bit` uses `save_for_backward` for `B` and the
+   `quant_state` tensors instead of plain `ctx` attributes. Gradient
+   checkpointing would then discard and recompute them like every other op, and
+   the cost returns to O(window). This is the clean fix and it is not in Soup.
+2. **In Soup**: do not route streamed NF4 layers through `MatMul4Bit` at all —
+   dequantise the layer's weights *inside* the checkpointed region and use a
+   native matmul, which does use `save_for_backward`. Cost is a transient
+   dequantised layer (O(window)) plus dequantisation compute. Untested.
+3. **Refuse**, as STEP 8 concluded for `pin=False`, until 1 or 2 exists.
+
+None of the three was implemented here. What is established is that the two
+obvious repairs — hold the buffer, or copy it — are both O(model) and therefore
+both self-defeating, and *why*.
+
 ### Every fact now accounted for
 
 | fact | explanation |

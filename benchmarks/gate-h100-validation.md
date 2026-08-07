@@ -108,6 +108,23 @@ appear in the order they were run, not in the order they would read best.
     multiplier is right and one shared coefficient is wrong. Deliberately **not**
     changed: 14 was measured on another stack, and swapping it would trade a
     documented over-prediction for an undocumented under-prediction.
+15. **`soup train --gpus N` had never launched** (STEP 20). `accelerate launch`
+    takes a script path and Soup handed it `sys.executable`, so accelerate parsed
+    the Python ELF binary as source and every rank died before the trainer existed.
+    The documented multi-GPU entry point, dead since it shipped, and invisible to
+    single-GPU CI because that path skips the launcher wrapper entirely. Repaired.
+    FSDP itself is sound: `full_shard` / `shard_grad` / `full_offload` all train and
+    write live adapters, with sharding verified as local params = total ÷ 4 exactly.
+16. **DeepSpeed does not work with LoRA at all** (STEP 20, #336) — every stage
+    fails on an empty no-decay parameter group meeting torch 2.13's strict `zip`.
+    The full-fine-tuning control trains to completion, which both isolates the
+    trigger and explains why an earlier ZeRO-3 run passed.
+
+**Seven defects were repaired in this session** — #331, #328, the `use_liger` crash,
+the silent `max_length` cap, SGLang's total failure, the multi-GPU launcher, and
+#335's dead adapter — and **five more were filed with reproducers** (#332, #333,
+#334, #336, plus the `--no-reexec` hint). Every one of them was found by running
+something that had never been run, not by reading code.
 
 Also here, because the record is the working one: a false alarm about the HF
 cache that a control disproved, two inconclusive user-level attempts at the
@@ -2787,11 +2804,17 @@ tests it as a control.
 
 ### Three more defects, filed rather than fixed
 
-- **`use_fsdp2_compile` writes a DEAD adapter, exit 0** (#335). Keys carry
-  torch.compile's `_orig_mod.` prefix, `PeftModel.from_pretrained` matches none,
-  and `lora_B` stays at zero init — **0/96 non-zero**, reproduced 3/3, while the
-  paired non-compile run writes 96/96. A completed run that produces a file which
+- **`use_fsdp2_compile` wrote a DEAD adapter, exit 0** (#335) — **now fixed.** Keys
+  carried torch.compile's `_orig_mod.` prefix, `PeftModel.from_pretrained` matched
+  none, and `lora_B` stayed at zero init — **0/96 non-zero**, reproduced 3/3, while
+  the paired non-compile run wrote 96/96. A completed run that produces a file which
   silently does nothing is this project's worst failure shape.
+  `strip_compile_prefix` normalises the keys after save, and its tests assert the
+  trained **values** survive the rename as well as the keys — a repair that renamed
+  correctly while losing numbers would be the same bug with a new mechanism. It
+  writes through `mkstemp` + `os.replace` because `load_file` memory-maps the file
+  and writing over a live mapping fails on Windows with `os error 1224`, the trap
+  `adapter_fuse.py` already documents; the test caught it on the first run.
 - **Every DeepSpeed stage fails with LoRA** (#336). HF builds 2 param groups and
   with LoRA the no-decay group is **empty** (`[192, 0]`, `base_lrs` length 2);
   DeepSpeed drops it, leaving 1 group against 2 base_lrs, and torch 2.13's

@@ -1692,6 +1692,33 @@ is exactly as broken as the control.** This clears the five-repeat bar that the
 `buffers=4` near-miss earned, and the direction is not a coin flip — the two arms
 separate completely and in the predicted direction.
 
+### Narrowed to the exact tensors, with the control that makes it mean something
+
+If bitsandbytes' `ctx` capture is the whole story, then de-aliasing **only the
+tensors bnb captures** — the packed weight and its `::absmax` / `::nested_*`
+sidecars — must fix it, while de-aliasing **only the rest** of the layer (the
+layernorms and biases, which reach native ops that do use `save_for_backward`)
+must not. Without the second arm the first is satisfied by "copying most of the
+bytes helps somehow".
+
+Five independent runs, three backward repetitions each, control in every run:
+
+```
+run1 control            -> WRONG  ['128/128', '8/128', '8/128']
+run1 clone_fwd_quant    -> EXACT  ['128/128', '128/128', '128/128']
+run1 clone_fwd_nonquant -> WRONG  ['8/128', '8/128', '8/128']
+run2 .. run5            -> identical in all three arms
+```
+
+**5/5 runs, 15/15 repetitions, and the two arms separate completely.** The
+diagnosis holds at tensor granularity: it is exactly the bitsandbytes-captured
+tensors, and nothing else in the layer.
+
+Note `run1 control` opening with `128/128` before collapsing to `8/128` — the
+first backward after construction is sometimes right, which is the same
+first-pass behaviour STEP 2b recorded. It is why every arm here is read across
+three repetitions rather than one.
+
 ### Every fact now accounted for
 
 | fact | explanation |

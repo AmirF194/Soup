@@ -1607,6 +1607,114 @@ and materialising in `unpack_hook`, which severs whatever reference the graph is
 actually holding rather than guessing where it points. Not attempted here: it
 needs changes inside `src/`, and `src/` is shared with another agent right now.
 
+### THE MECHANISM, named in the library that causes it
+
+Two fix attempts had been rejected and the forward-pool sweep had shown the
+premise behind both ("the backward reads stale weights") was wrong. So instead of
+a third guess: ask the graph what it holds.
+
+**Step 1 — `saved_tensors_hooks`, purely to observe.** Installed around the
+forward+backward, recording every packed tensor whose *storage pointer* falls in
+a pool buffer (storage, not identity: a `Params4bit` view, a `.t()`, a slice all
+share it).
+
+```
+quant=nf4  layers=32 buffers=2 -> packed 42, aliasing the pool 0
+quant=none layers=32 buffers=2 -> packed 42, aliasing the pool 0
+```
+
+Zero, in both quantisations. So nothing *outside* the checkpointed regions holds
+the pool. (Hooks were not installed inside those regions: non-reentrant
+`checkpoint` is itself implemented with `saved_tensors_hooks`, and nesting inside
+would replace the mechanism being measured.)
+
+**Step 2 — walk the graph instead.** Read-only, after the forward, before the
+backward. `fn.saved_tensors` is unreadable on most C++ nodes (2329
+`AttributeError`s), so the census of node *types* is what carried the result:
+
+```
+quant=nf4  nodes=2550 saved=0 aliasing=0
+   node types: {'MulBackward0': 350, 'ViewBackward0': 255, 'ToCopyBackward0': 255,
+                'AddBackward0': 255, 'MatMul4BitBackward': 221, 'MmBackward0': 129, ...}
+```
+
+**221 `MatMul4BitBackward` nodes exist in the graph after the forward** — 32
+layers x 7 quantised linears = 224. They are built during the forward and they
+survive it.
+
+**Step 3 — read what those nodes hold.** `bitsandbytes/autograd/_functions.py`,
+`MatMul4Bit`:
+
+```python
+55:  ctx.state = quant_state          # a plain Python attribute
+59:  ctx.tensors = (None, B)          # a plain Python attribute -- NOT save_for_backward
+...
+85:  grad_A = torch.matmul(grad_output, F.dequantize_4bit(B, ctx.state).to(...))
+```
+
+bitsandbytes stashes the packed weight `B` and the `quant_state` (which carries
+`absmax`, `offset`, `code`) on `ctx` as **ordinary attributes, bypassing
+`save_for_backward` entirely**. Gradient checkpointing discards and recomputes
+saved tensors *through the saved-tensor hooks*; a plain `ctx` attribute is
+invisible to that mechanism. So the reference is captured in the **forward**,
+aliases the pooled buffer, and survives untouched into the backward — by which
+time the slot has been refilled with another layer.
+
+### The experiment that confirms it: clone on the forward only
+
+If the forward-time capture is the consumer, de-aliasing on the **forward** alone
+must fix it, and de-aliasing on the **backward** alone must not. Five independent
+runs, three backward repetitions each, control in every run:
+
+```
+run1 control  -> WRONG  ['60/128', '8/128', '8/128']
+run1 clone_fwd -> EXACT ['128/128', '128/128', '128/128']
+run1 clone_bwd -> WRONG ['8/128', '8/128', '8/128']
+run2 control  -> WRONG  ['8/128', '8/128', '8/128']
+run2 clone_fwd -> EXACT ['128/128', '128/128', '128/128']
+run2 clone_bwd -> WRONG ['8/128', '8/128', '8/128']
+run3 control  -> WRONG  ['8/128', ...]   clone_fwd -> EXACT   clone_bwd -> WRONG
+run4 control  -> WRONG  ['8/128', ...]   clone_fwd -> EXACT   clone_bwd -> WRONG
+run5 control  -> WRONG  ['8/128', ...]   clone_fwd -> EXACT   clone_bwd -> WRONG
+```
+
+**5/5 runs, 15/15 repetitions: forward-only de-aliasing is exact; backward-only
+is exactly as broken as the control.** This clears the five-repeat bar that the
+`buffers=4` near-miss earned, and the direction is not a coin flip — the two arms
+separate completely and in the predicted direction.
+
+### Every fact now accounted for
+
+| fact | explanation |
+|---|---|
+| NF4 only; bf16 exact at 935 MiB/layer | bf16 goes through `MmBackward0`, a native op using `save_for_backward`, so checkpoint discards and recomputes it. bnb bypasses that mechanism. |
+| forward bit-exact, backward wrong | the corruption is a stale *reference* taken in the forward; the forward itself computes on correct data |
+| survivors = the last `stream_buffers` layers | exactly the layers whose slot was never refilled |
+| correctness returns at `buffers == n_layers` | nothing is ever refilled |
+| backward-side fixes do nothing | the recompute's fresh views are not what the node reads |
+| `clone` fixes it; `clone_fwd` alone fixes it | the forward-time capture points at a private copy |
+| `synchronize()` does not fix it | not a timing race |
+
+Still not explained: **the sharpness of the 163.8 / 171.5 MiB boundary.** Nothing
+in this mechanism is size-dependent, so the threshold is presumably about *when*
+a slot gets refilled relative to the backward, not about whether the reference is
+stale. Open.
+
+### What this means for the repair
+
+The fix is now specific rather than architectural: the pooled tensors handed to
+**bitsandbytes** must not be recycled, because bnb holds them outside the
+mechanism gradient checkpointing relies on. That is much narrower than "hold
+every layer" — it is the NF4 path only, and it is why the bf16 path has been
+correct all along at four times the bytes.
+
+Whether the cheapest form is cloning only the quantised tensors on the forward,
+teaching the pool not to recycle a slot bnb still references, or an upstream
+change to bnb to use `save_for_backward`, is a design decision with costs this
+record has not measured. What it has measured: **cloning everything on the
+forward is 6% throughput and, unlike cloning on every call, does not have to be
+paid on the recompute.**
+
 ### Two more attempts on the NF4-only asymmetry, both negative
 
 **Rejected 7 — the number of tensors per layer.** An NF4 layer arrives as many

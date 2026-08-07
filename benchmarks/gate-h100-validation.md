@@ -2489,6 +2489,151 @@ before and after, so this is not ordering or poisoned CUDA state),
 `/root/issue328_probe.py`, `/root/issue328_control.py`. Results under
 `/root/results/issue328_*.json`.
 
+## STEP 16 — #327: the VRAM pre-flight over-predicts, and not for the reason assumed
+
+72 runs, 3 repeats per cell, Qwen2.5-0.5B-Instruct (vocab 151936 — a real
+vocabulary, which is what the two earlier attempts lacked). Spread is **exactly
+0.00 MiB in every cell**: `max_memory_allocated` is bit-reproducible for a fixed
+shape, so the repeats confirm determinism rather than estimate noise.
+
+Fixture validity was recorded per run, because that is what invalidated the earlier
+attempts — DPO measured an identical 63.43 MiB at seq 128, 256 and 512, an
+independent variable that never moved. Here `observed_rows x observed_seq` equals
+`2·batch x max_length` for DPO and `batch x max_length` for SFT in all 72 runs.
+
+**The bug in one row:** DPO batch 1 / seq 768 is refused (predicted 3541.84 MiB
+against a 3166.20 MiB budget at the 3.32 GB free figure from the v0.72.4 notes) and
+measures **3092.46 MiB — it fits, with 73.74 MiB to spare.**
+
+**But it is not a preference-loss problem.** The SFT control over-predicts by the
+same amount at the same *effective* row count: DPO b1 against SFT b2, and DPO b2
+against SFT b4, agree to **+0.09% … +0.51%** (a flat ~6.5 MiB) across all 8
+comparable shapes. So `_STREAM_ROWS_PER_EXAMPLE = 2` is **correct** — a streamed DPO
+step costs what a streamed SFT step at twice the rows costs.
+
+What is wrong is one coefficient on the shared logits term. The ratio is not
+constant (DPO 1.107 -> 1.167, SFT 0.987 -> 1.163); it rises and asymptotes, the
+signature of a slope error plus a small offset. A least-squares fit of
+`measured = a + b·(vocab x seq x rows)` gives **b = 12.311 bytes/element**,
+a = 353.0 MiB, worst residual 0.15% over 12 DPO cells, against the shipped
+`LOGITS_BYTES_PER_ELEMENT = 14`.
+
+**The honest statement is that the constant is stack-dependent, not that 14 is
+wrong.** 14 was measured on RTX 3050 / Windows / an older torch; 12.3 is this
+stack. Both are measurements, and v0.72.3's own grid — 10 real runs, worst error
+0.85%, never under-predicting — still passes unchanged. Changing 14 on the strength
+of one stack would trade a documented over-prediction for an undocumented
+under-prediction, which is the worse failure: on Windows/WDDM it does not raise, it
+silently spills.
+
+Two robustness checks: 30 cells re-run against the tree carrying the #331 fix gave
+**byte-identical** peaks (the repair does not move VRAM), and the SFT 1x256 cell
+reproduces the -1.3% under-prediction that v0.72.4 already documents as a known
+-1.7% SFT miss.
+
+Method note worth keeping: peak must be reset AFTER `setup()`. A peak spanning
+`setup()` charges the pre-flight's own 4096³ GEMM probe to the training step and
+reports an under-prediction that does not exist — recorded in v0.72.4 as one of
+three invalid measurement attempts, and re-encountered here.
+
+Raw: `/root/results/issue327b/*.json` (72 records), `/root/results/issue327_summary.json`.
+
+## STEP 17 — #78: the first measurement of FlashAttention and Liger, and what it found
+
+Neither had ever been measured, because neither installs on the maintainer's
+Windows box. Real `soup train`, Llama-3.1-8B + LoRA r=16, bf16, batch 4, seq 1024,
+80 steps, 5 repeats **interleaved** A/B/C/D so clock drift cannot favour whichever
+ran first.
+
+| arm | median tok/s | spread | peak VRAM | SM clock (busy) | ratio |
+|---|---|---|---|---|---|
+| baseline (SDPA) | 9621.1 | 0.83% | 70.99 GiB | 1965 MHz | 1.000x |
+| FlashAttention 2 | 9764.8 | 0.92% | 70.99 GiB | 1965 MHz | **1.015x** |
+| Liger (HF flag) | 10115.3 | 0.22% | 61.81 GiB | 1905 MHz | **1.051x**, VRAM -12.9% |
+| FA2 + Liger | 10256.0 | 0.53% | 61.81 GiB | 1920 MHz | **1.066x**, VRAM -12.9% |
+
+Activation was verified rather than assumed — a counter on PYTHONPATH in dedicated
+short runs (timing runs had counters off): baseline 256 SDPA calls / 0 FA2, FA2 256
+FA2 calls / **0 SDPA**, Liger with the module classes actually swapped to
+`LigerRMSNorm` / `LigerSwiGLUMLP`. Baseline's real kernel, from `torch.profiler`,
+is `cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16`.
+
+**Against what Soup documented:** FlashAttention claimed "2-4x speedup and
+significant memory savings" and measures **1.015x with zero memory saving**; Liger
+claimed "20-60% memory and 20-40% throughput" and measures **12.9% and 5.1%**. Both
+claims are now corrected in the source docstrings and docs, with the measurement
+conditions attached.
+
+FA2 has little to beat here: the baseline is already a Hopper flash kernel, so this
+is flash against flash, which is also why the VRAM columns match to four figures.
+That is a property of the comparison, not a criticism of FA2, and the gap would
+widen with sequence length.
+
+**Four defects the benchmark found before it found numbers:**
+
+1. **`training.use_liger: true` crashed at step 0.** Soup patched the model but
+   never set `TrainingArguments.use_liger_kernel`, the flag TRL reads to know the
+   fused path returns `logits=None`; its entropy guard could not fire and
+   `entropy_from_logits(None)` raised. Reproduced on trl 0.26.2 **and** 0.19.1, so
+   the feature had never worked anywhere in the supported pin. The Liger rows above
+   use the HF-native flag, i.e. what a fixed Soup does. **Fixed.**
+2. **`data.max_length` above 1024 was silently ignored on every SFT run** —
+   `max_length=512` gave 512 tokens/sample, `max_length=4096` gave **1024**. Soup
+   passes a `TrainingArguments`, and `SFTTrainer` converts it with
+   `SFTConfig(**args.to_dict())`, where `max_length` is an SFT-only field that does
+   not survive the round trip. **Fixed.** This also bounds the FA result: 1024 was
+   the longest sequence Soup could produce, so the benchmark ran at the operating
+   point users actually got.
+3. **The FlashAttention 3 branch is unreachable.** Soup selects FA3 when
+   `import flash_attn` reports major >= 3, but Dao-AILab ships FA3 as package
+   `flash_attn_3` / module `flash_attn_interface`, and transformers gates on
+   `_is_package_available("flash_attn_3")`. Verified by spoofing `flash_attn` to
+   3.0.0: Soup requests `flash_attention_3` while
+   `transformers.is_flash_attn_3_available()` is False. Not fixed here — filed.
+4. FA3 could not be measured on this box for an independent reason (no `nvcc` to
+   build `hopper/`, PyPI `flash-attn-3` is a 0.0.0 placeholder, and the `kernels`
+   route needs `huggingface_hub>=1.10` against transformers 4.57.6's `<1.0` pin —
+   tried, broke transformers, reverted). So "Hopper now or never" did not rescue
+   it, and the honest status is unmeasured.
+
+## STEP 18 — #76: vLLM works, SGLang was broken for every request
+
+Both backends are documented and neither had ever been run, because neither
+supports Windows.
+
+**vLLM works.** `soup serve --backend vllm` came up in 38–118 s and returned 200 on
+`/v1/chat/completions`, on SSE streaming, and on `/v1/messages`. `--prefix-cache`
+verified through the engine's own config log. A LoRA adapter passed as `--model`
+loaded with the base auto-resolved.
+
+**SGLang was 100% broken.** `utils/sglang.py` did `response["text"]` on the return
+of `Runtime.generate`, which in sglang 0.5.16 ends `return json.dumps(...)` — a
+string. Every request raised `TypeError: string indices must be integers`, in both
+the streaming and non-streaming path. **Fixed**, accepting both shapes.
+
+**Install hazard confirmed, and it is the one the project was already burned by:**
+`pip install vllm` into the training venv resolves torch **2.13.0 -> 2.11.0** and
+transformers **4.57.6 -> 5.14.1**, past Soup's own `<5.0.0` cap. Separate venvs were
+used; the training venv was verified unperturbed afterwards.
+
+Three more defects, filed rather than fixed:
+
+- **vLLM ignores the model's chat template.** `utils/vllm.py::_build_prompt`
+  hand-rolls `"User: …\nAssistant:"` while the transformers backend uses
+  `apply_chat_template`. A/B inside one engine, same model and sampling params,
+  only the prompt differing: on Llama-3.1-8B + LoRA the hand-rolled prompt produces
+  a run-on loop that burns all 64 tokens. This degrades every vLLM user's output.
+- **`finish_reason` is hardcoded `"stop"`** even when length-truncated — observed
+  `"stop"` with `completion_tokens == max_tokens == 64`.
+- **`--dashboard` silently no-ops** on vLLM and SGLang (`/metrics` -> 404) although
+  `docs/commands.md` advertises it; SGLang additionally lacks `/v1/messages`, which
+  `docs/serving-and-export.md` claims for both.
+
+Also recorded because the record is the working one: a suspicion that Soup leaked
+`VLLM::EngineCore` processes holding 51 GB was **disproved** by a dedicated SIGINT
+test — the orphans were the harness `SIGKILL`ing after 5 s, and Soup's shutdown is
+clean in ~6 s.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

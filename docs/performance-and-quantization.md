@@ -586,7 +586,7 @@ Optimize training throughput and extend context windows:
 ```yaml
 # soup.yaml — performance options
 training:
-  use_liger: true            # Liger Kernel fused ops (20-60% memory savings)
+  use_liger: true            # Liger Kernel fused ops (measured 12.9% memory, 5.1% throughput)
   use_flash_attn: true       # FlashAttention v2/v3 auto-detection
   gradient_checkpointing: true  # Required for long sequences
 

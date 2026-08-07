@@ -2,7 +2,11 @@
 
 Liger Kernel provides fused CUDA kernels (RMSNorm, SwiGLU, CrossEntropy, RoPE, etc.)
 that replace standard HuggingFace operations with optimized fused versions.
-This can yield 20-60% memory savings and 20-40% throughput improvement.
+Measured on an H100 (sm90) with Llama-3.1-8B + LoRA, batch 4, seq 1024,
+5 interleaved repeats: **12.9% memory saving and 5.1% throughput**, verified by
+confirming the module classes were actually swapped for Liger's. The saving would
+shrink further with gradient checkpointing on.
+Numbers: benchmarks/gate-h100-validation.md.
 
 Requires: liger-kernel >= 0.3.0
 """

@@ -3,7 +3,12 @@
 Detects FlashAttention availability (v2/v3/v4) and configures models
 to use the best available attention implementation automatically.
 
-FlashAttention provides 2-4x speedup and significant memory savings
+Measured on an H100 (sm90) with Llama-3.1-8B + LoRA, batch 4, seq 1024,
+5 interleaved repeats: **1.015x throughput and no memory saving** against the
+default. That is not a defect in FlashAttention -- torch SDPA already dispatches
+to a cuDNN Hopper flash kernel there, so the comparison is flash against flash.
+The advantage grows with sequence length, so a longer-context run may differ.
+Numbers: benchmarks/gate-h100-validation.md.
 for long sequences by avoiding materializing the full attention matrix.
 """
 

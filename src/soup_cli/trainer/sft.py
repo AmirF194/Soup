@@ -607,6 +607,19 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         else:
             self.trainer = SFTTrainer(**trainer_kwargs)
 
+        # #336 — DeepSpeed + LoRA died on every stage before the first step.
+        # HF builds two optimizer parameter groups (decay / no-decay) and with
+        # LoRA the no-decay group is empty; DeepSpeed drops it while the LR
+        # scheduler keeps two ``base_lrs``, and torch >= 2.13's strict ``zip``
+        # raises at ``lr_scheduler.step()``. The guard prunes the empty group
+        # inside ``create_optimizer``, i.e. before the scheduler is built.
+        # Only under DeepSpeed: full fine-tuning populates both groups and the
+        # ordinary path must not have its optimizer rewritten.
+        if self.deepspeed_config:
+            from soup_cli.utils.deepspeed import attach_empty_param_group_guard
+
+            attach_empty_param_group_guard(self.trainer)
+
         self._output_dir = str(output_dir)
         self._batch_size = batch_size
 

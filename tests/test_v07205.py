@@ -437,3 +437,66 @@ class TestSglangDecodesItsRuntimeResponse:
 
         with pytest.raises(ValueError, match="SGLang"):
             decode_sglang_response("not json at all")
+
+
+# ==========================================================================
+# #77 — `soup train --gpus N` never launched at all
+# ==========================================================================
+class TestMultiGpuLaunchArgvIsRunnable:
+    """The whole multi-GPU entry point was dead.
+
+    ``accelerate launch`` takes a **script path** (or ``--module NAME``), and Soup
+    handed it ``sys.executable``. accelerate then opened the Python ELF binary and
+    parsed it as source, so every rank died before the trainer existed::
+
+        File "/root/venv/bin/python", line 1
+          ELF
+        SyntaxError: source code cannot contain null bytes
+
+    Measured on 4xH100: every arm of the #77 matrix had to be launched by hand.
+    The failure is total and immediate, which is why it is worth a test that reads
+    the argv rather than one that mocks the launch.
+    """
+
+    def test_the_python_dash_m_form_becomes_accelerates_module_flag(self):
+        import sys as _sys
+
+        from soup_cli.utils.launcher import build_accelerate_argv
+
+        argv = build_accelerate_argv(
+            num_processes=4,
+            script_args=[_sys.executable, "-m", "soup_cli.cli", "train", "-c", "s.yaml"],
+        )
+        assert _sys.executable not in argv, (
+            "the Python interpreter is still being passed where accelerate expects "
+            "a training script; accelerate will parse the ELF binary as source"
+        )
+        assert "--module" in argv
+        assert argv[argv.index("--module") + 1] == "soup_cli.cli"
+        assert argv[-3:] == ["train", "-c", "s.yaml"]
+        assert argv[:2] == ["accelerate", "launch"]
+
+    def test_a_real_script_path_is_left_alone(self):
+        """CONTROL. Translating unconditionally would break the documented
+        ``accelerate launch train.py`` form, which is a script path and must stay
+        positional."""
+        from soup_cli.utils.launcher import build_accelerate_argv
+
+        argv = build_accelerate_argv(
+            num_processes=2, script_args=["train.py", "--config", "s.yaml"]
+        )
+        assert "--module" not in argv
+        assert argv[-3:] == ["train.py", "--config", "s.yaml"]
+
+    def test_single_process_is_still_directly_executable(self):
+        """CONTROL. At one process there is no accelerate wrapper and the argv is
+        exec'd as-is, so the interpreter form must survive untouched — turning it
+        into ``--module`` there would produce a command with no program to run."""
+        import sys as _sys
+
+        from soup_cli.utils.launcher import build_accelerate_argv
+
+        argv = build_accelerate_argv(
+            num_processes=1, script_args=[_sys.executable, "-m", "soup_cli.cli", "train"]
+        )
+        assert argv == [_sys.executable, "-m", "soup_cli.cli", "train"]

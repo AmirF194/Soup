@@ -2817,6 +2817,15 @@ and self-contained:
 | `pincost.py` | pinned vs pageable throughput, correctness asserted in the same process |
 | `prep_convergence.py` | the emotion-classification subsets and held-out set |
 | `runbench.sh` / `variance.sh` / `runbench8.sh` | one `soup train` with VRAM and SM-clock sampling; n repeats; 8-GPU variant under torchrun |
+| `numerics.py` | STEP 13, first attempt — kept because it is VACUOUS: it measured at M=2048, above `_gemm_4bit_custom_max_m`, so both arms ran the same fallback |
+| `numerics2.py` | STEP 13 — per-M dispatch sweep plus the fused kernel forced on, forward and gradient reported separately |
+| `forcecheck.py` | STEP 13 — counts `_dequant_linear_fallback` directly, so a forcing that silently failed is distinguishable from a kernel that genuinely agreed |
+| `fixtureshape.py` / `fixture_window.py` / `fixture_window_cpu.py` | where the CI fixture sits relative to the fused-kernel window, on CUDA and on CPU |
+| `cpu_mode_probe.py` | whether the CPU divergence is an inference-path artefact (`_convert_weight_packed_for_cpu`) rather than a size effect |
+| `variant2_gate.py` | STEP 14 — the repair gate: control and repaired arms in ONE process against one resident reference, correctness printed next to VRAM and tok/s, empty gradient intersection is a hard failure |
+| `bnb_repro.py` | the standalone upstream reproducer for the bitsandbytes report — no downloads, ~1 minute, recycled buffer against a private-buffer reference plus a bf16 control |
+| `issue328_min.py` / `issue328_probe.py` / `issue328_control.py` | STEP 15 — six arms in one process, RMSNorm device instrumentation, and the 2x2 gradient-checkpointing control |
+| `issue327/measure327.py` | STEP 16 — the 72-run predicted-vs-measured VRAM grid, with the observed tensor shape recorded per run |
 
 All of them import `soup_cli` unmodified: every measurement above the
 measurement/fix boundary was taken against untouched Soup. The two `src/` changes

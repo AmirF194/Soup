@@ -584,3 +584,67 @@ class TestCompiledAdapterKeysAreCanonical:
 
         (tmp_path / "empty").mkdir()
         assert strip_compile_prefix(str(tmp_path / "empty")) == 0
+
+
+# ==========================================================================
+# #77 (low) — the --no-reexec hint dropped the user's own flags
+# ==========================================================================
+class TestNoReexecHintKeepsTheUsersFlags:
+    """`--gpus 4 --fsdp full_shard --no-reexec` printed a command WITHOUT
+    `--fsdp`, so following the hint literally trained without FSDP.
+
+    The hint was hand-built as ``["soup", "train", "-c", config]`` a few lines
+    above the auto-reexec path, which assembles the real flag list. Two copies of
+    "what the user typed", and only one of them was maintained. The hint is now
+    derived from the same ``script_args``, so they cannot drift.
+    """
+
+    def _advice(self, tmp_path, monkeypatch, extra_args):
+        import re
+
+        from typer.testing import CliRunner
+
+        from soup_cli.cli import app
+        from soup_cli.utils import topology as topo_mod
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "soup.yaml").write_text(
+            "base: test/model\n"
+            "task: sft\n"
+            "data: {train: data.jsonl, format: alpaca}\n"
+            "training: {epochs: 1, lr: 1e-4, batch_size: 1}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            topo_mod, "detect_topology",
+            lambda: {"gpu_count": 4, "interconnect": "PCIe"},
+        )
+        monkeypatch.setattr(topo_mod, "resolve_num_gpus", lambda spec: 4)
+        result = CliRunner().invoke(
+            app,
+            ["train", "--config", "soup.yaml", "--gpus", "4", "--no-reexec", "--yes",
+             *extra_args],
+        )
+        # Rich wraps and may inject ANSI; strip both before matching, the way
+        # every other CLI-output assertion in this repo has had to since v0.71.26.
+        return re.sub(r"\x1b\[[0-9;]*m", "", result.output).replace("\n", " ")
+
+    def test_the_hint_repeats_the_flags_the_user_passed(self, tmp_path, monkeypatch):
+        out = self._advice(
+            tmp_path, monkeypatch, ["--fsdp", "full_shard", "--trust-remote-code"]
+        )
+        if "Multi-GPU launch required" not in out:
+            pytest.skip("did not reach the advisory (config/data validation ran first)")
+        assert "--fsdp" in out, out
+        assert "full_shard" in out, out
+        assert "--trust-remote-code" in out, out
+
+    def test_the_hint_does_not_tell_you_to_pass_no_reexec(self, tmp_path, monkeypatch):
+        """Under `accelerate launch` the run is already distributed and never
+        re-execs, so repeating the flag would be noise the user has to reason
+        about. CONTROL for the derivation: it proves the hint is filtered rather
+        than a raw echo of the reexec argv."""
+        out = self._advice(tmp_path, monkeypatch, ["--fsdp", "full_shard"])
+        if "Multi-GPU launch required" not in out:
+            pytest.skip("did not reach the advisory (config/data validation ran first)")
+        assert "--no-reexec" not in out, out

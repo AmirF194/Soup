@@ -872,25 +872,6 @@ def train(
                 # --no-reexec was passed. Reexec uses os.execvp so the new
                 # accelerate process replaces this process; no leftover PID
                 # tree, stdio passes through unchanged.
-                if no_reexec:
-                    safe_config = markup_escape(config)
-                    console.print(
-                        Panel(
-                            markup_escape(
-                                format_advice(
-                                    num_gpus,
-                                    ["soup", "train", "-c", safe_config],
-                                )
-                            ),
-                            title="[yellow]Multi-GPU launch required[/]",
-                        )
-                    )
-                    console.print(
-                        f"[dim]Detected topology: {topo['gpu_count']} GPUs, "
-                        f"{topo['interconnect']}[/]"
-                    )
-                    raise typer.Exit(1)
-
                 # Reconstruct argv. Pass through critical flags so the
                 # reexec'd run sees what the user typed.
                 script_args: list[str] = [
@@ -960,6 +941,32 @@ def train(
                     script_args.extend(["--capture-activations", capture_activations])
                 if capture_prompts:
                     script_args.extend(["--capture-prompts", capture_prompts])
+                if no_reexec:
+                    # #77 — this hint used to be hand-built as
+                    # ["soup", "train", "-c", config] and silently dropped every
+                    # other flag the user typed, so following it literally ran
+                    # WITHOUT --fsdp, --deepspeed, --gate and the rest. It is now
+                    # derived from the same script_args the auto-reexec uses, so
+                    # the two cannot drift: one source for "what the user typed".
+                    # --no-reexec itself is dropped because under `accelerate
+                    # launch` the run is already distributed and never re-execs.
+                    hint_args = [
+                        "soup",
+                        "train",
+                        *(a for a in script_args[4:] if a != "--no-reexec"),
+                    ]
+                    console.print(
+                        Panel(
+                            markup_escape(format_advice(num_gpus, hint_args)),
+                            title="[yellow]Multi-GPU launch required[/]",
+                        )
+                    )
+                    console.print(
+                        f"[dim]Detected topology: {topo['gpu_count']} GPUs, "
+                        f"{topo['interconnect']}[/]"
+                    )
+                    raise typer.Exit(1)
+
                 argv = build_accelerate_argv(
                     num_processes=num_gpus, script_args=script_args,
                 )

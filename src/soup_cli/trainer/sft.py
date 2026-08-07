@@ -1413,6 +1413,20 @@ class SFTTrainerWrapper(StreamingSetupMixin):
 
         # Save final model (LoRA adapter)
         self.trainer.save_model(self._output_dir)
+        # #335 — under torch.compile the Trainer saves THROUGH the wrapper, so
+        # every key gains `_orig_mod.` and PeftModel.from_pretrained then matches
+        # none of them: it warns and leaves lora_B at zero init, i.e. the run
+        # exits 0 having written an adapter that does nothing. Measured 0/96
+        # non-zero against 96/96 for the paired non-compile run.
+        if getattr(self.config.training, "use_fsdp2_compile", False):
+            from soup_cli.utils.peft_wiring import strip_compile_prefix
+
+            renamed = strip_compile_prefix(self._output_dir)
+            if renamed:
+                console.print(
+                    f"[dim]Normalised {renamed} adapter keys saved through "
+                    "torch.compile's wrapper[/]"
+                )
         self.tokenizer.save_pretrained(self._output_dir)
 
         # Extract metrics

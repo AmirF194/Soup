@@ -500,3 +500,87 @@ class TestMultiGpuLaunchArgvIsRunnable:
             num_processes=1, script_args=[_sys.executable, "-m", "soup_cli.cli", "train"]
         )
         assert argv == [_sys.executable, "-m", "soup_cli.cli", "train"]
+
+
+# ==========================================================================
+# #335 — use_fsdp2_compile wrote an adapter that reloads as all zeros
+# ==========================================================================
+class TestCompiledAdapterKeysAreCanonical:
+    """A run that completes, exits 0, and writes a file that silently does nothing.
+
+    Under ``training.use_fsdp2_compile`` every saved key carried torch.compile's
+    wrapper prefix::
+
+        _orig_mod.base_model.model...     # written with compile
+        base_model.model...               # written without it
+
+    The tensors ARE trained (max|lora_B| 7.0e-3 measured), but
+    ``PeftModel.from_pretrained`` matches none of them, emits only
+    ``UserWarning: Found missing adapter keys``, and leaves ``lora_B`` at its zero
+    init — **0 of 96 non-zero**, reproduced 3/3 on 4xH100, against 96/96 for the
+    paired non-compile run.
+
+    This is the same failure shape v0.72.1 fixed for the streaming wrapper's
+    ``.inner.`` segment, and it is the worst one this project has: nothing raises.
+    """
+
+    def _write_adapter(self, directory, prefix=""):
+        from safetensors.torch import save_file
+
+        directory.mkdir(parents=True, exist_ok=True)
+        tensors = {
+            f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight":
+                torch.ones(4, 8),
+            f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight":
+                torch.full((8, 4), 0.007),
+        }
+        path = directory / "adapter_model.safetensors"
+        save_file(tensors, str(path))
+        return path
+
+    def test_the_compile_prefix_is_stripped(self, tmp_path):
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import strip_compile_prefix
+
+        path = self._write_adapter(tmp_path / "a", prefix="_orig_mod.")
+        changed = strip_compile_prefix(str(tmp_path / "a"))
+        assert changed == 2, f"expected both keys rewritten, got {changed}"
+        keys = set(load_file(str(path)))
+        assert not any(k.startswith("_orig_mod.") for k in keys), keys
+        assert all(k.startswith("base_model.model.") for k in keys), keys
+
+    def test_the_values_survive_the_rewrite(self, tmp_path):
+        """Renaming must not quietly re-initialise anything — the whole defect is
+        that trained numbers stop being found, so a fix that loses them is the
+        same bug with a different mechanism."""
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import strip_compile_prefix
+
+        path = self._write_adapter(tmp_path / "a", prefix="_orig_mod.")
+        strip_compile_prefix(str(tmp_path / "a"))
+        loaded = load_file(str(path))
+        b = loaded["base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"]
+        assert float(b.abs().max()) == pytest.approx(0.007), "trained values lost"
+
+    def test_a_normal_adapter_is_untouched(self, tmp_path):
+        """CONTROL. Rewriting unconditionally would churn every ordinary run's
+        adapter file for nothing, and any bug in the rewrite would then reach
+        users who never enabled compile."""
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import strip_compile_prefix
+
+        path = self._write_adapter(tmp_path / "a")
+        before = set(load_file(str(path)))
+        assert strip_compile_prefix(str(tmp_path / "a")) == 0
+        assert set(load_file(str(path))) == before
+
+    def test_a_missing_adapter_file_is_not_an_error(self, tmp_path):
+        """Full fine-tuning writes no adapter; the normaliser must not turn that
+        into a crash at the end of a completed run."""
+        from soup_cli.utils.peft_wiring import strip_compile_prefix
+
+        (tmp_path / "empty").mkdir()
+        assert strip_compile_prefix(str(tmp_path / "empty")) == 0

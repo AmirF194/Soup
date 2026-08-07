@@ -486,3 +486,73 @@ def attach_plugin_callback(trainer: Any, console: Any = None) -> bool:
         except Exception:  # noqa: BLE001
             pass
     return True
+
+
+#: torch.compile wraps the module and every state-dict key gains this segment.
+_COMPILE_PREFIX = "_orig_mod."
+
+
+def strip_compile_prefix(output_dir: str) -> int:
+    """Rewrite a saved adapter's keys to their canonical, loadable form.
+
+    #335 — under ``training.use_fsdp2_compile`` the HF Trainer saves through the
+    ``torch.compile`` wrapper, so every key comes out as
+    ``_orig_mod.base_model.model...`` instead of ``base_model.model...``. The
+    tensors are genuinely trained, but ``PeftModel.from_pretrained`` matches none
+    of them: it emits ``UserWarning: Found missing adapter keys`` and leaves
+    ``lora_B`` at its zero initialisation, so the adapter is a no-op. Measured on
+    4xH100: **0 of 96** non-zero against 96/96 for the paired non-compile run,
+    reproduced 3/3, with the run exiting 0 throughout.
+
+    Returns the number of keys rewritten — 0 when there was nothing to do, which
+    is the ordinary case and must stay a no-op rather than a rewrite of every
+    run's adapter file.
+    """
+    import os
+
+    path = os.path.join(output_dir, "adapter_model.safetensors")
+    if not os.path.isfile(path):
+        # full fine-tuning writes no adapter; a completed run must not end in a
+        # crash just because there is nothing here to normalise
+        return 0
+
+    import tempfile
+
+    from safetensors.torch import load_file, save_file
+
+    tensors = load_file(path)
+    if not any(key.startswith(_COMPILE_PREFIX) for key in tensors):
+        return 0
+
+    rewritten = {}
+    changed = 0
+    for key, value in tensors.items():
+        # clone: load_file MEMORY-MAPS the file, and writing over a live mapping
+        # fails on Windows with `os error 1224` (the same trap adapter_fuse.py
+        # documents for an in-place save_pretrained). Cloning detaches the
+        # tensors from the mapping so it can be released before the write.
+        target = key[len(_COMPILE_PREFIX):] if key.startswith(_COMPILE_PREFIX) else key
+        if target != key:
+            changed += 1
+        rewritten[target] = value.clone()
+    if len(rewritten) != len(tensors):
+        raise ValueError(
+            "stripping the torch.compile prefix would collide two adapter keys; "
+            "the checkpoint carries both spellings of the same weight"
+        )
+    del tensors
+
+    # atomic: a half-written adapter is worse than the prefixed one, which at
+    # least still holds the trained numbers
+    handle, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", suffix=".safetensors"
+    )
+    os.close(handle)
+    try:
+        save_file(rewritten, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return changed

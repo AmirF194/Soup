@@ -2812,7 +2812,11 @@ Laptop GPU*, DOI [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.217710
 measures Llama-3.1-8B NF4 on a 4 GB card. A published DOI cannot be quietly
 corrected, so this is answered explicitly rather than left implicit.
 
-**No measured number in it changes, and nothing in it is invalidated.**
+**No measured number in it changes, and nothing in it is invalidated.** That
+verdict was reached while the defect was still open and it survives the repair —
+but the repair adds two things a v2 has to say, and they are listed after the
+original three points below rather than folded into them, so the record shows what
+was concluded when.
 
 - Its headline configuration is 8B NF4 at **105 MiB per layer**, comfortably
   below the 163.8–171.5 MiB boundary found here, and it survives a 50-backward
@@ -2828,6 +2832,36 @@ What the session adds is **scope beyond** what the preprint claims — behaviour
 32B and above, which it never asserted — plus the defect that lives there. If a
 future version widens its scope past 14B, this record's threshold and the
 pinning result have to go with it.
+
+### Added after the repair (STEP 14) — two things a v2 must handle
+
+1. **The headline throughput was measured on code that has since changed.** 119.6
+   tok/s / 3.32 GB for Llama-3.1-8B NF4 on the RTX 3050 was taken **before**
+   `install_dequant_forward`. At training shapes bitsandbytes already took
+   `_dequant_linear_fallback`, so the arithmetic is unchanged, and the cost measured
+   on 32B here is **−4.8%**. But **nobody has re-run the 8B laptop configuration on
+   the repaired code**, and an 80 GB H100 cannot stand in for a 4 GB card whose
+   throughput is bound by host-to-device transfer. Options for v2, in order of
+   honesty: re-measure on the laptop; or state the figure as pre-repair and quote
+   the 32B delta as the expected direction. Silently carrying it forward is not one
+   of them.
+
+2. **The exactness protocol's own fixtures moved.** The paper's bit-exactness checks
+   ran at token counts that sit **inside** bitsandbytes' fused-kernel M window,
+   where the repaired streamed path (which always dequantises) and a resident model
+   (which does not, at small M) differ by one bf16 ulp *by construction*. The
+   property still holds for the shipped code — re-verified at 128 tokens, exactly
+   0.0 on CUDA — but the *conditions* under which "bit-exact" is true are now
+   explicit, and a v2 that repeats the protocol has to state the token count. See
+   STEP 13 for the measured window and STEP 14 for the re-verification.
+
+Neither of these invalidates a published number. Both change what a **v2** may
+claim without re-measuring, which is why they are here rather than in a footnote.
+
+A third, smaller point: the paper describes the method as exact and the record now
+contains a period in which the *backward* was not, above a size the paper never
+claimed. A v2 that mentions the defect and its repair is more credible than one
+that does not, given that #331 and this record are both public.
 
 ## Reproducing
 

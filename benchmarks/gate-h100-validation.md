@@ -35,7 +35,16 @@ appear in the order they were run, not in the order they would read best.
    is the first evidence of that from outside the original box.
 3. **Against DeepSpeed ZeRO-3 CPU offload, same box, same data, same model:
    2.93x the throughput in 9.7x less peak VRAM** at matched numerics.
-4. **A silent correctness defect, found and diagnosed.** With an NF4 base and
+4. **A silent correctness defect, found and its cause named in the library that
+   creates it.** `bitsandbytes.MatMul4Bit` stashes the packed weight and
+   `quant_state` on `ctx` as plain attributes rather than through
+   `save_for_backward`, so gradient checkpointing — which discards and recomputes
+   *saved tensors* — cannot see them. The reference is captured in the forward,
+   aliases the streaming buffer, and is read in the backward after that slot has
+   been refilled. Confirmed by de-aliasing on the forward alone: exact in 5/5
+   runs, while de-aliasing on the backward alone is exactly as broken as the
+   control. That is also why bf16 was never affected at four times the bytes.
+   With an NF4 base and
    layers above a threshold bracketed at 163.8–171.5 MiB, the streamed
    *backward* produces gradients
    that disagree with a resident reference on every layer but the last

@@ -2185,6 +2185,134 @@ measurement says nothing about throughput. Re-run on the 3000-row dataset the
 ordering reverses and becomes sensible. Left here because it is exactly the kind
 of number that would have looked publishable.
 
+## STEP 13 — is variant 2 numerically clean? (a probe, and a vacuous first answer)
+
+Both repairs measured in STEP 9 are dead for one shared reason: bitsandbytes holds
+its reference from forward to backward, so *any* de-aliasing keeps a copy of every
+layer alive across that span and costs **O(model)**, not O(window). STEP 9's
+measurement on real 32B put the number on it: peak VRAM 4 220 -> 19 720 MiB.
+
+Variant 2 is the remaining candidate implementable inside Soup: do not send the
+streamed NF4 weight through `MatMul4Bit` at all. Dequantise inside the checkpointed
+region and use a native matmul. That is O(window) by construction — the dequantised
+weight is a transient inside the recomputed block, not a reference held across it.
+
+Its risk is numerical. `matmul_4bit` is a fused kernel; dequantise-then-matmul is two
+operations with a different accumulation order. There is no reason to expect the two
+to be bit-identical, and if they are not, then "streamed NF4 == resident NF4" stops
+holding *by construction rather than because of a bug* — which is a question about
+what the project's reference standard means, not a question about the repair.
+
+Forward and gradient are asked separately throughout and never averaged, because
+bitsandbytes is asymmetric and the asymmetry is the whole point:
+
+```
+MatMul4Bit.forward   -> torch.ops.bitsandbytes.gemm_4bit          (fused)
+MatMul4Bit.backward  -> F.dequantize_4bit(B, ctx.state) @ ...     (NOT fused)
+```
+
+The gradient path upstream is *already* dequantise-then-matmul. So the two arms can
+agree on the gradient while disagreeing on the forward, and the gradient is the half
+that matters here — it is what the defect corrupts.
+
+### The first answer was vacuous, and the path control did not catch it
+
+First run: real Qwen2.5-32B projection shapes, real `quant_state` (blocksize 64, nf4,
+double_quant — what `layer_shard._quantize_nf4` writes), 5 seeds x 5 shapes at
+M = 2048 tokens. Result: forward **and** gradient bit-exact on 25/25, worst
+`max_abs` exactly 0.0, with determinism and accumulation-order controls holding.
+
+All true and all beside the point. `bitsandbytes::gemm_4bit` dispatches on M:
+
+```python
+_gemm_4bit_custom_max_m = 1536   # CUDA
+if M > _gemm_4bit_custom_max_m:
+    use_custom = False           # -> _dequant_linear_fallback
+```
+
+At M = 2048 bitsandbytes itself takes `_dequant_linear_fallback`. **Both arms were
+running the same code.** The run compared variant 2 against variant 2.
+
+The control that should have caught this did not. It counted calls to
+`bitsandbytes.functional.dequantize_4bit` and saw zero in the forward, which was read
+as "the fused kernel ran". The fallback lives in `backends/cuda/ops.py` and reaches
+the dequantiser through a registered torch op, never touching the `functional`
+wrapper that was patched. A path control has to observe the path, not a proxy for it.
+
+An earlier control in the same run failed loudly and was fixed before this one was
+found: the negative control perturbed a weight element by `max|W| * 1e-3`, about
+4e-3 relative on an element of size ~2e-2 — which is bf16's own resolution (2^-8).
+It rounded away, so the "control" compared a tensor against itself and reported that
+`torch.equal` could not detect a difference. Replaced with a sign flip plus a whole
+unit, and an assertion that the perturbation survived rounding.
+
+### The second answer, with the dispatch read out rather than assumed
+
+Rewritten to (a) record the dispatcher's actual per-M decision, (b) **force** the
+fused kernel on at training-shaped M by patching the two module globals the kernel
+reads at call time, and (c) count `_dequant_linear_fallback` directly, so a forcing
+that silently failed is distinguishable from a kernel that genuinely agreed.
+
+Forcing verified: **24/24 forced rows ran with 0 fallback calls.** The forced rows
+are real agreements or real disagreements, not failed patches.
+
+| | rows | forward bit-exact | gradient bit-exact |
+|---|---|---|---|
+| default dispatch, M in 1..4096, 6 shapes, 5 seeds | 300 | no (only where fused ran) | **yes, 300/300** |
+| fused kernel forced on, M = 512 and 2048 | 60 | no, 3 of 6 shapes | **yes, 60/60** |
+| fallback-counter cross-check, M in 8..2048 | 48 | as above | **yes, 48/48** |
+| shipped CI fixture shape | 15 | no at M = 8, 16 | **yes, 15/15** |
+
+**Gradient: bit-exact in 423 of 423 rows, worst `max_abs` exactly 0.0**, across every
+shape, every M, forced and unforced. This is not luck; it is construction. Variant 2's
+backward *is* bitsandbytes' backward — the same `dequantize_4bit` followed by the same
+matmul. Nothing about the gradient changes.
+
+**Forward: differs only where the fused kernel genuinely runs, and then at bf16 noise.**
+Worst `max_abs` 6.25e-2, worst relative-to-scale **3.95e-3**, against bf16's own
+resolution of 2^-8 = 3.9e-3. One unit in the last place. Structurally the same number,
+not a different one.
+
+And the window where the fused kernel runs does not overlap real training shapes:
+
+| shape | fused kernel runs at | falls back at |
+|---|---|---|
+| Llama-3.1-8B `q_proj` [4096x4096] | never, in M = 8..512 | every M tested |
+| Qwen2.5-32B `q_proj` / `down_proj` | never, in M = 8..2048 | every M tested |
+| Qwen2.5-32B `gate_proj` [27648x5120] | M <= 32 | M >= 512 |
+| CI fixture [64x64] | M <= 16 | M >= 64 |
+| CI fixture [256x64] | every M tested (8..512) | never |
+
+At real training shapes bitsandbytes is **already doing variant 2 internally**. So for
+the configuration this feature ships for — 8B / 32B NF4, batch x seq >= 128 — variant 2
+is not a numerics change at all. It makes explicit what the library already does, and
+moves it inside the checkpointed region where the aliasing cannot happen.
+
+The heuristic was also queried for arches this box does not have, by substituting
+`_gpu_dispatch_props`: sm86 (RTX 3050 Laptop, the shipped 4 GB configuration), sm89
+and sm90 all agree — over the 60 (M, shape) combinations swept, the largest M at which
+any of them selects the fused kernel is **32**. The sm86 answer is a query of the
+shipped heuristic, not a measurement on that card.
+
+### The one place it does bite: the CI fixture
+
+`tests/test_v07202.py` builds `hidden_size=64, intermediate_size=64, vocab_size=64`
+with sequences of 64-128. That shape sits **inside** the fused window — 7 of 10 fixture
+rows use the fused kernel, and at M = 8 and 16 the forward differs by up to 3.9e-3.
+
+So the tests that assert streamed-NF4 == resident-NF4 bit-exactly are running in
+precisely the regime where variant 2 changes the streamed arm, while the real models
+they stand in for are not. The gradient stays exact there too (15/15), so what would
+move is the forward assertion, on fixtures, at one bf16 ulp.
+
+That is a decision about what the reference standard means, and it is deliberately not
+taken here. Recorded, and left open.
+
+Scripts: `numerics.py` (the vacuous first run, kept), `numerics2.py` (dispatch sweep
+plus forced fused kernel), `forcecheck.py` (fallback counter), `fixtureshape.py`.
+Results: `/root/results/numerics_bf16.json`, `numerics_v3.json`, `forcecheck.json`,
+`fixtureshape.json`. torch 2.13.0+cu130, bitsandbytes 0.50.0, H100 sm90, 132 SMs.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

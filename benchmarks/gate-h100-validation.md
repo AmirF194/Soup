@@ -2764,9 +2764,38 @@ Raw: `/root/results/convergence_nf4_summary.json` and the per-run files.
 - **The 8-GPU comparison is on hardware where streaming's premise does not
   apply**, and on a PCIe box with no NVLink, which is the interconnect ZeRO-3
   most depends on.
-- **Preference losses were not benchmarked at all** — `dpo`/`orpo`/`simpo`/`kto`
-  streamed all fail on this torch before training starts (FINDING 2), so
-  v0.72.4's claims are untested here.
+- **Preference losses were not benchmarked** — when the throughput work was done
+  `dpo`/`orpo`/`simpo`/`kto` streamed all failed on this torch before training
+  started (FINDING 2). That cause is now found and fixed (STEP 15), so they DO run
+  here; nobody has re-run the throughput arms against them, so v0.72.4's
+  performance claims remain untested on this box.
+- **The repair is gated at one point in config space** — real 32B NF4, seq 128,
+  `stream_buffers=2`, `pin=True`, 5 repeats. The repair is shape-independent by
+  construction and 2174 CI tests cover the surrounding paths, but 72B was not
+  re-run after the fix and no throughput sweep was taken with it.
+- **The repair changes the code path the preprint's headline was measured on.**
+  Llama-3.1-8B NF4 at 119.6 tok/s on an RTX 3050 was measured pre-repair. At
+  training shapes bitsandbytes already took `_dequant_linear_fallback`, so the
+  arithmetic is unchanged and the 32B cost here is −4.8%, but **the 8B laptop
+  number has not been re-measured on the repaired code** and this box cannot
+  stand in for that card. Treat the published figure as pre-repair until someone
+  re-runs it.
+- **`LOGITS_BYTES_PER_ELEMENT` is left at 14 knowing it fits this stack worse**
+  (fitted 12.311 here). That is a deliberate refusal to trade a documented
+  over-prediction for an undocumented under-prediction, not an oversight — but it
+  means #327's user-visible symptom, a refusal of configs that would fit, is still
+  present.
+- **FlashAttention 3 is unmeasured**, on a Hopper box, which was one of the stated
+  reasons for the session. Two independent blockers: no `nvcc` to build `hopper/`,
+  and Soup's own FA3 detection cannot fire at all (#334). The second means no
+  amount of build effort would have produced a measurement through Soup.
+- **The FA/Liger numbers are one operating point** — 8B + LoRA + seq 1024 + batch 4,
+  no gradient checkpointing. Liger's memory saving shrinks with checkpointing on and
+  FA's advantage grows with sequence length; 1024 was the longest sequence Soup
+  could produce at the time, which is itself the bug that was fixed afterwards.
+  Nothing was tuned to improve any arm.
+- **vLLM's remaining defects are filed, not fixed** (#332, #333) — including that it
+  ignores the model's chat template, which degrades every vLLM user's output today.
 - **Every number is one machine, one session**, on a stack (torch 2.13.0+cu130,
   bnb 0.50.0, trl 0.26.2, peft 0.20.0) that differs from the published records in
   everything but `transformers`. SM clock was 1980 MHz median-while-busy in every

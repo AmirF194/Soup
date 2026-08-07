@@ -396,3 +396,44 @@ class TestLigerTellsTrlItIsOn:
         from an unpatched model, which is the same crash with the arms swapped."""
         wrapper = _sft_wrapper(tmp_path, monkeypatch)
         assert wrapper.trainer.args.use_liger_kernel is False
+
+
+# ==========================================================================
+# #76 — SGLang generation was broken for every request
+# ==========================================================================
+class TestSglangDecodesItsRuntimeResponse:
+    """`--backend sglang` loaded and then returned 500 on every generation.
+
+    ``sglang.Runtime.generate`` ends with ``return json.dumps(response.json())`` —
+    a **string**. ``utils/sglang.py`` did ``response["text"]`` on it, so every
+    request raised ``TypeError: string indices must be integers``. Deterministic,
+    not a race, and the backend had genuinely never been run: verified on
+    sglang 0.5.16 on an H100.
+
+    Older sglang returned a dict, so the decode has to accept BOTH shapes rather
+    than swapping one hard assumption for another.
+    """
+
+    def test_a_json_string_is_decoded(self):
+        import json
+
+        from soup_cli.utils.sglang import decode_sglang_response
+
+        payload = {"text": " Paris.", "meta_info": {"prompt_tokens": 17}}
+        out = decode_sglang_response(json.dumps(payload))
+        assert out["text"] == " Paris."
+        assert out["meta_info"]["prompt_tokens"] == 17
+
+    def test_a_dict_still_works(self):
+        """CONTROL. The older sglang shape must keep working — a fix that only
+        handled strings would break every previously-working version."""
+        from soup_cli.utils.sglang import decode_sglang_response
+
+        payload = {"text": " Paris.", "meta_info": {"prompt_tokens": 17}}
+        assert decode_sglang_response(payload) is payload
+
+    def test_an_undecodable_response_raises_something_actionable(self):
+        from soup_cli.utils.sglang import decode_sglang_response
+
+        with pytest.raises(ValueError, match="SGLang"):
+            decode_sglang_response("not json at all")

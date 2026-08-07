@@ -157,6 +157,78 @@ def rebuild_params4bit(key: str, buffers: Mapping[str, Any], spec: Any, codes: M
     )
 
 
+def install_dequant_forward(module: Any) -> int:
+    """#331 — keep a STREAMED NF4 weight out of ``bitsandbytes``' ``MatMul4Bit``.
+
+    ``MatMul4Bit.forward`` stashes the packed weight and the ``quant_state`` on
+    ``ctx`` as plain attributes rather than through ``save_for_backward``::
+
+        ctx.state = quant_state
+        ctx.tensors = (None, B)
+
+    ``torch.utils.checkpoint`` discards and recomputes *saved tensors*. These are
+    not saved tensors, so it cannot see them: the reference taken in the forward
+    survives, it ALIASES the buffer pool, and the backward reads it after that slot
+    has been refilled with a different layer. Measured on 8xH100 against a resident
+    NF4 reference, that is a bit-exact forward, a healthy-looking loss curve, and
+    gradients wrong on every layer but the last ``stream_buffers``.
+
+    De-aliasing was measured and rejected: bnb holds the reference across the whole
+    forward-to-backward span, so any copy keeps one layer alive for that span and
+    costs O(model). On real 32B, peak VRAM 4 220 -> 19 720 MiB.
+
+    So the weight never enters that autograd Function. It is dequantised inside the
+    checkpointed region and multiplied natively; ``F.linear`` saves the dequantised
+    tensor through the ordinary mechanism, which checkpointing DOES discard and
+    recompute, and the transient lives only inside the recomputed block — O(window).
+
+    This is not a numerics change at training shapes. ``bitsandbytes::gemm_4bit``
+    dispatches on M with ``_gemm_4bit_custom_max_m = 1536``, and on real projection
+    shapes it takes ``_dequant_linear_fallback`` at every M measured from 8 to 2048 —
+    i.e. bitsandbytes already does exactly this. The dtype handling below therefore
+    mirrors ``Linear4bit.forward`` line for line, replacing only the final call: a
+    dequantisation into a different dtype than bnb's own would introduce a rounding
+    difference precisely where there is none today.
+
+    Returns the number of modules patched, so a caller can assert it patched
+    something. Zero would mean the model carries no 4-bit linears at all.
+    """
+    import types
+
+    import bitsandbytes as bnb
+    import torch.nn.functional as functional
+    from bitsandbytes.functional import dequantize_4bit
+
+    def _dequant_forward(self, x):
+        if getattr(self, "quant_state", None) is not None and self.weight.quant_state is None:
+            self.weight.quant_state = self.quant_state
+        quant_state = self.weight.quant_state
+
+        if not getattr(self, "compute_type_is_set", True):
+            self.set_compute_type(x)
+            self.compute_type_is_set = True
+
+        inp_dtype = x.dtype
+        if getattr(self, "compute_dtype", None) is not None:
+            x = x.to(self.compute_dtype)
+
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(x.dtype)
+
+        # THE repair: dequantise here, inside whatever checkpointed region this
+        # forward is running in, and let F.linear save the dense weight properly.
+        weight = dequantize_4bit(self.weight, quant_state).to(x.dtype)
+        return functional.linear(x, weight, bias).to(inp_dtype)
+
+    patched = 0
+    for child in module.modules():
+        if isinstance(child, bnb.nn.Linear4bit):
+            child.forward = types.MethodType(_dequant_forward, child)
+            patched += 1
+    return patched
+
+
 def validate_quant_shape(key: str, spec: Any, shard_spec: Mapping[str, Any]) -> None:
     """The index's claimed shape must be backed by the bytes actually on disk.
 
@@ -548,6 +620,13 @@ def _build_streamed_layer_class():
             self.use_checkpoint = bool(use_checkpoint)
             self.quant_specs = dict(quant_specs or {})
             self.codes = dict(codes or {})
+            # v0.72.5 (#331) — a streamed NF4 weight must not reach MatMul4Bit,
+            # which captures it outside save_for_backward and so aliases the pool
+            # across the checkpoint boundary. See install_dequant_forward.
+            if self.quant_specs:
+                self.n_dequant_forward = install_dequant_forward(self.inner)
+            else:
+                self.n_dequant_forward = 0
             # v0.72.3 — the mirror of the state_dict() override below.
             self._register_load_state_dict_pre_hook(self._redirect_canonical_keys)
 

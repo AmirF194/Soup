@@ -2313,6 +2313,92 @@ plus forced fused kernel), `forcecheck.py` (fallback counter), `fixtureshape.py`
 Results: `/root/results/numerics_bf16.json`, `numerics_v3.json`, `forcecheck.json`,
 `fixtureshape.json`. torch 2.13.0+cu130, bitsandbytes 0.50.0, H100 sm90, 132 SMs.
 
+## STEP 14 — variant 2 implemented, and the gate it had to pass (FIX PHASE)
+
+STEP 13 established that dequantise-then-matmul is bit-exact to `MatMul4Bit` on the
+gradient in 423/423 rows, by construction. So the repair is: never send a streamed
+NF4 weight through that autograd Function. `install_dequant_forward` swaps the
+forward of every `bnb.nn.Linear4bit` inside a streamed layer for
+`dequantize_4bit` + `F.linear`, with the dtype handling mirroring
+`Linear4bit.forward` line for line so nothing else moves.
+
+`F.linear` then saves the dense weight through the ordinary mechanism, which
+checkpointing DOES discard and recompute, and the transient lives only inside the
+recomputed block — O(window), which is what both rejected repairs could not be.
+
+### The gate, on real Qwen2.5-32B
+
+Both arms in ONE process against ONE deterministic resident NF4 reference. The
+`control` arm neuters `install_dequant_forward` before the model is built, so it
+must reproduce the defect; without that, a passing `variant2` arm is equally
+consistent with "this configuration never triggered it".
+
+64 layers, NF4, `stream_buffers=2`, `pin=True`, seq 128, 5 repeats.
+
+| | control (repair off) | variant 2 | resident reference |
+|---|---|---|---|
+| gradients exact | 8–12 / 256 | **256 / 256**, all 5 reps | — |
+| wrong layers (of 64) | 61–62 | **0** | — |
+| worst abs | 7.743083e-01 | **0.0** | — |
+| loss | 13.058376312 | 13.058376312 | 13.058376312 |
+| peak VRAM | 22 413.3 MiB | 23 064.2 MiB | 30 504.0 MiB |
+| median tok/s | 208.7 | 198.6 | — |
+| Linear4bit modules rewired | 0 | 448 | — |
+
+**Cost: +650.9 MiB (1.029x) and −4.8% throughput (0.951x).** Against the criteria
+set before the work: gradients exact at `pin=True, buffers=2` — yes, 256/256 five
+times over; peak VRAM within a couple of layers rather than O(model) — yes, +650.9
+MiB against a per-layer packed size of 239.8 MiB, i.e. **2.71 layer-equivalents**;
+throughput no worse than 1.5x — yes, 1.05x.
+
+For scale, the de-aliasing repair rejected in STEP 9 cost 4 220 -> 19 720 MiB. That
+figure comes from STEP 9's own harness and configuration, not from this gate's
+control, so the two peak columns are not directly subtractable — what transfers is
+the shape of the cost: O(model) there, a bounded transient here.
+
+**Both arms produced a loss identical to the resident reference, to every digit.**
+That is not an aside; it is the whole reason this defect was silent for three
+releases. A run whose gradients are wrong on 62 of 64 layers reports a healthy,
+bit-exact loss curve. Only a gradient comparison against a resident reference can
+see it, which is why that comparison is the gate.
+
+### The first run of this gate was vacuous, and the control is what caught it
+
+Run 1 reported `grads exact 0/0` on every repetition and a verdict of
+`variant2_gradients_all_exact: true`, because `n_exact == n_compared` is trivially
+satisfied by `0 == 0`. The cause: a streamed model's `named_parameters()` still
+carries the wrapper's `.inner.` segment — v0.72.1's fix was serialisation-only — so
+intersecting streamed names with resident names gives the EMPTY SET. The gate was
+comparing nothing and calling it a pass.
+
+What exposed it was not the green verdict but the line under it: the control had
+not broken. A control that cannot fail is the tell for a measurement that cannot
+measure. Fixed by keying gradients canonically (`.replace(".inner.", ".")`, as
+`repeat_backward.py` already did) and by making an empty intersection a hard
+`SystemExit` rather than a pass. That guard is now in the harness permanently.
+
+This is the third time in this session a control caught a false positive: the
+vacuous M=2048 numerics run, the negative control that rounded away, and this.
+
+### Caveats on these numbers
+
+- `sm_clock` was sampled at the END of each arm, not while busy, and both arms read
+  345 MHz — an idle reading. It is recorded for completeness but is NOT a
+  while-busy clock and no fraction-of-ceiling is computed from it.
+- Peak VRAM is `torch.cuda.max_memory_allocated`, per arm, after
+  `reset_peak_memory_stats`.
+- The control's repetition 1 differs from repetitions 2–5 (12/256 exact,
+  worst_abs 7.099325e-03, against 8/256 and 7.743083e-01). That matches STEP 9's
+  finding that the corruption depends on state carried between backward passes, and
+  it is why a single repetition is not a measurement here.
+- Measured at seq 128 on one model. The repair is shape-independent by
+  construction, but only 32B NF4 was gated end to end.
+
+Script: `variant2_gate.py`. Result: `/root/results/variant2_gate_32b.json`.
+Shipped as `install_dequant_forward` in `src/soup_cli/utils/layer_stream_runtime.py`,
+with a CI test asserting the streamed path makes zero `MatMul4Bit` calls and a
+resident control asserting the counter can see such calls at all.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

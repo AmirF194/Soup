@@ -71,7 +71,7 @@ cache that a control disproved, two inconclusive user-level attempts at the
 defect, an invalid pair of VRAM numbers, an experiment whose test arm crashed
 and could not answer the question it was built for, a wrong SM-clock column, an
 8-GPU benchmark so short it reported CPU offload as *faster* than no offload, a
-reading of the quality result that n=3 supported and n=5 destroyed, and eight
+reading of the quality result that n=3 supported and n=5 destroyed, and nine
 hypotheses about the defect's trigger that measurement rejected.
 
 ## Why this run exists
@@ -1516,6 +1516,96 @@ though this prototype's correctness is not.
 Hypothesis 2 (explicit re-fetch with gated release) and the
 `saved_tensors_hooks` alternative are **not attempted here** — both need changes
 inside `src/`, and `src/` currently carries another agent's uncommitted work.
+
+### Hypothesis 9 — re-fetch with release gated on the layer's own backward. **Rejected**
+
+The half Hypothesis 8 omitted, and the one DeepSpeed spends a gradient counter
+on. The signal is cheaper than a counter here: walking the backward L-1..0, the
+gradient w.r.t. layer *i*'s **input** is the last thing its backward produces, so
+`hidden_states.register_hook(...)` fires exactly at `PostBackwardFunction` time.
+
+Prototype: forward keeps the shipped rotating pool; the backward takes a buffer
+set from a free list of K, fills it synchronously from the same source, and
+returns it from the input hook. Exhausting the free list raises rather than
+silently reusing — silent reuse is the bug being fixed. Layer 0 gets no input
+gradient (frozen embeddings) so it has no "done" signal; it is last in the walk,
+so it simply holds its set to the end of the step.
+
+```
+control  k=0 -> WRONG 8/128  867.38 tok/s  peak 1132 MiB
+gated    k=2 -> WRONG 8/128  546.64 tok/s  peak 1612 MiB  {'acquire':510,'release':493,'hooked':493,'unhooked':17,'max_held':1}
+gated    k=4 -> WRONG 8/128  556.42 tok/s  peak 2094 MiB  {... 'max_held':1}
+gated    k=8 -> WRONG 8/128  542.97 tok/s  peak 3059 MiB  {... 'max_held':1}
+```
+
+The gate works mechanically — 493 hooks fired, 17 unhooked (one per step, layer
+0), and `k` is never the constraint. The telling number is **`max_held: 1`**:
+never more than one buffer set is held at a time, i.e. the "this layer is
+finished" signal always arrives before the next layer asks. So under the ZeRO-3
+model there is no overlap at all, and the release is not premature by that
+model's own definition — yet the gradients are unchanged.
+
+**Holding longer does not help either.** Delaying the release by N further
+layers (a ring on top of the free list) moves `max_held` 1 -> 2 -> 3 -> 4 exactly
+as intended and moves nothing else:
+
+```
+gated delay=0 -> WRONG 8/128  max_held 1
+gated delay=1 -> WRONG 8/128  max_held 2
+gated delay=2 -> WRONG 8/128  max_held 3
+gated delay=3 -> WRONG 8/128  max_held 4
+```
+
+### The result that reframes all of it: the count tracks the FORWARD pool
+
+Sweeping `stream_buffers` (the **forward** pool) while the backward re-fetches
+into its own gated buffers:
+
+| `stream_buffers` | control | gated backward |
+|---|---|---|
+| 2 | WRONG 8/128 | WRONG 8/128 |
+| 4 | WRONG 16/128 | *(see below)* |
+| 8 | WRONG 32/128 | WRONG 32/128 |
+
+The control column is the familiar `4 x buffers`. The gated column matches it at
+2 and at 8 — **the backward-side intervention does not move the outcome**. What
+governs how many layers come out right is the size of the pool the *forward* used,
+not what the backward reads. Every backward-side fix tried so far (separate pool,
+gated re-fetch, delayed release) is therefore aiming at the wrong half.
+
+### And a near-miss that repetition destroyed
+
+The `buffers=4` gated arm returned **`CORRECT 128/128`** on its first run — the
+success criterion, met. Repeating the identical configuration:
+
+```
+run 1 (original)  128/128   CORRECT
+run 2             100/128
+run 3              40/128
+run 4              64/128
+run 5              16/128
+run 6              40/128
+```
+
+Six observations of one configuration spanning 16 to 128. The `CORRECT` was
+luck. Had it been published on n=1 it would have read as a working fix.
+
+That scatter is itself a signal and it is worth separating from the aliasing
+diagnosis: the shipped control is **deterministic** (STEP 2b: reps 2-5 byte-identical),
+while this prototype is not. Nothing here added a CUDA stream — the fills are
+synchronous on the compute stream on purpose — but the extra per-layer copy
+changes the interleaving, and the outcome became run-dependent. This is the
+second bug class flagged in advance (cf. torchtune#1867) showing up as soon as
+the schedule is perturbed, and it is *not* the aliasing bug: it must not be
+folded into the same diagnosis.
+
+**Where this leaves the repair.** Both prototypes were built on the premise that
+the backward reads stale weights. The forward-pool tracking says that premise is
+at best incomplete. The remaining untested route is the one that does not depend
+on it at all — `torch.autograd.graph.saved_tensors_hooks`, packing a layer index
+and materialising in `unpack_hook`, which severs whatever reference the graph is
+actually holding rather than guessing where it points. Not attempted here: it
+needs changes inside `src/`, and `src/` is shared with another agent right now.
 
 ### Two more attempts on the NF4-only asymmetry, both negative
 

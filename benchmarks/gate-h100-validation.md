@@ -2634,6 +2634,77 @@ Also recorded because the record is the working one: a suspicion that Soup leake
 test — the orphans were the harness `SIGKILL`ing after 5 s, and Soup's shutdown is
 clean in ~6 s.
 
+## STEP 19 — convergence, second arm: NF4
+
+STEP 11 compared streamed against resident in **bf16**. Users and the preprint are
+about **NF4**, so the quality claim rested on the wrong quantisation. 8B sits below
+the ~165 MiB/layer defect threshold, so this arm is clean by construction — and the
+run's own panel confirms it: 2 x 113 MB buffers against a 3.60 GB pinned store over
+32 layers.
+
+Same protocol: 5 paired training subsets, one held-out set of 300 rows, judged by
+Soup's own `soup ship --task-mode metric`.
+
+| pair | resident NF4 | streamed NF4 | difference |
+|---|---|---|---|
+| s0 | 0.8766666666666667 | 0.8733333333333333 | +0.0033333333333334103 |
+| s1 | 0.8833333333333333 | 0.8766666666666667 | +0.006666666666666599 |
+| s2 | 0.89 | 0.8633333333333333 | +0.026666666666666727 |
+| s3 | 0.8566666666666667 | 0.8633333333333333 | −0.006666666666666599 |
+| s4 | 0.88 | 0.8833333333333333 | −0.0033333333333332993 |
+
+**Mean paired difference +0.005333333333333368** (sum of five, divided by five).
+Signs split 3 positive / 2 negative.
+
+The control is the within-arm spread, which is what that difference has to beat:
+
+| arm | mean | spread (max − min) |
+|---|---|---|
+| resident NF4 | 0.8773333333333333 | **0.033333333333333326** |
+| streamed NF4 | 0.8719999999999999 | **0.020000000000000018** |
+
+The between-arm difference is 0.16 of the resident spread and 0.27 of the streamed
+spread (both divisions), i.e. **1.6 items out of 300** (multiplication). Both arms
+clear the 0.42 task base and the 0.3333 majority-class floor.
+
+**Verdict: at NF4 the two are indistinguishable**, reproducing the bf16 result
+(+0.0060 against a 0.0133 spread) on the quantisation that actually ships.
+
+Leg 2 points the same way and is worth stating because it points *against* the
+convenient direction: 3 of 5 **resident** runs came back DON'T SHIP against 1 of 5
+streamed, and the single worst regression in the matrix is a resident run
+(−0.208333 on `mini_common_sense`). Every flagged regression is on a 24- or 40-item
+suite where one item is 4.2% / 2.5%. No streaming-specific failure mode.
+
+Judge control: all 10 runs report task base 0.42 and an identical benchmark base
+vector, and 0.42 matches the bf16 arm exactly — the judge is deterministic and
+unchanged across all four arms in this record.
+
+**The caveat that matters most, stated rather than buried:** the bf16 arm ran at
+`9117da1` and this arm at `a14ea3b`, and `985d6fc` (#331) landed between them,
+rewriting the streamed NF4 forward. So this arm measures the **post-#331** path.
+Both NF4 arms ran at the same revision, so the pairing is internally valid, but
+these numbers are **not revision-comparable to the bf16 arm's**.
+
+Two more limits on what this says: the judge loads a **bf16** base
+(`live_eval.load_model_and_tokenizer` takes no quantisation argument), so both arms
+are scored as an NF4-*trained* adapter on a bf16 base — identical for both, so the
+paired comparison holds, but the absolute accuracies are not NF4-inference numbers.
+And adapter-init seed is uncontrolled, which is exactly why the design is paired by
+subset; all 10 adapters have distinct md5s, so the pairing did its job.
+
+Also kept: a monitor loop reported a false `ABORTED` because `grep -c` emits
+`file:count` per file and broke a `paste -sd+ | bc` sum — a monitoring bug that
+looks identical to a real abort, and touched no measurement. And every SSH session
+dropped simultaneously mid-run while box uptime was unchanged; all 10 runs
+completed `rc=0`, which is the entire reason the harness runs under `setsid`.
+
+Wall-clock averaged 339.8 s resident against 336.0 s streamed, including model load
+and shard-cache read. That is **not** a throughput measurement and no tok/s claim is
+made from it.
+
+Raw: `/root/results/convergence_nf4_summary.json` and the per-run files.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

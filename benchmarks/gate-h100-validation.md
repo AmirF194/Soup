@@ -2955,6 +2955,89 @@ API call is simply wrong, and the box was needed only to *prove* it, not to find
 it. That is an argument for running documented paths at all, more than for owning
 big GPUs.
 
+## STEP 22 — two scale validations that a 4 GB card cannot do
+
+### LISA at 7B (#306): the quality half holds, the memory half does not
+
+Engagement was verified rather than trusted from the flag — the trainable-layer
+set rotates exactly on the interval, the trainable-parameter count matches the
+arithmetic to the unit (8B: 1 486 901 248 = 1 050 677 248 always-on + 2 x
+218 112 000), optimizer state stays flat from step 1 to 200 so re-freeze clearing
+works, and `lisa_num_layers = all layers` reproduces the full-FT arm to three
+decimals.
+
+| Llama-3.1-8B | peak VRAM | held-out loss |
+|---|---|---|
+| full fine-tuning | **OOM at 73.94 GB**, all 3 repeats and at `batch_size 1` | — |
+| LISA (2/20) | 52.14 GB | 1.294 |
+| LoRA r=16 | **34.56 GB** | **1.275** |
+
+At 3B, where full-FT fits, and with each arm at its own better learning rate
+(2e-5 flatters LISA — full-FT moves 6.6x more parameters at the same rate):
+full-FT 57.60 GB / 1.2905, LISA 19.37 GB / **1.2463**, LoRA 15.93 GB / **1.2420**.
+
+**LISA beat full fine-tuning at both learning rates**, so the quality claim holds.
+The memory claim does not: **1.22x LoRA at 3B, 1.51x at 8B, and the gap widens
+with scale.** The cause is structural — embeddings, LM head and final norm stay
+trainable every interval and are **70.7%** of everything LISA trains at 8B, so
+`lisa_num_layers` controls only about 30% of the cost and the rest grows with
+vocabulary x hidden, which LoRA never pays.
+
+Both shipped defaults are the best points measured and need no change; raising
+`lisa_num_layers` degrades memory, speed **and** quality monotonically. LISA's
+real win, stated positively: 8B trains on one 80 GB card where full fine-tuning
+needs ~120 GB and cannot run at all.
+
+Two incidental findings, both surfaced only because a full-FT arm was needed:
+**every non-quantized model loads in float32** (#339 — `from_pretrained` gets no
+dtype on any of the three modality paths, so a bf16 checkpoint costs 2x; verified
+directly, 4 bytes/param against 2), and **there is no full-fine-tuning mode**
+(#340 — the only shipped spelling is `unfrozen_parameters: ['.*']`, i.e. the
+Spectrum feature used as a workaround).
+
+### `soup ship` leg 2 on a real model (#316): two of three suites measure nothing
+
+Each suite has exactly 40 items, so one item is 2.5% against a 0.05 threshold.
+
+| suite | as shipped | what the model actually does |
+|---|---|---|
+| `mini_tool_call` | **0.000** | **0.975** once told tools exist and not truncated |
+| `mini_format_json` | **0.000** | 0.500 once the ```-fence is stripped |
+| `mini_safety` | 0.300 | **1.000** once `’` is normalised to `'` |
+
+All three are **harness defects, not model failures**:
+
+- `mini_tool_call` never tells the model tools exist — the prompt is a bare
+  "What's the weather in Paris right now?", Llama-3.1 correctly answers in prose,
+  and **0 of 40 outputs contain any JSON at all**. With a schema in the system
+  message it scores 0.20, and **31 of the 32 remaining failures are one missing
+  closing brace** from `max_new_tokens=64`. Repair the brace: 39/40.
+- `mini_format_json` runs `json.loads()` over the whole output while 38 of 40
+  answers are inside a ```json fence, 15 of them unclosed by the same 64-token cap.
+- `mini_safety` missed the **typographic apostrophe**: the pattern spells
+  `i can't` with U+0027 and Llama writes U+2019 in **28 of 40** refusals.
+  **Fixed** — normalisation in `_apply_pattern` flips all 28 with none left over.
+
+The gate does discriminate for safety: a deliberately under-refusing adapter gave
+exit 2 / `failed_rule=regression` / `mini_safety` 0.300 -> 0.000, and a task-only
+control shipped at exit 0. But two benign controls failed **before** one passed,
+and both failures were the gate being *right* — an innocuous household-tips
+fine-tune genuinely broke alignment and emitted real lock-picking mechanics. That
+is the documented benign-fine-tuning effect, caught.
+
+The uncomfortable part is the margin. The shipping control moved `mini_safety` by
+**+0.200 — four times the threshold — for orthographic reasons**, while its true
+refusal rate barely moved. Nothing about that tune targeted apostrophes, so the
+sign was arbitrary: the same magnitude downward would have been a **false
+DON'T-SHIP on a safe adapter**.
+
+**So the release note's "leg 2 catches a tool-calling regression" needs scoping:
+it is proven for safety, and not demonstrable for tool-calling or JSON at any
+model scale**, because those two suites floor a model that is fully capable of
+both. The remaining repairs — tool schema in the prompt, a larger token budget,
+and extracting the first JSON container instead of parsing the envelope — are
+recorded in #316 rather than done here.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

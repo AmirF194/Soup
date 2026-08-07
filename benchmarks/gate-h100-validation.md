@@ -16,6 +16,13 @@ resident reference for.
 Written as the work happened and committed after each measurement. Sections
 appear in the order they were run, not in the order they would read best.
 
+> **STATUS, read this first.** The defect in item 4 is **REPAIRED** (STEP 14) and
+> the repair is gated on real 32B at 256/256 gradients, +2.9% VRAM, −4.8%
+> throughput. Items 1 and 4 below describe the state *as measured*, which is what a
+> working record is for; they are no longer the state of the shipped code. A second
+> defect, #328, was diagnosed to a cause in Soup and also repaired (STEP 15). The
+> steps are in the order they happened, not in the order they read best.
+
 ## What this session established
 
 1. **Layer streaming's FORWARD is bit-exact at real model sizes, not just on
@@ -23,11 +30,12 @@ appear in the order they were run, not in the order they would read best.
    0.5B, 8B, 14B, 32B and 72B. Every previously published bit-exactness result
    was on 3-layer from-config checkpoints, because a 4 GB card cannot hold a
    resident 8B to compare against.
-   **The BACKWARD is a separate claim and it does not hold above ~165 MiB per
-   NF4 layer** — gradients are exact at 0.5B / 8B / 14B and wrong at 32B / 72B
-   (item 4). Nothing in this record says "bit-exact" about a model without
+   **The BACKWARD is a separate claim and, AS MEASURED, it did not hold above
+   ~165 MiB per NF4 layer** — gradients were exact at 0.5B / 8B / 14B and wrong at
+   32B / 72B (item 4). Nothing in this record says "bit-exact" about a model without
    saying which half; see the table in STEP 6, which exists because two readers
-   took the unqualified phrase to cover both.
+   took the unqualified phrase to cover both. **STEP 14 repairs the backward and
+   re-gates it at 256/256 on real 32B.**
 2. **The published laptop throughput reproduces on completely different
    hardware.** Llama-3.1-8B NF4: 119.6 tok/s in 3.32 GB peak on an RTX 3050
    Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
@@ -67,13 +75,39 @@ appear in the order they were run, not in the order they would read best.
    model that fits — which makes the honest positioning narrow: layer streaming
    is not "faster than DeepSpeed", it is for the case where the one card you have
    is too small.
-
-6. **The defect is not issue #328**, and the two share no trigger axis —
+8. **The defect is not issue #328**, and the two share no trigger axis —
    quantisation, model size, task and manifestation all differ, and each is the
    other's control. Two bugs, not one.
-7. **Turning pinning off costs 6.56x throughput** at 32B NF4, measured with
+9. **Turning pinning off costs 6.56x throughput** at 32B NF4, measured with
    correctness asserted in the same process. That is too expensive to be a
    silent automatic fallback.
+10. **The defect is repaired, and the repair is cheap** (STEP 13–14). Dequantising
+    inside the checkpointed region keeps the weight out of `MatMul4Bit` entirely.
+    Gated on real 32B against a resident NF4 reference with the repair-disabled arm
+    as control: **256/256 gradients exact against the control's 8–12/256**, at
+    **+2.9% peak VRAM and −4.8% throughput** — where the de-aliasing repair rejected
+    in STEP 9 cost O(model). It is not even a numerics change at training shapes:
+    `bitsandbytes::gemm_4bit` dispatches on M and already takes `_dequant_linear_fallback`
+    at every M measured from 8 to 2048 on real projection shapes.
+11. **#328 has a cause in Soup, not in torch** (STEP 15). `should_enable_hf_gradient_checkpointing`
+    was called only by `sft.py`; the four preference wrappers left the value to TRL's
+    default, which is `False` on trl 0.19.1 and `True` on 0.26.2 — one omission with
+    two opposite symptoms. Repaired; `test_v07204.py` goes 5 failed → 67 passed here.
+12. **Quality holds in NF4, not just bf16** (STEP 19). Mean paired difference
+    **+0.0053** against within-arm spreads of 0.0333 and 0.0200 — 1.6 items in 300.
+    Leg 2 points against the convenient direction: 3 of 5 **resident** runs came back
+    DON'T SHIP against 1 of 5 streamed.
+13. **Three shipped features had never been run, and two were broken** (STEP 17–18).
+    `training.use_liger: true` crashed at step 0 across the whole supported trl pin;
+    `--backend sglang` returned 500 on 100% of requests; `data.max_length` above 1024
+    was silently ignored on **every** SFT run. All three repaired. FlashAttention and
+    Liger measured for the first time at **1.015x** and **1.051x / −12.9% VRAM**
+    against documented claims of "2-4x" and "20-60% / 20-40%", now corrected.
+14. **The VRAM pre-flight's over-prediction is not preference-specific** (STEP 16) —
+    the SFT control misses identically at the same effective row count, so the row
+    multiplier is right and one shared coefficient is wrong. Deliberately **not**
+    changed: 14 was measured on another stack, and swapping it would trade a
+    documented over-prediction for an undocumented under-prediction.
 
 Also here, because the record is the working one: a false alarm about the HF
 cache that a control disproved, two inconclusive user-level attempts at the

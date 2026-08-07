@@ -2739,6 +2739,87 @@ made from it.
 
 Raw: `/root/results/convergence_nf4_summary.json` and the per-run files.
 
+## STEP 20 — #77: the multi-GPU matrix, and the entry point that never worked
+
+Qwen2.5-0.5B-Instruct, LoRA r16 on q/k/v/o, bf16, batch 4/device, max_length 512,
+800 rows x 2 epochs, 4xH100. Every successful arm processed **exactly 167 928
+tokens**, so tok/s is directly comparable. SM clock 1980 MHz median while busy on
+every arm.
+
+| arm | started | loss | tok/s | peak VRAM/rank | sharding verified how | adapter |
+|---|---|---|---|---|---|---|
+| control, 1 GPU | yes | 3.3366 → 0.0001 | 4278.9 | 4240 MiB | `DistributedType.NO`, 496 195 456 params local | **ALIVE 96/96** |
+| DDP, 4 GPU | yes | 3.3422 → 0.0002 | 12083.5 | 4246–4248 | `MULTI_GPU`, params replicated | ALIVE 96/96 |
+| `--fsdp full_shard` | yes | 3.3461 → 0.0002 | 2944.7 | 2068 | **217x `FullyShardedDataParallel`**, 124 048 864/rank = 496 195 456 / 4 **exactly** | ALIVE 96/96 |
+| `--fsdp shard_grad` | yes | 3.3479 → 0.0002 | 3403.4 | 2727 | same, 124 048 864/rank | ALIVE 96/96 |
+| `--fsdp full_offload` | yes | 3.3441 → 0.0002 | 2609.1 | 1964 | same, 124 048 864/rank | ALIVE 96/96 |
+| `use_fsdp2_compile` + full_shard | yes | 3.3444 → 0.0002 | 957.7 | 1964 | "FSDP2 enabled" x4 + VRAM signature | **DEAD 0/96** |
+| `--deepspeed zero2` | yes | **crash @ step 1** | — | 2221–2233 | `DEEPSPEED`, stage 2 | none |
+| `--deepspeed zero++` | yes | **crash in forward** | — | 2153 | `DEEPSPEED`, stage 3 | none |
+| zero3 (re-run as contrast) | yes | **crash @ step 1** | — | 2153 | `DEEPSPEED`, stage 3 | none |
+| zero2 with LoRA replaced by full FT | yes | 3.1811 → 0.0 | 6667.3 | 4105–4442 | `DEEPSPEED`, stage 2 | n/a |
+
+Sharding was **verified, not assumed** — an external `sitecustomize` probe on
+PYTHONPATH (no repo edits) dumping per-rank distributed type, wrapper classes and
+local parameter storage at the first step. The FSDP arms show local params equal to
+the total divided by 4 **exactly**, which is the difference between "FSDP engaged"
+and "the flag was accepted".
+
+### The blocker: `soup train --gpus N` had never launched
+
+```
+accelerate launch --num_processes 4 /root/venv/bin/python -m soup_cli.cli train ...
+  File "/root/venv/bin/python", line 1
+    ELF
+SyntaxError: source code cannot contain null bytes
+```
+
+`accelerate launch` takes a **script path**, or a module behind `--module`. Soup
+passed `sys.executable`, so accelerate parsed the Python ELF binary as source and
+every rank died before the trainer existed. **Every arm in the table above had to be
+launched by hand**, in the form the auto-reexec was trying to produce. **Fixed.**
+
+That is the whole documented multi-GPU entry point, and it had never worked. It is
+also a good argument for this session existing: no amount of single-GPU CI can see
+it, because at `num_processes == 1` the launcher wrapper is skipped entirely and the
+argv is exec'd directly — which is exactly why the fix keeps that path untouched and
+tests it as a control.
+
+### Three more defects, filed rather than fixed
+
+- **`use_fsdp2_compile` writes a DEAD adapter, exit 0** (#335). Keys carry
+  torch.compile's `_orig_mod.` prefix, `PeftModel.from_pretrained` matches none,
+  and `lora_B` stays at zero init — **0/96 non-zero**, reproduced 3/3, while the
+  paired non-compile run writes 96/96. A completed run that produces a file which
+  silently does nothing is this project's worst failure shape.
+- **Every DeepSpeed stage fails with LoRA** (#336). HF builds 2 param groups and
+  with LoRA the no-decay group is **empty** (`[192, 0]`, `base_lrs` length 2);
+  DeepSpeed drops it, leaving 1 group against 2 base_lrs, and torch 2.13's
+  `zip(..., strict=True)` raises. **The control isolates it:** the same config with
+  LoRA replaced by full fine-tuning trains to completion. So the trigger is
+  DeepSpeed **+ LoRA** — which also explains why an earlier ZeRO-3 run passed: it
+  was full-FT.
+- **`zero++` fails earlier and independently**, on dtype: the preset sets
+  `zero_quantized_weights/gradients` (fp16) against a bf16 model. Fixing the param
+  groups alone would not make it run. It also hardcodes
+  `zero_hpz_partition_size: 8` while running 4 GPUs.
+- Low: `--no-reexec` prints a hint that **drops the user's own flags** —
+  `--gpus 4 --fsdp full_shard --no-reexec` suggests a command without `--fsdp`, so
+  following it literally trains without FSDP.
+
+### What these numbers do NOT say
+
+FSDP is **slower than one GPU here** (0.61–0.80x), and that is expected rather than
+damning: a 0.5B LoRA model fits one H100 comfortably, so sharding buys memory, not
+speed, at this size. The compile arm's 0.22x includes torch.compile warm-up inside a
+100-step run. The dataset is templated synthetic text and loss saturates near zero
+everywhere — it establishes "the plumbing works", nothing about quality.
+
+`--fsdp offload` being rejected is **not** a bug: the accepted names are
+`full_shard, shard_grad, full_offload` and the refusal names them.
+
+Raw: `/root/results/issue77_*`.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

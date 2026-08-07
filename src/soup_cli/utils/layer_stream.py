@@ -83,13 +83,52 @@ SUPPORTED_STREAM_ARCHS = (
     "phi3",
 )
 
-#: VRAM bytes per logit element at peak. **Measured (v0.72.3 GATE 2), not
-#: derived**: ``transformers``' ``ForCausalLMLoss`` holds four copies live at
-#: once — the bf16 logits (2), the fp32 upcast (4), log-softmax's fp32 output
-#: (4) and the fp32 gradient (4). v0.72.0 charged 6 from first principles, which
-#: under-predicts this term by 2.33x — a ~5 GB error on a 152k-vocab model at
-#: batch 8, where the logits tensor is 146x the entire buffer pool.
-LOGITS_BYTES_PER_ELEMENT = 14
+#: The loss path's own arithmetic, in VRAM bytes per logit element. **Measured
+#: stage by stage (issue #327), not derived.** ``ForCausalLMLoss`` upcasts to
+#: fp32, hands the view to ``cross_entropy`` and returns; the residency at each
+#: stage, per element, excluding the source logits tensor:
+#:
+#:   after the loss returns   4  — only log-softmax's saved fp32 output survives;
+#:                                 the fp32 upcast is freed with the local
+#:   backward peak           12  — that saved output plus the two transient fp32
+#:                                 gradient buffers (nll -> log-softmax)
+#:
+#: So the peak holds THREE fp32 logits-shaped buffers, not "upcast + softmax +
+#: grad" as v0.72.3 recorded — the totals agree, the decomposition did not.
+#: Measured 12.000000 exactly, spread 0.00e+00 over 3 repeats, at every
+#: (vocab, tokens) probed, and **byte-identical under torch 2.5.1 and 2.13.0
+#: and under trl 0.19.1 and 0.26.2** — this term is not stack-dependent.
+LOGITS_LOSS_BYTES_PER_ELEMENT = 12
+
+#: One further bf16 logits-shaped tensor, charged unconditionally.
+#:
+#: This is the whole of the inter-stack disagreement in issue #327. The v0.72.3
+#: grid (RTX 3050 / Windows) needs 13.869-13.901 bytes per element across its
+#: ten rows; the H100 grid fits 12.311, and a real ``trl`` training step
+#: measured on that box marginals at 12.0955 (12.0821 once the probe fixture's
+#: own per-token cost is removed). The excess the RTX grid requires over that
+#: is **1.8031 bytes per element**, fitted across its 3.1x vocab contrast with a
+#: flat residual of 21.0 bytes per token — i.e. the excess is vocab-scaled, the
+#: size of one bf16 copy of the logits, and not a mis-modelled activation term.
+#: A single-variable control reproduces it directly: holding the model
+#: output object across ``backward()`` instead of letting it die with the local
+#: costs **+2.0000 bytes per element**, at 5 of 6 (vocab, tokens) cells and
+#: +2.0480 at the sixth (allocator rounding on a 32k-vocab, 256-token cell).
+#:
+#: What retains it on that stack is NOT identified. torch, trl and transformers
+#: were each swapped to the RTX grid's versions on the H100 box and the real
+#: training step measured byte-identical, so none of them is the cause. Until
+#: something can OBSERVE the retention at pre-flight — a synthetic probe cannot,
+#: it sees only its own reference — this stays charged: dropping it under-
+#: predicts 10 of the 10 v0.72.3 rows by up to 10.49%, and on Windows an
+#: under-prediction does not raise, it silently spills to host memory.
+LOGITS_RETENTION_BYTES_PER_ELEMENT = 2
+
+#: VRAM bytes per logit element at peak: the loss arithmetic plus the retained
+#: copy. v0.72.0 charged 6 from first principles, which under-predicts this term
+#: by 2.33x — a ~5 GB error on a 152k-vocab model at batch 8, where the logits
+#: tensor is 146x the entire buffer pool.
+LOGITS_BYTES_PER_ELEMENT = LOGITS_LOSS_BYTES_PER_ELEMENT + LOGITS_RETENTION_BYTES_PER_ELEMENT
 #: Forward only, no loss: just the bf16 logits.
 LOGITS_BYTES_PER_ELEMENT_NO_LOSS = 2
 
@@ -484,7 +523,12 @@ def estimate_epoch_seconds(tokens: int, tokens_per_sec: float) -> float:
 
 
 def estimate_logits_bytes(
-    *, vocab_size: int, seq_len: int, batch_size: int = 1, upcast_fp32: bool = True
+    *,
+    vocab_size: int,
+    seq_len: int,
+    batch_size: int = 1,
+    upcast_fp32: bool = True,
+    bytes_per_element: Optional[float] = None,
 ) -> int:
     """plan P5: logits, not weights, OOM you first on a small card.
 
@@ -493,12 +537,100 @@ def estimate_logits_bytes(
     suggests. At Qwen2.5-0.5B (vocab 151936), batch 8, S=512 this single term is
     8.71 GB — 146x the whole buffer pool — so a pre-flight that budgets only
     weights and buffers green-lights a config that cannot run.
+
+    ``bytes_per_element`` accepts a stack measurement from
+    :func:`calibrated_logits_bytes_per_element`. It is **floored at the shipped
+    constant and can therefore only raise the budget**, which is the only
+    direction the evidence supports: the loss arithmetic is measurable at
+    pre-flight, the retention (issue #327) is not, so a reading below the
+    constant is a probe that could not see the retention rather than a stack
+    that does not pay it.
     """
     if vocab_size <= 0 or seq_len <= 0 or batch_size <= 0:
         raise ValueError("vocab_size, seq_len and batch_size must all be positive")
     elements = vocab_size * seq_len * batch_size
-    per = LOGITS_BYTES_PER_ELEMENT if upcast_fp32 else LOGITS_BYTES_PER_ELEMENT_NO_LOSS
-    return elements * per
+    per: float = LOGITS_BYTES_PER_ELEMENT if upcast_fp32 else LOGITS_BYTES_PER_ELEMENT_NO_LOSS
+    if bytes_per_element is not None:
+        if not math.isfinite(bytes_per_element):
+            raise ValueError(f"bytes_per_element must be finite; got {bytes_per_element}")
+        per = max(per, bytes_per_element)
+    return math.ceil(elements * per)
+
+
+def measure_logits_loss_bytes_per_element(
+    *,
+    vocab_size: int = 8192,
+    tokens: Tuple[int, int] = (1024, 2048),
+    device: Optional[str] = None,
+) -> Optional[float]:
+    """Measure THIS stack's loss-path cost per logit element, or ``None``.
+
+    Reports the **marginal** slope between two token counts, so the fixed
+    overhead of the probe itself cancels rather than being modelled. The source
+    logits tensor is allocated *before* the peak is reset, so what comes back is
+    the loss arithmetic alone — :data:`LOGITS_LOSS_BYTES_PER_ELEMENT`, not the
+    retained copy on top of it.
+
+    Costs one transient allocation of ``14 * vocab_size * max(tokens)`` bytes —
+    96 MiB at the defaults. Returns ``None`` rather than raising when there is no
+    CUDA device or the probe cannot run: a pre-flight that dies because its own
+    instrument failed is worse than one that falls back to the shipped constant.
+
+    Measured 12.000000 with spread 0.00e+00 over 3 repeats at each of
+    (8192, 1024->2048), (4096, 1024->2048) and (16384, 512->1024).
+    """
+    if vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive; got {vocab_size}")
+    small, large = tokens
+    if small <= 0 or large <= small:
+        raise ValueError(f"tokens must be an increasing positive pair; got {tokens!r}")
+    try:  # pragma: no cover - exercised only where torch + CUDA exist
+        import torch
+        from transformers.loss.loss_utils import ForCausalLMLoss
+    except Exception:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    where = device or "cuda"
+
+    def _peak(count: int) -> int:
+        torch.cuda.empty_cache()
+        labels = torch.randint(0, vocab_size, (1, count), device=where)
+        logits = torch.randn(
+            1, count, vocab_size, dtype=torch.bfloat16, device=where, requires_grad=True
+        )
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(where)
+        base = torch.cuda.memory_allocated(where)
+        loss = ForCausalLMLoss(logits, labels, vocab_size)
+        loss.backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated(where) - base
+        del loss, logits, labels
+        torch.cuda.empty_cache()
+        return peak
+
+    try:  # pragma: no cover - exercised only where torch + CUDA exist
+        low, high = _peak(small), _peak(large)
+    except Exception:
+        return None
+    return (high - low) / (vocab_size * (large - small))
+
+
+def calibrated_logits_bytes_per_element(**kwargs: Any) -> float:
+    """The shipped constant, raised if this stack's loss path costs more.
+
+    Never lowered. The measurable half is the loss arithmetic; the retention
+    term is charged on top of whatever is measured, because no synthetic probe
+    can observe whether the training loop that will actually run still holds the
+    logits when the loss backward peaks (issue #327). A stack whose loss path
+    grew a fourth fp32 buffer would otherwise be under-budgeted by 12.5% with no
+    guard at all, and under-prediction is the failure that does not raise.
+    """
+    measured = measure_logits_loss_bytes_per_element(**kwargs)
+    if measured is None:
+        return float(LOGITS_BYTES_PER_ELEMENT)
+    return max(float(LOGITS_BYTES_PER_ELEMENT), measured + LOGITS_RETENTION_BYTES_PER_ELEMENT)
 
 
 def estimate_activation_bytes(
@@ -559,6 +691,7 @@ def estimate_stream_peak_vram(
     seq_len: int,
     batch_size: int = 1,
     dtype: str = "bfloat16",
+    logits_bytes_per_element: Optional[float] = None,
 ) -> int:
     """Predicted ``torch.cuda.max_memory_allocated()`` for a streaming step.
 
@@ -577,6 +710,10 @@ def estimate_stream_peak_vram(
     sit outside the caching allocator (0.85 GB on the dev box, which also drives
     a display), so the fit decision compares this against *measured free VRAM*
     rather than against the card's nameplate size.
+
+    ``logits_bytes_per_element`` forwards a stack measurement from
+    :func:`calibrated_logits_bytes_per_element`; it is floored at the shipped
+    constant, so passing it can only raise the prediction.
     """
     return (
         layer_bytes * buffers
@@ -592,7 +729,10 @@ def estimate_stream_peak_vram(
             dtype=dtype,
         )
         + estimate_logits_bytes(
-            vocab_size=vocab_size, seq_len=seq_len, batch_size=batch_size
+            vocab_size=vocab_size,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            bytes_per_element=logits_bytes_per_element,
         )
     )
 

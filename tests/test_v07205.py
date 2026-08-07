@@ -648,3 +648,90 @@ class TestNoReexecHintKeepsTheUsersFlags:
         if "Multi-GPU launch required" not in out:
             pytest.skip("did not reach the advisory (config/data validation ran first)")
         assert "--no-reexec" not in out, out
+
+
+# ==========================================================================
+# Liger was silently inert for every local model path
+# ==========================================================================
+class TestLigerDetectsArchitectureFromTheConfig:
+    """`apply_liger_kernel` matched on a SUBSTRING OF THE MODEL PATH.
+
+    It first tried `AutoLigerKernelForCausalLM._apply_liger_kernel(model_name)` —
+    which **does not exist** in liger-kernel 0.8.1 (`AttributeError: type object
+    ... has no attribute '_apply_liger_kernel'`, verified on the box) — and then
+    fell back to `_apply_liger_manual(model_name.lower())`, which looks for
+    "llama" / "mistral" / "qwen2" and friends **in the name**.
+
+    So for any model loaded from a local directory the name carries no
+    architecture, nothing matched, and the run printed "no matching architecture
+    found" and trained without Liger. Silently, on a flag the user explicitly set.
+
+    The architecture is in the config, where it cannot be renamed away: liger 0.8.1
+    exposes a module-level `_apply_liger_kernel(model_type: str)`, and
+    `AutoConfig.model_type` is exactly that string.
+    """
+
+    def _fake_liger(self, monkeypatch, calls):
+        """Inject a stand-in liger so this runs where liger is not installed —
+        which is the machine the maintainer develops on, and the reason the defect
+        survived."""
+        import sys
+        import types
+
+        mod = types.ModuleType("liger_kernel.transformers")
+
+        def _apply(model_type, **kwargs):
+            calls.append(model_type)
+
+        mod._apply_liger_kernel = _apply
+        mod._apply_liger_kernel_to_instance = lambda model, **kw: None
+        parent = types.ModuleType("liger_kernel")
+        parent.transformers = mod
+        monkeypatch.setitem(sys.modules, "liger_kernel", parent)
+        monkeypatch.setitem(sys.modules, "liger_kernel.transformers", mod)
+        return calls
+
+    def test_a_local_path_with_no_architecture_in_its_name_is_still_detected(
+        self, tmp_path, monkeypatch
+    ):
+        from test_v07202 import _tiny_llama_dir
+
+        from soup_cli.utils import liger as liger_mod
+
+        weights, _, _ = _tiny_llama_dir(tmp_path)
+        assert "llama" not in weights.lower(), (
+            "the fixture path must NOT contain the architecture name, or this test "
+            "passes for the substring matcher too and proves nothing"
+        )
+        calls: list = []
+        self._fake_liger(monkeypatch, calls)
+        monkeypatch.setattr(liger_mod, "check_liger_available", lambda: True)
+
+        assert liger_mod.apply_liger_kernel(weights) is True
+        assert calls == ["llama"], calls
+
+    def test_an_unknown_architecture_still_reports_false(self, tmp_path, monkeypatch):
+        """CONTROL. Detection by config must not turn into "always True" — an
+        architecture liger does not support has to keep reporting False so the
+        caller keeps printing its warning and does not set the TRL flag."""
+        import json
+
+        from soup_cli.utils import liger as liger_mod
+
+        directory = tmp_path / "weird"
+        directory.mkdir()
+        (directory / "config.json").write_text(
+            json.dumps({"model_type": "not_a_real_arch"}), encoding="utf-8"
+        )
+        calls: list = []
+        self._fake_liger(monkeypatch, calls)
+
+        def _raise(model_type, **kwargs):
+            raise NotImplementedError(model_type)
+
+        import sys
+
+        sys.modules["liger_kernel.transformers"]._apply_liger_kernel = _raise
+        monkeypatch.setattr(liger_mod, "check_liger_available", lambda: True)
+
+        assert liger_mod.apply_liger_kernel(str(directory)) is False

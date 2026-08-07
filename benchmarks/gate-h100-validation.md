@@ -120,11 +120,29 @@ appear in the order they were run, not in the order they would read best.
     The full-fine-tuning control trains to completion, which both isolates the
     trigger and explains why an earlier ZeRO-3 run passed.
 
-**Seven defects were repaired in this session** — #331, #328, the `use_liger` crash,
-the silent `max_length` cap, SGLang's total failure, the multi-GPU launcher, and
-#335's dead adapter — and **five more were filed with reproducers** (#332, #333,
-#334, #336, plus the `--no-reexec` hint). Every one of them was found by running
-something that had never been run, not by reading code.
+### Why this session needed someone else's hardware
+
+**Seven defects were repaired** — #331, #328, the `use_liger` crash, the silent
+`max_length` cap, SGLang's total failure, the multi-GPU launcher, and #335's dead
+adapter — and **five more were filed with reproducers** (#332, #333, #334, #336,
+plus the `--no-reexec` hint). **Every one of them was found by running something
+that had never been run, not by reading code.**
+
+That sentence is the session's actual result, more than any single number in it.
+Four of the twelve are features the project ships and documents that had **never
+executed once**: `--backend vllm`, `--backend sglang`, FlashAttention, Liger. Three
+more could not fail on the maintainer's machine even in principle — the multi-GPU
+launcher is skipped entirely at one process, #328's sign inverts on the older trl,
+and #331 needs an NF4 layer larger than a 4 GB card can hold. No amount of care on
+the dev box reaches them; only different hardware does.
+
+The corollary is uncomfortable and worth keeping: a green test suite measured
+neither the features that had never run nor the paths that cannot run on one card.
+Two of the twelve — the dead adapter and the silent `max_length` cap — produced
+successful, exit-0 runs the whole time.
+
+The upstream half of #331 is filed as
+[bitsandbytes-foundation/bitsandbytes#2034](https://github.com/bitsandbytes-foundation/bitsandbytes/issues/2034).
 
 Also here, because the record is the working one: a false alarm about the HF
 cache that a control disproved, two inconclusive user-level attempts at the

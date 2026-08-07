@@ -1157,14 +1157,26 @@ class TestNF4StreamedModel:
 #: The window boundary and the exactness boundary coincide, which is what identifies
 #: the dispatch as the cause. ``TestNF4ParityOnCuda`` keeps the literal ``== 0.0``.
 #:
-#: On CPU there is no such token count: measured 1.9484907389e-03 at 8 tokens and
-#: 1.9717328250e-03 flat from 32 through 256 (bitsandbytes 0.50.0, torch 2.13). The
-#: fixture cannot leave the window because it is not a window -- it is a different
-#: kernel for the inference path. So this bound is set just above the measured
-#: value, and a REGRESSION past it still fails.
+#: On CPU there is no such token count. The fixture cannot leave the window because
+#: it is not a window -- it is a different kernel for the inference path.
 #:
-#: If this ever needs raising, that is a finding, not a maintenance chore.
-_CPU_NF4_INFERENCE_PATH_TOLERANCE = 2.5e-3
+#: THIS BOUND IS AN INTER-STACK ENVELOPE, NOT A PHYSICAL CONSTANT, and the first
+#: version of it was wrong for exactly the reason worth recording: it was set at
+#: 2.5e-3 from ONE machine (an H100's CPU backend, 1.9484907389e-03 at 8 tokens and
+#: 1.9717328250e-03 flat from 32 through 256, bitsandbytes 0.50.0 / torch 2.13) and
+#: CI's stack then measured 2.5089234113693237e-03 and failed. Transplanting a
+#: measured constant from one stack to another is the same mistake this project
+#: refused to make with ``LOGITS_BYTES_PER_ELEMENT``, and it deserved to fail here.
+#:
+#: So it is now an envelope over both observed stacks with room, chosen so that the
+#: quantity it is really bounding -- a dequantisation-path difference, whose scale is
+#: NF4's own granularity -- stays inside it, while a REGRESSION (an order of
+#: magnitude, a wrong-layer gradient, a broken substitution) still fails loudly.
+#:
+#: Observed: 1.97e-03 (H100 CPU backend), 2.51e-03 (CI). Bound: 5e-3.
+#: Raising this again is a finding, not a maintenance chore -- and if it is raised,
+#: measure BOTH stacks again rather than the one in front of you.
+_CPU_NF4_INFERENCE_PATH_TOLERANCE = 5e-3
 
 
 class TestNF4BitExactVsResident:

@@ -114,3 +114,83 @@ class TestStreamedNF4AvoidsMatMul4Bit:
             "captures the packed weight outside save_for_backward and therefore aliases "
             "the buffer pool across the checkpoint boundary (#331)"
         )
+
+
+# ==========================================================================
+# #328 — HF gradient checkpointing must stay OFF on a streamed preference run
+# ==========================================================================
+PREFERENCE_TASKS = ("dpo", "orpo", "simpo", "kto")
+
+
+class TestStreamedPreferenceLossesDisableHfGradientCheckpointing:
+    """``StreamedDecoderLayer`` already wraps every layer in
+    ``checkpoint(use_reentrant=False)``. ``should_enable_hf_gradient_checkpointing``
+    exists so the HF Trainer does not ALSO checkpoint a streamed model — but only
+    ``sft.py`` ever consulted it. The four preference wrappers never did, and TRL's
+    ``DPOConfig`` / ``ORPOConfig`` / ``CPOConfig`` / ``KTOConfig`` all default
+    ``gradient_checkpointing=True``, so it arrived switched on through the default
+    rather than through anything the user wrote.
+
+    On torch 2.5.1 that is the documented ~1.5x silent double-recompute. On torch
+    2.13 + CUDA it is fatal: HF's checkpoint wraps the INNER ``LlamaDecoderLayer``,
+    whose recompute runs long after ``functional_call``'s reparametrisation context
+    has exited and restored the ``meta`` placeholders, so the recompute multiplies a
+    ``meta`` ``input_layernorm.weight`` by a real ``cuda`` activation::
+
+        RuntimeError: Tensor on device cuda:0 is not on the expected device meta!
+
+    Measured on 8xH100: all four preference losses fail, SFT passes, and forcing the
+    flag back off makes the DPO failure disappear with the wrapper's own checkpoint
+    still active — which is what makes HF's checkpointing the cause rather than a
+    correlate.
+    """
+
+    @pytest.mark.parametrize("task", PREFERENCE_TASKS)
+    def test_streaming_turns_hf_gradient_checkpointing_off(self, task, tmp_path, monkeypatch):
+        from test_v07204 import _build_streamed_wrapper
+
+        wrapper, _, _ = _build_streamed_wrapper(
+            tmp_path, monkeypatch, task=task, device="cpu"
+        )
+        assert wrapper.trainer.args.gradient_checkpointing is False, (
+            f"{task}: HF gradient checkpointing reached the Trainer switched ON for a "
+            "streamed run, so HF checkpoints the inner decoder layer as well as the "
+            "streaming wrapper. On torch 2.13 CUDA that recompute sees the restored "
+            "meta placeholders and dies with 'expected device meta' (#328)"
+        )
+
+    @pytest.mark.parametrize("asked", [True, False])
+    def test_a_non_streaming_run_gets_what_the_config_asked_for(
+        self, asked, tmp_path, monkeypatch
+    ):
+        """CONTROL, and the second half of the same defect.
+
+        Two things have to be true at once, and only asserting one of them would
+        hide the other:
+
+        * the repair must switch HF checkpointing off ONLY where streaming already
+          checkpoints — pinning the flag to a constant ``False`` would satisfy the
+          streamed test above while silently removing checkpointing from every
+          ordinary DPO run;
+        * the wrapper must not inherit TRL's default either way.
+
+        Stating it as "the config value survives to the Trainer" is deliberately
+        version-independent. TRL's own default for these configs is NOT stable —
+        measured ``False`` on trl 0.19.1 and ``True`` on trl 0.26.2 — so asserting
+        the default directly would be red on one supported stack and green on the
+        other while the actual bug (the wrapper never setting it) went unnoticed on
+        both. On the older stack a user's explicit ``gradient_checkpointing: true``
+        was being silently dropped; on the newer one TRL's ``True`` arrived
+        uninvited. One cause, two opposite symptoms.
+        """
+        from test_v07204 import _build_streamed_wrapper
+
+        wrapper, _, _ = _build_streamed_wrapper(
+            tmp_path,
+            monkeypatch,
+            task="dpo",
+            device="cpu",
+            stream_layers=False,
+            gradient_checkpointing=asked,
+        )
+        assert wrapper.trainer.args.gradient_checkpointing is asked

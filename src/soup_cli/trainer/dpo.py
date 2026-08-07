@@ -147,6 +147,8 @@ class DPOTrainerWrapper(StreamingSetupMixin):
         warmup_steps = int(total_steps * tcfg.warmup_ratio)
 
         # --- DPO config ---
+        from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
+
         dpo_config = DPOConfig(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
@@ -154,6 +156,18 @@ class DPOTrainerWrapper(StreamingSetupMixin):
             gradient_accumulation_steps=tcfg.gradient_accumulation_steps,
             learning_rate=tcfg.lr,
             warmup_steps=warmup_steps,
+            # #328 — StreamedDecoderLayer already wraps every layer in
+            # checkpoint(use_reentrant=False). Letting HF check-point the INNER
+            # decoder layer as well recomputes it after functional_call's
+            # reparametrisation context has exited and restored the `meta`
+            # placeholders, which on torch 2.13 + CUDA dies with "Tensor on device
+            # cuda:0 is not on the expected device meta!". Passing this explicitly
+            # also stops the value being decided by TRL's default, which is not
+            # stable across versions (False on trl 0.19.1, True on 0.26.2) and was
+            # silently dropping the user's own setting on the older one.
+            gradient_checkpointing=should_enable_hf_gradient_checkpointing(
+                tcfg.gradient_checkpointing, stream_layers=tcfg.stream_layers
+            ),
             weight_decay=tcfg.weight_decay,
             max_grad_norm=tcfg.max_grad_norm,
             optim=tcfg.optimizer,

@@ -3851,10 +3851,17 @@ comparison and puts both modes on every card.
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK
   section for the measurement taken and the decision not to bypass the guard.
-- **The NF4 defect has a diagnosis but no repair.** The mechanism is aliasing
-  (STEP 9), and both obvious workarounds were measured and rejected: de-aliasing
-  costs 8x peak VRAM, `pin=False` costs 7.41x throughput. Filed as #331 with the
-  synthetic reproducer.
+- **The NF4 defect is REPAIRED, and what is left open is narrower than the defect.**
+  The mechanism is aliasing (STEP 9); the two obvious workarounds were measured and
+  rejected (de-aliasing costs 8x peak VRAM, `pin=False` costs 7.41x throughput), and
+  the repair that shipped is variant 2 (STEP 13–14) — dequantise inside the
+  checkpointed region, which keeps the weight out of `MatMul4Bit` entirely. Gated on
+  **real 32B NF4 against a resident NF4 reference with the repair-disabled arm as
+  control: 256/256 gradients exact against that control's 8–12/256, at +2.9% peak
+  VRAM and −4.8% throughput.** What remains open is narrower than the defect was:
+  **72B was not re-run after the fix**, and the two questions in the next bullets —
+  why it is NF4-only and why its boundary is so sharp — are untouched by the repair.
+  #331 carries the synthetic reproducer.
 - **Why the defect is NF4-only, and why its boundary is so sharp, is not
   explained.** The bf16 path aliases the pool identically and its **backward** is
   exact at 3.9x the bytes. Seven hypotheses were tested and rejected; none

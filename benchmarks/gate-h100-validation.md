@@ -3094,6 +3094,138 @@ exposes no training-seed knob at all — every run is `seed=42, data_seed=None`
 between-arm difference must beat; that spread is currently missing its largest
 natural source.
 
+## STEP 24 — three repairs, and the test-design fault all three share
+
+None of this is a measurement. These are three defects found and fixed the morning
+after STEP 23 — two of them things this record itself surfaced — and they are
+grouped because of what they turn out to have in common, which is stated at the end
+rather than assumed at the start.
+
+### `training.reward_model` never worked on the trl a fresh install resolves (#300, `3830fa0`)
+
+`_trl_has_judges()` probed `from trl import BasePairwiseJudge` and used the answer to
+decide whether to pass `reward_model=`. Those two facts had decoupled: **trl dropped
+`reward_model=` at 0.25.0 and kept `BasePairwiseJudge` exported through 0.28.0.** So
+the probe answered yes for every trl in the supported `<0.27` range — including
+0.26.2, which is what `pip install "soup-cli[train]"` resolves today and what this box
+runs — and the wrapper passed a keyword removed five releases earlier.
+
+Measured on 0.26.2: **`TypeError` before step 0, no adapter written.** Not a
+degradation and not a wrong number — the reward-model half of `task: online_dpo`
+could not start.
+
+The judge half does work, and was verified rather than assumed, because "the other
+branch is fine" is exactly what a broken probe would also report. A run makes **48
+judge calls = 24 prompts x 2**, the swap-debiasing pass. The decisive arm is an A/B
+with the judge's polarity INVERTED: completions at step 1 are byte-identical (entropy
+**53.93193** in both arms) and the log-probs come back exactly swapped —
+`chosen -40.5646 / rejected -44.7643` becomes `chosen -44.7643 / rejected -40.5646`.
+Nothing differed but the judge's answer, and the trainer moved with it.
+
+**The first fix was wrong, and the contract test caught it on the box.** The obvious
+probe is `inspect.signature(OnlineDPOTrainer.__init__)`. On 0.26.2 that reports
+**nothing at all**: the top-level class is a deprecation shim, `def __init__(self,
+*args, **kwargs)`, forwarding into `trl.experimental`. A parameter check against that
+signature answers False for `judge` as well, so it would have disabled the one path
+that works. The shipped probe walks the MRO to the first non-passthrough `__init__`.
+
+| trl | `judge` | `reward_model` | `reward_funcs` |
+|---|---|---|---|
+| 0.19.1 (dev box) | True | **True** | False |
+| 0.26.2 (this box) | True | **False** | True |
+
+**Why CI could not catch it, which is the part worth keeping.**
+`test_reward_model_branch_adapts_to_trl_version` branched on `_TRL_HAS_JUDGES` — the
+same predicate the production code branched on — so it asserted that the code
+returned what its own condition said it would. It could not fail, on any trl, for any
+defect in the mapping. That is the same blind spot as the v0.72.4 trl-bound bug
+already recorded in this file. The test now asks trl.
+
+The naive-signature mistake then appeared in **three** places while the fix was being
+written; all three now call one resolver, because two copies of "where does the real
+signature live" is how the original defect happened.
+
+### `soup ship`'s tool-call and JSON suites, repaired (#316, `c87fd00`)
+
+STEP 22 recorded these as findings — `mini_tool_call` 0.000 and `mini_format_json`
+0.000 on a model that does both correctly — and left the repairs to the issue. They
+are done; only what changed is recorded here.
+
+`mini_tool_call` now shows the model a candidate tool menu — **8 candidates, with
+near-synonyms excluded so the suite measures selection rather than transcription** —
+and the envelope the scorer parses. The schema lives in the **fixture**, not in
+scoring code: injecting it at scoring time would break every caller that keys a
+lookup off `item["prompt"]`, which trades one silent-zero for another.
+
+`_extract_json_container` keeps the whole-string parse and falls back to a **bounded**
+`raw_decode` scan. Bounded on two axes deliberately: an unbounded scan credits
+incidental braces in prose and pins the suite at a constant **1.000**, which detects
+exactly as little as the **0.000** it replaces. For the same reason, extraction does
+not repair truncated JSON — a decoder lenient enough to guess a missing brace is the
+over-eager failure the controls exist to prevent.
+
+STEP 22 already identified the 64-token cap. What it did not say is where the cap
+lived: **the generation budget was declared and never wired.** The constant sat in
+`gate_suites` while `commands/ship.py` built the generators at `make_generator`'s
+default of 64, truncating **31 of 40** tool calls one closing brace short. It is now
+passed at all three construction sites, with a test that the budget **arrives** — a
+constant nobody reads is indistinguishable from not having one.
+
+**What is not here: a post-repair score on the real model.** STEP 22's 0.000 / 0.000
+were taken on the broken harness, and its 0.975 / 0.500 came from diagnostic patches
+rather than from the shipped repair. Nobody has re-run the repaired suites against
+Llama-3.1-8B-Instruct on this box, so the numbers the gate now produces there are
+unmeasured.
+
+### A training seed, and full fine-tuning as `lora.r = 0` (#341 / #340, `dcb5eb5`)
+
+STEP 23 ended by recording that Soup exposed no training-seed knob at all, and that
+several steps in this file use within-arm spread as the bar a between-arm difference
+has to clear while that spread was missing its largest natural source. Fixed.
+
+`training.seed` and `training.data_seed` now reach `TrainingArguments`. They are
+`Optional[int]` rather than defaulting to 42, and the reason is worth stating because
+the obvious default is the wrong one: **unset has to reproduce two different
+historical defaults** — HF's 42 for `TrainingArguments`, and 0 for the multipack
+sampler since v0.37.0. A plain `= 42` would have silently re-ordered every existing
+`multipack: true` run.
+
+**A method finding, and the sharpest of the three.** `test_same_seed_reproduces`
+**passed before the fix** — the config silently ignored the unknown `seed` key, so
+both runs were seed 42 and agreed perfectly. Its partner `test_different_seed_diverges`
+failed. That asymmetry is exactly why the control is required: on its own,
+"different seeds diverge" also passes for a value that is thrown away.
+
+Full fine-tuning is now `lora.r = 0`, chosen on repo evidence rather than taste.
+**Three consumers already treated rank 0 as "no adapter"**, and under a separate flag
+`commands/card.py` would have reported a full-FT run as a LoRA adapter in a published
+model card. `r: 0` crashed before this change, so no config that worked before
+changes meaning.
+
+Two scope limits, stated rather than left implicit. **`training.seed` is wired into
+the SFT trainer only** — the other task wrappers build their own `TrainingArguments`,
+so setting it on a DPO run parses and does nothing. And it **does not retro-fix this
+record**: every run in STEPs 1–23 was taken before the knob existed, so every spread
+quoted in this file is still missing that source.
+
+### What the three have in common
+
+Each was a test that asserted the code agreed with itself. The trl probe branched on
+`_TRL_HAS_JUDGES` and its test branched on `_TRL_HAS_JUDGES`, so the assertion was a
+tautology that no trl version could break. The seed control compared two runs of a
+value the config was discarding, so it compared 42 against 42 and passed. The two
+`soup ship` suites scored the envelope the harness produced — a bare prompt, a
+whole-string `json.loads` — rather than the content the model emitted, so they
+reported 0.000 about themselves and nothing about the model.
+
+That is the same shape as the v0.72.4 lesson already recorded here: a bound derived
+by reading source is a hypothesis, and the experiment that settles it is constructing
+the object. The repair was the same move all three times — **ask the external system
+rather than ourselves.** trl's real signature instead of an importable name that
+happens to correlate with it; the model's actual output instead of the wrapper the
+harness expected it in; the trainer's actual arguments instead of the config field we
+believed reached them.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

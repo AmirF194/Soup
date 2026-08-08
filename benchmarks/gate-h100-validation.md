@@ -3167,15 +3167,30 @@ over-eager failure the controls exist to prevent.
 STEP 22 already identified the 64-token cap. What it did not say is where the cap
 lived: **the generation budget was declared and never wired.** The constant sat in
 `gate_suites` while `commands/ship.py` built the generators at `make_generator`'s
-default of 64, truncating **31 of 40** tool calls one closing brace short. It is now
-passed at all three construction sites, with a test that the budget **arrives** — a
-constant nobody reads is indistinguishable from not having one.
+default of 64. It is now passed at all three construction sites, with a test that the
+budget **arrives** — a constant nobody reads is indistinguishable from not having one.
+
+> **Written here as "truncating 31 of 40 tool calls one closing brace short", and
+> disproved by a later measurement — see STEP 26.** That clause has been cut from the
+> sentence above rather than left standing in it, because it is not a wrong emphasis,
+> it is a wrong *cause*, and the sentence asserted it. Sweeping the budget on
+> Meta-Llama-3.1-8B-Instruct gives **0.2250 at 64 and 0.2250 at 256**, and the output
+> is **byte-identical at 64, 256 and 1024**: generation ends at `<|eot_id|>` after
+> **21 new tokens**, so nothing in `mini_tool_call` was being cut off at any budget.
+> The missing brace is the model's own output — **3 opens, 2 closes**. The
+> observation STEP 22 made survives (the brace really is missing); the attribution
+> STEP 22 attached to it does not, and this paragraph and commit `c87fd00` carried
+> that attribution forward without re-testing it. Both are left as written.
+> **The budget repair is real and load-bearing, for a different suite:**
+> `mini_format_json` scores **0.550** without the budget and **0.975** with it
+> (**+0.425**).
 
 **What is not here: a post-repair score on the real model.** STEP 22's 0.000 / 0.000
 were taken on the broken harness, and its 0.975 / 0.500 came from diagnostic patches
 rather than from the shipped repair. Nobody has re-run the repaired suites against
 Llama-3.1-8B-Instruct on this box, so the numbers the gate now produces there are
-unmeasured.
+unmeasured. **Since closed — STEP 26 re-runs all three on this box, and the sweep
+that corrects the paragraph above came out of that re-run.**
 
 ### A training seed, and full fine-tuning as `lora.r = 0` (#341 / #340, `dcb5eb5`)
 
@@ -3422,6 +3437,148 @@ And that fix does not reach this step even now. `training.seed` is wired into th
 **SFT trainer only**, while every arm above is `task: grpo`, whose wrapper builds
 its own `TrainingArguments`. The "5 seeds per mode" this step needs is still not
 expressible in a config for the task that needs it.
+
+## STEP 26 — the repaired suites re-measured, and a draft-distillation null result
+
+Two unrelated pieces of work, kept in one step because of what they turn out to
+share, which is stated at the end rather than assumed at the start.
+
+### The repaired `soup ship` suites, on the model STEP 24 could not re-run
+
+STEP 24 shipped the repairs and recorded explicitly that no post-repair score
+existed on a real model. These are those scores. Meta-Llama-3.1-8B-Instruct, 40
+items per suite, so one item is 0.025 against a 0.05 threshold.
+
+| suite | pre-repair | post-repair |
+|---|---|---|
+| `mini_tool_call` | 0.000 (0/40) | 0.225 (9/40) |
+| `mini_format_json` | 0.000 (0/40) | 0.975 (39/40) |
+| `mini_safety` | 0.300 (12/40) | 1.000 (40/40) |
+
+**The question that mattered is not whether the scores rose.** A suite pinned at
+1.000 detects a regression exactly as poorly as one pinned at 0.000, and two of the
+three post-repair numbers sit at or next to a ceiling. So the repaired suites were
+run against a deliberately broken adapter: 96 rows of prose, LoRA r=16, 3 epochs,
+loss 2.83 -> 1.32, trained to answer in prose where a tool call or JSON is expected.
+
+| suite | base | broken | drop | multiple of the 0.05 threshold |
+|---|---|---|---|---|
+| `mini_tool_call` | 0.225 | 0.000 | −0.225 | 4.5x |
+| `mini_format_json` | 0.975 | 0.075 | −0.900 | 18x |
+| `mini_safety` | 1.000 | 0.725 | −0.275 | 5.5x |
+
+Verified through the real `soup ship` CLI end to end, not only through the component
+call the harness uses: all three flagged REGRESSED, verdict **DON'T SHIP**, **exit
+2**, and the numbers the CLI printed are identical to the harness's. A third model
+(Qwen2.5-0.5B: 0.475 / 1.000 / 0.925) gives each suite three distinct values across
+three models, so none of the three is a constant wearing a measurement's clothes.
+
+`mini_safety`'s −0.275 is the strongest evidence in the table that it is not pinned,
+and not because it is the largest — it is the smallest of the three. **The adapter
+was never trained to under-refuse.** It was trained to answer in prose, so that drop
+is collateral damage rather than the effect being induced, and one of the lost items
+is genuine harmful compliance rather than a rewording the scorer failed to match. A
+suite that only moves when you aim at it cannot catch an accident, and accidents are
+what leg 2 is for.
+
+**Carry this rider, because the 0.225 reads as something it is not.**
+`mini_tool_call` measures **JSON well-formedness, not tool selection.**
+Envelope-agnostic extraction finds the correct tool name in **40 of 40**. The chain
+is mechanical: the model omits the outer brace -> the whole-string parse fails ->
+the bounded `raw_decode` scan returns the inner `{"name", "arguments"}` object ->
+`_extract_function` requires a `"function"` key -> False. The contrast model
+corroborates it instead of merely agreeing with it: Qwen2.5-0.5B closes its braces
+39 of 40 times and scores 0.475, so **a 0.5B model outranks an 8B on "tool calling"
+purely on brace hygiene**. Filed as **#346**. Until that is fixed the suite does
+discriminate — the second table is real — but the axis it discriminates on is not
+the one its name claims.
+
+### Draft distillation does not raise acceptance, and acceptance was not the constraint
+
+`soup draft distill` exists to make a small draft agree with a specific target more
+often. The arm was built to be as favourable to the feature as the feature allows:
+Llama-3.1-8B-Instruct <- Llama-3.2-1B-Instruct, same family, 48 fixed prompts held
+constant across arms, and a distillation corpus of **400 disjoint prompts answered
+by the target itself** — the student trained on exactly the distribution it is later
+scored on agreeing with.
+
+Acceptance **before 0.81293, after 0.81255**: **−0.038 percentage points.**
+
+A difference that small is indistinguishable from instrument noise, so it was
+re-measured with a paired instrument, both drafts scored against the **same** target
+continuations: delta **−0.000378**, 95% CI **[−0.0111, +0.0107]**. The token
+contingency over **2646 tokens** — both 2070, stock-only 81, distilled-only 80,
+neither 415 — is the same statement without a confidence interval: **161 tokens
+flipped, net −1**, McNemar exact **p = 1.0**.
+
+**Distillation genuinely trained**, which is the control that makes a null result
+worth anything: **32 of 146 tensors moved**, exactly the `q_proj` / `v_proj` of all
+16 layers, relative Frobenius delta median **5.96e-03**. It changed **6.1% of token
+decisions**, symmetrically. **It moved the draft; it did not move agreement.** And
+because this arm is a same-family pair, it also settles the earlier attempt: the
+0.0 pp result there was not an artefact of the 360M <- 135M size inversion.
+
+**The stronger finding is the one the arm was not built to look for.** Target
+**39.28 tok/s** against draft **65.90 tok/s** — a 6.5x smaller model is only
+**1.68x faster** (division of the two measured rates), because at batch 1 both are
+launch-latency bound. The three lines below are computed from those measured
+latencies, not observed in an assisted run:
+
+- break-even acceptance at the shipped default `k=5` is **0.832**, against a
+  measured **0.813**;
+- a **perfect** draft (alpha = 1.0) caps at **1.507x** ideal at k=5, and framework
+  overhead costs a further **1.99x** on top of that;
+- `k=5` is mis-tuned for this pair regardless — the ideal peaks at **k=1–2**
+  (~1.13x).
+
+So the honest reading is not "distillation needs more data or a better recipe".
+**No achievable acceptance rate makes this pair pay**, and acceptance was never the
+lever worth pulling.
+
+**The pair the issue proposed cannot be run by the shipped feature at all.**
+Qwen2.5's large models declare `config.vocab_size` **152064** and its small ones
+**151936**, and the two subcommands disagree about what to do with that:
+`soup draft distill` refuses up front, which is correct, while `soup draft measure`
+accepts, does all of the work, and then dies inside transformers — **discarding
+every completed measurement.** Filed as **#344**. Salvaged by calling the same
+kernels with the error caught: acceptance **0.6857 MODERATE**, plain **25.54
+tok/s**; the assisted arm is not obtainable.
+
+**A metric bug found on the way, #345.** `measure_acceptance` scores the draft
+against **penalised** target logits, so a draft identical to the target scores
+**0.8623** on Qwen instead of 1.0. Numerical precision was the obvious explanation
+and it was tested and **rejected**: fp32 gives 0.8638 against bf16's 0.8623, and the
+median top-2 logit gap at the disagreeing positions is **0.64–0.75** — decisive
+margins, not near-ties a rounding difference could flip. It matters because it
+crosses a band boundary on the 32B pair, **0.6857 MODERATE -> 0.7072 STRONG**, so a
+CI gate at `--min-acceptance 0.70` would fail that pair for an artefact of the
+measurement. **Real speculative decoding is unaffected** — assisted generation
+passes the same `logits_processor` to the draft.
+
+Two incidental findings from the same runs. `--steps N` delivers **N/4.44**
+optimizer steps, because the epoch count is computed ignoring both `val_split=0.1`
+and `gradient_accumulation_steps=4`. And the distill teacher loads in **fp32** — a
+third independent sighting of **#339**.
+
+**Not covered, and it is the half worth wanting:** whether distillation helps when
+the target has genuinely **drifted** from the draft. This arm is a same-family stock
+pair, so it answers "was the earlier null result just size?" (no) and says nothing
+about the drift question.
+
+### The thread between the two
+
+Both halves of this step are measurements that **contradicted a claim this record
+itself had made.** The truncation attribution struck out in STEP 24 was written
+here, believed, and acted on in a shipped commit. The draft-distillation arm
+was built on the assumption — also this record's — that acceptance was the quantity
+worth moving.
+
+In both cases the correcting evidence came from asking the system a question it
+could answer directly, and in both cases the question was cheap: **sweep the budget
+and diff the bytes**; **measure the two models' latencies and divide.** Neither
+needed a better argument about what ought to be true. That is the move STEP 24
+closed on — ask the external system rather than ourselves — arriving here as a
+correction *to* STEP 24 rather than as its conclusion.
 
 ## What was not done, and what these numbers do not say
 

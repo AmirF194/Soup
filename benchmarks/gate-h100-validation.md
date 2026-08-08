@@ -3226,6 +3226,203 @@ happens to correlate with it; the model's actual output instead of the wrapper t
 harness expected it in; the trainer's actual arguments instead of the config field we
 believed reached them.
 
+## STEP 25 — the reward-hack controller at 7B: mechanism yes, efficacy no
+
+`--reward-hack-mitigation` shipped in v0.71.26 with unit tests and had never been
+run against a real proxy reward on a real model. This is that run. The verdict is
+in the heading and belongs before the numbers rather than after: **every
+mechanical claim the feature makes was confirmed, and the claim a user actually
+cares about — that turning the controller on preserves true quality while the
+proxy is being gamed — is not established by anything here.**
+
+**Setup.** `Qwen2.5-7B-Instruct`, LoRA r=32 alpha=64, `task: grpo`. The proxy
+reward is `OpenAssistant/reward-model-deberta-v3-large-v2` — a real
+preference-trained RM, not a hand-written scorer that is gameable by
+construction. GSM8K, 400 prompts, lr 2e-4, GRPO KL beta 0.02, batch 16 x 8
+generations, 512-token generation cap, seed 42 identical across arms. Stack:
+torch 2.13.0+cu130, transformers 4.57.6, trl 0.26.2, peft 0.20.0, soup 0.72.4.
+
+### Feasibility was settled before spending GPU time
+
+The experiment means nothing unless the RM can actually be gamed, so that was
+measured first, on hand-built completions:
+
+- a **wrong**, verbose, marker-less answer scores **0.372**; a **correct**, terse
+  one scores **0.406**. The whole right-versus-wrong gap is 0.034.
+- padding the **same correct answer** with verbosity pays **+0.54**.
+- pure padding with no answer in it is punished at **−4.80**.
+
+That last line is the control that matters. An RM that rewards any long string
+would make the entire experiment trivial, and this one does not: it has a real
+preference for correctness and a much larger preference for length. That is the
+shape a reward-hacking study needs, and it was established before any long run.
+
+### Hacking was produced — in two phases, on training rollouts
+
+| reward-fn calls | proxy RM | strict acc | format-blind acc | words | `####` rate |
+|---|---|---|---|---|---|
+| 0–14 | 1.854 | 0.904 | 0.900 | 160 | 0.967 |
+| 30–44 | 3.841 | **0.504** | 0.954 | 122 | 0.529 |
+| 75–89 | 3.500 | **0.217** | **0.487** | 314 | 1.000 |
+
+These are windows over the reward function's own call index on **training
+rollouts**, not held-out evaluations — see the held-out gap below, which is not a
+detail.
+
+**Phase 1 is spec abandonment.** The RM does not care about GSM8K's `#### N`
+marker, so the policy stops emitting it (`####` rate 0.967 -> 0.529) while the
+answers stay right: format-blind accuracy is 0.954, *higher* than at the start.
+Strict accuracy halves for a reason that has nothing to do with reasoning.
+
+**Phase 2 is length blow-up.** Completions grow 122 -> 314 words, **52% of
+rollouts hit the 512-token cap**, and the format-blind metric collapses with the
+strict one (0.954 -> 0.487). That second collapse is what makes this a real
+result rather than a scoring artefact: the answers themselves get worse, and both
+true metrics agree while the proxy is up at 3.500.
+
+**It happened in 1 of 5 long runs.** Same config, same seed. The other four moved
+strict accuracy by **+0.052, +0.006, −0.134 and −0.291** — the last is a large
+degradation, but without the proxy-up/true-down signature, and none of the four
+reproduces the two-phase pattern. That 1-in-5 is the most consequential number in
+this step and everything downstream inherits it.
+
+### The controller closes the loop, mechanically
+
+Checked rather than assumed, because a controller that computes a new beta and
+fails to install it looks identical in its own logs to one that works:
+
+- beta escalated **0.03 -> 0.045 -> 0.0675 -> 0.1013 -> 0.1519**, x1.5 per step,
+  on four consecutive HACK votes.
+- **each commanded beta was read back off the LIVE trainer on the following
+  step.** That is the dual-write landing, and it is the check a unit test on the
+  controller object cannot make.
+- hysteresis behaved as designed — no oscillation between escalate and release.
+- `log_only` **observed without acting**: 0 non-hold actions and beta pinned at
+  0.02 across 113 and 168 steps, confirmed on two separate runs.
+
+**Throughput cost is not measurable here.** `kl_control` 16.2 and 18.5 s/step
+against `log_only` 16.3 and 19.4 s/step — two values per mode, overlapping
+ranges. The honest statement is "no cost resolved at n=2", not "no cost".
+
+### Efficacy is NOT established, and this is the load-bearing part
+
+The feature's actual promise is that `kl_control` protects true quality where
+`log_only` does not. Nothing measured here can say that.
+
+| | within-mode spread, strict acc |
+|---|---|
+| `log_only` | 0.140 |
+| `kl_control` | 0.195 |
+
+The between-mode difference is **0.130 — smaller than either mode's own
+within-mode range.** At n=2 per mode there is no mode effect to resolve, and
+quoting the 0.130 as a result would be quoting noise with a sign on it.
+
+**The A/A control establishes the floor rather than assuming it.** Identical
+configs are bit-identical at step 1 — reward **−0.5709912776947021** in all five
+runs, to the last digit — and diverge from step 2 onward on GPU nondeterminism
+alone. So the floor is not zero. It is whatever this configuration amplifies that
+nondeterminism into, and the 0.130 sits inside it.
+
+### The most important mechanism finding: `info_rm` does not track what it claims
+
+Across **185–200 paired steps per run**, the detector does not correlate with the
+thing it exists to detect.
+
+| quantity | per run |
+|---|---|
+| corr(detector `drop_pct`, true accuracy) | **+0.033 / −0.239 / +0.107** |
+| corr(step, proxy RM) | +0.741 / +0.352 / +0.397 |
+| corr(step, detector `drop_pct`) | **+0.157 / +0.093 / −0.012** |
+
+Splitting the steps by the detector's own signal separates true accuracy by
+**−0.010 and +0.065** — the steps it calls bad are not the steps where the model
+is worse, and in one of the two splits the sign is backwards.
+
+Read the second and third rows together, because that is where the finding is:
+**the proxy is clearly climbing, and the detector barely trends while it does.** A
+signal whose job is to notice proxy-versus-true divergence should move as the
+divergence develops; this one moves about as much as its own noise.
+
+The cause is structural rather than a tuning problem. `drop_pct` is a per-step
+statistic referenced to a **single noisy step-1 baseline**, so it behaves as
+half-wave-rectified noise around one sample. No controller can be better than the
+signal it consumes, which is the sense in which "mechanism yes" is a narrower
+result than it first reads as.
+
+### Three things the design asked for and did not get
+
+- **The held-out arm is unmet.** Every adapter from a hacking run was destroyed
+  by the NaN crash below (#342), so the phase table's true-accuracy collapse is
+  measured on training rollouts with **no held-out confirmation**. The one
+  held-out trajectory that was rescued belongs to a run that was **not** hacking:
+  true quality flat while the proxy climbed, i.e. a run climbing the RM without
+  degrading. That is a real observation, and it is not the one the design needed.
+- **The rollback ladder never fired in any arm.** It requires three consecutive
+  HACK votes. That sits awkwardly next to the beta ladder above, which escalated
+  on four consecutive HACK votes, and this record does not explain why one path
+  reached its threshold and the other did not. Recorded as an open inconsistency
+  rather than papered over.
+- **`pid_lagrangian` has no valid arm at all.** All three attempts crashed, at
+  steps 6, 25 and 8. That shipped mode is therefore unexercised by this step
+  mechanically as well as statistically.
+
+### The invalid arms, kept
+
+**8 of 14 runs died with `grad_norm: nan` followed by a device-side assert.** On
+both GPUs, at two learning rates, with **no pre-crash signature** in the logged
+metrics, and **not reproducible on retry with an identical seed.**
+
+The obvious hypothesis was a faulty card, and it was tested rather than assumed:
+the card passed a bf16 GEMM check with **zero ECC errors**, and a retry ran clean
+**past the step the previous attempt had died at**. Hypothesis rejected. Filed as
+**#342** with no cause attached.
+
+That attrition — 8 of 14 — is why the mode arms are n=2 and why the held-out arm
+is empty. It is not a side note about infrastructure; it is the direct reason this
+step's headline is "efficacy no".
+
+Separately, **#343**: `MitigationLogWriter` silently drops records when its parent
+directory has vanished, which truncated several arms' logs. Found while trying to
+reconstruct crashed runs, i.e. surfaced by the failure above rather than by
+reading the writer.
+
+### PPO was not run, but the mutation target was checked rather than assumed
+
+The controller is documented for GRPO and PPO, with PPO marked BETA. No PPO arm
+ran. What was checked is the thing that would silently not work: on trl 0.26.2
+`trl.PPOTrainer` is a **35-line shim** over `trl.experimental.ppo`, and the real
+trainer reads **`args.kl_coef` per batch** — so the controller's PPO write lands
+somewhere that is actually consulted. Sound in principle, unmeasured in practice.
+
+The practical blocker is not the controller. TRL's PPO wants a reward model that
+shares the policy's tokenizer, which the DeBERTa RM used throughout this step does
+not. Running PPO here would have meant changing the reward, which would have made
+it a different experiment rather than a second arm of this one.
+
+### What it would take
+
+**The blocker is statistical, not hardware.** At this learning rate the process is
+chaotic — identical configs bifurcate into runs that hit the generation cap and
+runs that never clip, which is what both the 1-of-5 hacking rate and the A/A
+control say. Separating a 0.130 mode difference from within-mode spreads of 0.140
+and 0.195 needs replicates, not a bigger card: **at least 5 seeds per mode,
+roughly 25 runs at ~55 min each.** That is an affordable amount of GPU time and it
+was not available in what remained of this session.
+
+The connection to STEP 23 is worth stating explicitly, because two occurrences
+make it a pattern rather than an incident. **This is the second step in a row
+whose honest yardstick is within-arm spread**, and, as STEP 23 recorded, Soup
+exposed no training-seed knob at all until #341 was fixed this morning (STEP 24) —
+so the replicates here differ in row ordering and GPU nondeterminism and **not in
+the trainer RNG**, which is the largest natural source of the very spread both
+steps measure against.
+
+And that fix does not reach this step even now. `training.seed` is wired into the
+**SFT trainer only**, while every arm above is `task: grpo`, whose wrapper builds
+its own `TrainingArguments`. The "5 seeds per mode" this step needs is still not
+expressible in a config for the task that needs it.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

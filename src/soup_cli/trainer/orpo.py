@@ -70,9 +70,19 @@ class ORPOTrainerWrapper(StreamingSetupMixin):
     def setup(self, dataset: dict) -> None:
         """Load model, tokenizer, apply LoRA, create ORPO trainer."""
         from datasets import Dataset
-        from trl import ORPOConfig, ORPOTrainer
 
+        from soup_cli.trainer._trl_compat import (
+            prompt_length_kwargs,
+            resolve_trl_symbol,
+        )
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
+
+        # #326 — trl 0.29.0 dropped ORPOConfig / ORPOTrainer from the public
+        # `trl` namespace. They were not deleted: they live on under
+        # `trl.experimental.orpo`. A plain `from trl import ORPOConfig` is an
+        # ImportError there, so the task dies before it can say anything useful.
+        orpo_config_cls = resolve_trl_symbol("ORPOConfig", "trl.experimental.orpo")
+        orpo_trainer_cls = resolve_trl_symbol("ORPOTrainer", "trl.experimental.orpo")
 
         _enable_hf_transfer_progress()
 
@@ -146,7 +156,7 @@ class ORPOTrainerWrapper(StreamingSetupMixin):
         # --- ORPO config ---
         from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
 
-        orpo_config = ORPOConfig(
+        orpo_config = orpo_config_cls(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
             per_device_train_batch_size=batch_size,
@@ -179,13 +189,14 @@ class ORPOTrainerWrapper(StreamingSetupMixin):
             **(self.fsdp_config or {}),
             beta=tcfg.orpo_beta,
             max_length=cfg.data.max_length,
-            max_prompt_length=cfg.data.max_length // 2,
+            # #326 — ORPOConfig lost `max_prompt_length` at 0.28.0. See dpo.py.
+            **prompt_length_kwargs(orpo_config_cls, cfg.data.max_length // 2),
             **({"neftune_noise_alpha": tcfg.neftune_alpha}
                if tcfg.neftune_alpha is not None else {}),
         )
 
         # --- Trainer ---
-        self.trainer = ORPOTrainer(
+        self.trainer = orpo_trainer_cls(
             model=self.model,
             args=orpo_config,
             train_dataset=train_ds,

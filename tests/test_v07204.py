@@ -1004,12 +1004,18 @@ class TestKtoBatchIsRefusedEarly:
         model = AutoModelForCausalLM.from_pretrained(weights, torch_dtype=torch.float32)
         tokenizer = AutoTokenizer.from_pretrained(weights)
         dataset = Dataset.from_list(_kto_rows(4))
+        from soup_cli.trainer._trl_compat import prompt_length_kwargs
+
         args = KTOConfig(
             output_dir=str(tmp_path / "o"),
             per_device_train_batch_size=1,
             report_to=[],
             max_length=32,
-            max_prompt_length=16,
+            # #326 — incidental setup, not what this test asserts. trl removed
+            # `max_prompt_length` from KTOConfig at 0.27.0, so hard-coding it
+            # made this test raise TypeError there and stop reaching the
+            # batch-size check it exists to pin.
+            **prompt_length_kwargs(KTOConfig, 16),
             # Newer TRL configs enable bf16 by default, which a CPU-only runner
             # rejects with "Your setup doesn't support bf16/gpu" BEFORE reaching
             # the batch-size check this test exists to pin.

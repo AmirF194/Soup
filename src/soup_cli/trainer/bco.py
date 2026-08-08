@@ -102,9 +102,17 @@ class BCOTrainerWrapper:
     def setup(self, dataset: dict) -> None:
         """Load model, tokenizer, apply LoRA, create BCO trainer."""
         from datasets import Dataset
-        from trl import BCOConfig, BCOTrainer
 
+        from soup_cli.trainer._trl_compat import (
+            prompt_length_kwargs,
+            resolve_trl_symbol,
+        )
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
+
+        # #326 — trl 0.29.0 dropped BCOConfig / BCOTrainer from the public
+        # `trl` namespace; they live on under `trl.experimental.bco`.
+        bco_config_cls = resolve_trl_symbol("BCOConfig", "trl.experimental.bco")
+        bco_trainer_cls = resolve_trl_symbol("BCOTrainer", "trl.experimental.bco")
 
         _enable_hf_transfer_progress()
 
@@ -170,7 +178,7 @@ class BCOTrainerWrapper:
         warmup_steps = int(total_steps * tcfg.warmup_ratio)
 
         # --- BCO config ---
-        bco_config = BCOConfig(
+        bco_config = bco_config_cls(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
             per_device_train_batch_size=batch_size,
@@ -191,7 +199,8 @@ class BCOTrainerWrapper:
             **(self.fsdp_config or {}),
             beta=tcfg.bco_beta,
             max_length=cfg.data.max_length,
-            max_prompt_length=cfg.data.max_length // 2,
+            # #326 — BCOConfig lost `max_prompt_length` at 0.28.0. See dpo.py.
+            **prompt_length_kwargs(bco_config_cls, cfg.data.max_length // 2),
             **(
                 {"neftune_noise_alpha": tcfg.neftune_alpha}
                 if tcfg.neftune_alpha is not None
@@ -200,7 +209,7 @@ class BCOTrainerWrapper:
         )
 
         # --- Trainer ---
-        self.trainer = BCOTrainer(
+        self.trainer = bco_trainer_cls(
             model=self.model,
             args=bco_config,
             train_dataset=train_ds,

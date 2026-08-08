@@ -171,10 +171,28 @@ class TestEveryPreferenceTrainerReachesALiveTrlTrainer:
         """`max_prompt_length` is the field that actually broke, so it is named
         here rather than left implicit in "setup() didn't raise". A trl release
         that keeps accepting the keyword but stops storing it would pass the
-        test above and fail this one."""
+        test above and fail this one.
+
+        #326 made the assertion conditional, because trl removed the field in
+        stages (kto 0.27, bco/orpo/simpo 0.28, dpo/ipo 0.29) and the wrappers
+        now pass it only to a config that still accepts it. The contract being
+        pinned is therefore two-sided, and BOTH halves have teeth: where the
+        field exists it must carry the value the wrapper computed, and where it
+        does not it must be genuinely absent — not silently defaulted, which is
+        how a wrapper that had quietly stopped passing it would look.
+        """
+        from soup_cli.trainer._trl_compat import config_accepts
+
         wrapper = _build(tmp_path, monkeypatch, task)
         args = wrapper.trainer.args
-        assert args.max_prompt_length == 32, (task, args.max_prompt_length)
+        if config_accepts(type(args), "max_prompt_length"):
+            assert args.max_prompt_length == 32, (task, args.max_prompt_length)
+        else:
+            assert not hasattr(args, "max_prompt_length"), (
+                f"{task}: installed trl does not accept `max_prompt_length` as a "
+                f"keyword, yet the built config has the attribute — the capability "
+                f"probe and the object disagree"
+            )
         assert args.max_length == 64, (task, args.max_length)
 
 
@@ -190,18 +208,28 @@ class TestTheCanaryCoversWhatItClaims:
     def test_every_wrapper_that_passes_max_prompt_length_is_listed(self):
         """Derived from the source, so a seventh trainer adopting the same trl
         argument joins this file automatically instead of silently reopening
-        the gap."""
+        the gap.
+
+        #326 moved the marker. The canary fired exactly as designed when the
+        wrappers migrated — it asserted "did the path move?" and the path had
+        moved: the literal `max_prompt_length=` was replaced by a call to
+        `prompt_length_kwargs(...)`, which passes the keyword only to a trl that
+        still accepts it. Both spellings are searched, so a trainer using either
+        the old direct keyword or the new helper is covered.
+        """
         import pathlib
 
         trainer_dir = pathlib.Path(__file__).resolve().parents[1] / "src" / "soup_cli" / "trainer"
+        markers = ("max_prompt_length=", "prompt_length_kwargs(")
         users = {
             path.stem
             for path in trainer_dir.glob("*.py")
-            if "max_prompt_length=" in path.read_text(encoding="utf-8")
+            if any(marker in path.read_text(encoding="utf-8") for marker in markers)
+            and path.stem != "_trl_compat"  # the helper defines it, does not pass it
         }
-        assert users, "found no trainer passing max_prompt_length — did the path move?"
+        assert users, "found no trainer passing a prompt-length cap — did the path move?"
         uncovered = sorted(users - set(_ALL_SIX))
-        assert not uncovered, f"passes max_prompt_length with no setup() test: {uncovered}"
+        assert not uncovered, f"passes a prompt-length cap with no setup() test: {uncovered}"
 
 
 class TestTheTrlBoundsAreConsistentWithTheCode:

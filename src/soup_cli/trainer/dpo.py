@@ -71,6 +71,8 @@ class DPOTrainerWrapper(StreamingSetupMixin):
         from datasets import Dataset
         from trl import DPOConfig, DPOTrainer
 
+        from soup_cli.trainer._trl_compat import prompt_length_kwargs
+
         # Enable Rich progress bar for HuggingFace downloads
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
 
@@ -182,7 +184,11 @@ class DPOTrainerWrapper(StreamingSetupMixin):
             **(self.fsdp_config or {}),
             beta=tcfg.dpo_beta,
             max_length=cfg.data.max_length,
-            max_prompt_length=cfg.data.max_length // 2,
+            # #326 — trl dropped `max_prompt_length` from DPOConfig at 0.29.0
+            # with no successor field; `max_length` absorbs it. Asked of the
+            # class rather than of trl.__version__, because a version table is
+            # exactly what was wrong twice before.
+            **prompt_length_kwargs(DPOConfig, cfg.data.max_length // 2),
             **({"neftune_noise_alpha": tcfg.neftune_alpha}
                if tcfg.neftune_alpha is not None else {}),
         )

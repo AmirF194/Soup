@@ -41,49 +41,60 @@ train = [
     "torch>=2.0.0",
     "transformers>=4.36.0,<5.0.0",
     "peft>=0.7.0",
-    # Capped below 0.27. Six trainers (bco, dpo, ipo, kto, orpo, simpo) pass
-    # `max_prompt_length` to their trl config, and trl removed it in STAGES
+    # Capped below 0.29. #326 raised this from `<0.27` after migrating the six
+    # preference trainers (bco, dpo, ipo, kto, orpo, simpo) off the two trl APIs
+    # that moved. The cap is no longer set by those trainers at all — see the
+    # 0.29 note at the bottom, which is about `online_dpo`.
+    #
+    # trl removed `max_prompt_length` from the preference configs in STAGES
     # rather than in one release — which is why a single spot-check gives the
-    # wrong answer. Read off the published wheels, per config, by extracting
-    # each *Config class's OWN annotated fields (all five inherit from
-    # TrainingArguments, so there is no inherited-field escape hatch):
+    # wrong answer. This table is now verified the only way that settles it, by
+    # CONSTRUCTING each config with the exact kwargs the wrappers pass:
     #
     #   version          dpo   kto   orpo   cpo   bco
-    #   0.24.0 - 0.26.2  yes   yes   yes    yes   yes  <- last all six work on
+    #   0.14.0 - 0.26.2  yes   yes   yes    yes   yes
     #   0.27.0 - 0.27.2  yes   NO    yes    yes   yes
     #   0.28.0           yes   NO    NO     NO    NO
-    #   0.29.0+          NO    NO    NO     NO    NO
+    #   0.29.0 - 1.9.2   NO    NO    NO     NO    NO
     #
-    # So `soup train --task kto` breaks at 0.27, `--task bco|orpo|simpo` at
-    # 0.28, and `--task dpo|ipo` at 0.29. From 0.29 the break is worse than a
-    # missing field: ORPOConfig / CPOConfig / BCOConfig (and their trainers) are
-    # no longer exported from the `trl` namespace at all — the modules survive
-    # under `trl/experimental/`, but `from trl import ORPOConfig` is an
-    # ImportError, so those tasks fail at import rather than at construction.
+    # There is NO successor field: `max_length` survives on every version and
+    # absorbs prompt truncation, so the migration is to stop passing the keyword
+    # to a config that no longer has it, not to rename it. The trainers now ask
+    # the config class whether it accepts the keyword (trainer/_trl_compat.py)
+    # instead of comparing versions, because a version table is exactly what was
+    # wrong twice before. On every trl that still has the field the behaviour is
+    # byte-identical — measured: the six train to identical losses on 0.26.2,
+    # 0.28.0 and 1.9.2 on the same fixture.
     #
-    # v0.72.4 shipped this cap as `<0.25`, derived from a table that read a
-    # MODULE RELOCATION as a field removal: `BCOConfig` moved to
-    # `trl/experimental/bco/` at 0.25 and kto/orpo/cpo followed at 0.26, but all
-    # of them stayed publicly re-exported from `trl` with the field intact. The
-    # bound above is verified the only way that settles it — by constructing all
-    # six configs with the exact kwargs the wrappers pass: 0.26.2 builds all six,
-    # 0.27.0 raises `KTOConfig.__init__() got an unexpected keyword argument
-    # 'max_prompt_length'` while dpo and orpo still build.
+    # Separately, trl 0.29.0 dropped ORPOConfig / CPOConfig / BCOConfig (and
+    # their trainers) from the public `trl` namespace. They were not deleted —
+    # they live on under `trl.experimental.<algo>` — so those three trainers now
+    # fall back to that path when the public import is gone.
+    #
+    # WHY THE CAP IS 0.29 AND NOT HIGHER: `soup train --task online_dpo` is
+    # broken on 0.29.x, and the cause is not in these trainers. trl 0.29 moved
+    # `BasePairwiseJudge` to `trl.experimental.judges` while still accepting
+    # `judge=`, so the wrapper correctly selects the judge path and then
+    # `eval/judge.py::_base_pairwise_judge_cls` cannot import the base class.
+    # trl 1.x drops `judge=` entirely, so the wrapper falls back to
+    # `reward_funcs=` and online_dpo works again — measured: all nine tasks build
+    # on 1.9.2, and the six preference tasks train there. Raising the cap past
+    # 0.29 therefore needs (a) a `trl.experimental.judges` fallback in
+    # eval/judge.py and (b) validation of the trl surfaces this bump did not
+    # exercise (serve, GRPO variants, PPO with a real reward model). Shipping
+    # against a release nobody has validated is not a substitute for that.
     #
     # The underlying bug was latent, not new: the trl imports live inside
     # `setup()`, which no test had ever called on those wrappers, so CI stayed
     # green while anyone pip-installing got a broken install. v0.72.4's
     # end-to-end preference tests are what surfaced it.
     #
-    # Migrating to the newer API is its own piece of work (#326); shipping
-    # against a release nobody has validated is not a substitute for it.
-    #
     # The floor is 0.14.0, not 0.7.0: `setup()` imports GRPOTrainer
     # unconditionally and trl first exports it at 0.14.0 (OnlineDPO / KTO / BCO /
     # BasePairwiseJudge arrive at 0.11.0; trl 0.7.0 has none of them). Resolvers
     # normally pick the newest allowed version, so the impossible floor only bit
     # under a constraints file or anyone reading the metadata as a support claim.
-    "trl>=0.14.0,<0.27",
+    "trl>=0.14.0,<0.29",
     "datasets>=2.14.0",
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",

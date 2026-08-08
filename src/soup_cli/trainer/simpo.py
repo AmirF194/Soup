@@ -71,9 +71,18 @@ class SimPOTrainerWrapper(StreamingSetupMixin):
     def setup(self, dataset: dict) -> None:
         """Load model, tokenizer, apply LoRA, create SimPO (CPO) trainer."""
         from datasets import Dataset
-        from trl import CPOConfig, CPOTrainer
 
+        from soup_cli.trainer._trl_compat import (
+            prompt_length_kwargs,
+            resolve_trl_symbol,
+        )
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
+
+        # #326 — trl 0.29.0 dropped CPOConfig / CPOTrainer from the public
+        # `trl` namespace; they live on under `trl.experimental.cpo`. SimPO is
+        # CPO with loss_type='simpo', so it moves with CPO.
+        cpo_config_cls = resolve_trl_symbol("CPOConfig", "trl.experimental.cpo")
+        cpo_trainer_cls = resolve_trl_symbol("CPOTrainer", "trl.experimental.cpo")
 
         _enable_hf_transfer_progress()
 
@@ -147,7 +156,7 @@ class SimPOTrainerWrapper(StreamingSetupMixin):
         # --- SimPO config (via CPOTrainer with loss_type='simpo') ---
         from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
 
-        cpo_config = CPOConfig(
+        cpo_config = cpo_config_cls(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
             per_device_train_batch_size=batch_size,
@@ -182,13 +191,14 @@ class SimPOTrainerWrapper(StreamingSetupMixin):
             cpo_alpha=tcfg.cpo_alpha,
             simpo_gamma=tcfg.simpo_gamma,
             max_length=cfg.data.max_length,
-            max_prompt_length=cfg.data.max_length // 2,
+            # #326 — CPOConfig lost `max_prompt_length` at 0.28.0. See dpo.py.
+            **prompt_length_kwargs(cpo_config_cls, cfg.data.max_length // 2),
             **({"neftune_noise_alpha": tcfg.neftune_alpha}
                if tcfg.neftune_alpha is not None else {}),
         )
 
         # --- Trainer ---
-        self.trainer = CPOTrainer(
+        self.trainer = cpo_trainer_cls(
             model=self.model,
             args=cpo_config,
             train_dataset=train_ds,

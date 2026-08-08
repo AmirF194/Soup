@@ -67,6 +67,7 @@ class IPOTrainerWrapper:
         from datasets import Dataset
         from trl import DPOConfig, DPOTrainer
 
+        from soup_cli.trainer._trl_compat import prompt_length_kwargs
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
 
         _enable_hf_transfer_progress()
@@ -148,7 +149,8 @@ class IPOTrainerWrapper:
             loss_type="ipo",
             beta=tcfg.ipo_tau,
             max_length=cfg.data.max_length,
-            max_prompt_length=cfg.data.max_length // 2,
+            # #326 — see dpo.py; IPO rides the same DPOConfig.
+            **prompt_length_kwargs(DPOConfig, cfg.data.max_length // 2),
             **({"neftune_noise_alpha": tcfg.neftune_alpha}
                if tcfg.neftune_alpha is not None else {}),
         )

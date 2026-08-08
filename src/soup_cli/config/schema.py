@@ -34,7 +34,23 @@ _UNFROZEN_REDOS_RE = re.compile(r"\([^)]*[+*][^)]*\)\s*[+*]")
 
 
 class LoraConfig(BaseModel):
-    r: int = Field(default=64, description="LoRA rank")
+    # #340 — `r: 0` is the first-class full-fine-tuning switch: no
+    # adapter is applied and the base weights train directly. It is the
+    # spelling `trainer/classifier.py` has read as "no adapter" since
+    # v0.71.12 (#146) and the one `commands/card.py::_is_adapter` already
+    # resolves to "dense model". Before #340 a rank of 0 reached peft and
+    # died with "`r` should be a positive integer value", so nothing that
+    # worked before changes meaning. `ge=0` closes the pre-existing hole
+    # where a NEGATIVE rank parsed and failed the same way, deep in peft.
+    r: int = Field(
+        default=64,
+        ge=0,
+        description=(
+            "LoRA rank. 0 = full fine-tuning: no adapter, every base "
+            "parameter trains (sft + transformers + text + "
+            "quantization='none' only)."
+        ),
+    )
     alpha: int = Field(default=16, description="LoRA alpha")
     dropout: float = Field(default=0.05, description="LoRA dropout")
     target_modules: Union[str, List[str]] = Field(
@@ -898,6 +914,50 @@ class TrainingConfig(BaseModel):
         ),
     )
     gradient_accumulation_steps: int = Field(default=4, ge=1)
+    # #341 — the general training seed. Before this there was none:
+    # `TrainingArguments` took HF's defaults on every run, so two runs of the
+    # same config differed only by GPU nondeterminism and "run it again with a
+    # different seed" was impossible. Both default to None rather than to 42
+    # so the trainer can distinguish "unset" from "explicitly 42" — the
+    # multipack FFD sampler's historical seed of 0 has to survive an unset
+    # seed, while `TrainingArguments.seed` keeps HF's 42.
+    #
+    # Upper bound: `transformers.set_seed` feeds the value to
+    # `numpy.random.seed`, which rejects anything outside [0, 2**32-1]. Bound
+    # it here so a too-large seed is a config error, not a numpy traceback at
+    # step 0.
+    seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2**32 - 1,
+        description=(
+            "Training seed (weight init of new params, data order, dropout). "
+            "Reaches TrainingArguments.seed and the multipack sampler. "
+            "Unset = HF's default of 42."
+        ),
+    )
+    data_seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2**32 - 1,
+        description=(
+            "Separate seed for data sampling only (TrainingArguments."
+            "data_seed). Set it alongside `seed` to vary data order while "
+            "holding initialisation fixed. Unset = follow `seed`."
+        ),
+    )
+
+    @field_validator("seed", "data_seed", mode="before")
+    @classmethod
+    def _validate_seed_ints(cls, v: Any) -> Any:
+        """#341 — reject bool-as-int (`bool` subclasses `int`, so `seed: true`
+        would silently become seed 1). Mirrors the v0.71.34 LISA policy."""
+        if isinstance(v, bool):
+            raise ValueError(
+                "training.seed / training.data_seed must be int, not bool"
+            )
+        return v
+
     warmup_ratio: float = Field(default=0.03, ge=0.0, le=0.5)
     weight_decay: float = Field(default=0.01, ge=0.0)
     max_grad_norm: float = Field(default=1.0, gt=0)
@@ -4645,6 +4705,96 @@ class SoupConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_full_finetune(self) -> "SoupConfig":
+        """#340 — ``lora.r: 0`` = full fine-tuning (no adapter).
+
+        The third member of the "LoRA off" family, sharing Spectrum's and
+        LISA's gate: sft + transformers + text + ``quantization='none'``,
+        mutually exclusive with the LoRA feature flags and with the other two
+        (each independently decides what trains).
+
+        Scoped to ``task='sft'`` ON PURPOSE. ``classifier`` / ``reranker`` /
+        ``cross_encoder`` (``classifier_lora``, v0.71.12 #146) and ``asr``
+        (``asr_lora``, v0.71.32) have gated LoRA behind their own opt-in flag
+        for releases, so ``lora.r: 0`` already parses and is already harmless
+        there; a blanket gate would break configs that work today. Tasks that
+        do pass the rank straight to peft keep their existing behaviour
+        (peft's "`r` should be a positive integer value") rather than gaining
+        a new refusal this issue never measured.
+        """
+        tcfg = self.training
+        if tcfg.lora.r != 0 or self.task != "sft":
+            return self
+        if tcfg.stream_layers:
+            # Streaming has its own, more specific refusal (the decoder lives
+            # on the meta device, so there is nothing to full fine-tune).
+            # Let it speak rather than reporting a quantization mismatch.
+            return self
+        if self.backend != "transformers":
+            raise ValueError(
+                f"training.lora.r=0 (full fine-tuning) requires "
+                f"backend='transformers'; got backend={self.backend!r}. The "
+                f"full-FT branch is wired in the transformers SFT trainer."
+            )
+        if self.modality != "text":
+            raise ValueError(
+                f"training.lora.r=0 (full fine-tuning) requires "
+                f"modality='text'; got modality={self.modality!r}. The "
+                f"vision / audio setups always attach an adapter."
+            )
+        if tcfg.quantization != "none":
+            raise ValueError(
+                f"training.lora.r=0 (full fine-tuning) requires "
+                f"quantization='none' (got {tcfg.quantization!r}); quantized "
+                f"weights cannot be trained directly. For a quantized run use "
+                f"LoRA (QLoRA) with lora.r >= 1."
+            )
+        mode_conflicts = []
+        if tcfg.unfrozen_parameters:
+            mode_conflicts.append("unfrozen_parameters")
+        if tcfg.lisa_enabled:
+            mode_conflicts.append("lisa_enabled")
+        if tcfg.train_router_only:
+            mode_conflicts.append("train_router_only")
+        if mode_conflicts:
+            raise ValueError(
+                f"training.lora.r=0 (full fine-tuning) is mutually exclusive "
+                f"with {', '.join(mode_conflicts)} (each independently selects "
+                f"which parameters train)"
+            )
+        lcfg = tcfg.lora
+        lora_conflicts = []
+        if lcfg.use_dora:
+            lora_conflicts.append("lora.use_dora")
+        if lcfg.use_vera:
+            lora_conflicts.append("lora.use_vera")
+        if lcfg.use_olora:
+            lora_conflicts.append("lora.use_olora")
+        if lcfg.use_rslora:
+            lora_conflicts.append("lora.use_rslora")
+        if lcfg.rank_pattern is not None:
+            lora_conflicts.append("lora.rank_pattern")
+        if lcfg.alpha_pattern is not None:
+            lora_conflicts.append("lora.alpha_pattern")
+        if getattr(lcfg, "init_strategy", "random") != "random":
+            lora_conflicts.append("lora.init_strategy")
+        if tcfg.moe_lora:
+            lora_conflicts.append("moe_lora")
+        if tcfg.use_longlora:
+            lora_conflicts.append("use_longlora")
+        if tcfg.relora_steps is not None:
+            lora_conflicts.append("relora_steps")
+        if tcfg.loraplus_lr_ratio is not None:
+            lora_conflicts.append("loraplus_lr_ratio")
+        if lora_conflicts:
+            raise ValueError(
+                f"training.lora.r=0 means full fine-tuning (no adapter), so it "
+                f"is mutually exclusive with LoRA features: "
+                f"{', '.join(lora_conflicts)}. Set lora.r >= 1 to use them."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_stream_layers_compat(self) -> "SoupConfig":
         """v0.72.0 BETA — layer-streaming compatibility gates.
 
@@ -4743,8 +4893,10 @@ class SoupConfig(BaseModel):
         if tcfg.lora.r < 1:
             raise ValueError(
                 "training.stream_layers requires LoRA (training.lora.r >= 1) — "
-                "the streamed base is frozen, so with no adapter there is "
-                "nothing trainable and the run is a no-op."
+                "the streamed base is frozen and its decoder weights live on "
+                "the meta device, so full fine-tuning (lora.r=0) is not merely "
+                "unwise here, it is impossible: there would be nothing "
+                "trainable and the run would be a no-op."
             )
         # LoRA variants that READ the real base weight during
         # get_peft_model() cannot work against a meta skeleton: DoRA computes a

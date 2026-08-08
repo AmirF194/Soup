@@ -21,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 console = Console()
 
+# #341 — what an UNSET ``training.seed`` resolves to. This is HF's own
+# ``TrainingArguments.seed`` default, restated here so the "unset behaves
+# exactly as before" guarantee is a written constant rather than an accident
+# of whichever transformers version is installed.
+DEFAULT_TRAINING_SEED = 42
+
+# #341 — what an unset seed gives the multipack FFD sampler. NOT 42: the
+# sampler has been seeded 0 since v0.37.0 because ``getattr(tcfg, "seed", 0)``
+# never found an attribute, and changing it would silently re-order every
+# existing ``multipack: true`` run.
+DEFAULT_MULTIPACK_SEED = 0
+
 # Text-token surface TRL's SFTTrainer reads directly off ``processing_class``
 # (trl/trainer/sft_trainer.py: ``pad_token`` / ``eos_token`` / ``eos_token_id``
 # resolution) — mirrored from a vision processor's nested tokenizer in #302.
@@ -242,9 +254,14 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         if stream_total:
             total = stream_total
         pct = 100 * trainable / total if total else 0.0
-        label = (
-            "Spectrum targeted FT" if tcfg.unfrozen_parameters else "LoRA applied"
-        )
+        # #340 — "LoRA applied" is a false statement on a full-FT run, and this
+        # is the line an operator screenshots to show what trained.
+        if tcfg.unfrozen_parameters:
+            label = "Spectrum targeted FT"
+        elif tcfg.lora.r == 0 and cfg.modality == "text" and cfg.backend == "transformers":
+            label = "Full fine-tuning"
+        else:
+            label = "LoRA applied"
         console.print(
             f"[green]{label}:[/] {trainable:,} trainable"
             f" / {total:,} total ({pct:.2f}%)"
@@ -392,6 +409,14 @@ class SFTTrainerWrapper(StreamingSetupMixin):
             "report_to": self.report_to,
             "remove_unused_columns": False,
             "deepspeed": self.deepspeed_config,
+            # #341 — the general training seed. Until this landed there was no
+            # knob at all: every run took HF's defaults (seed=42,
+            # data_seed=None), so replicates of one config differed only by
+            # row permutation and GPU nondeterminism. `None` means "unset", and
+            # unset must reproduce the pre-#341 numbers exactly — hence 42
+            # here rather than a new default.
+            "seed": DEFAULT_TRAINING_SEED if tcfg.seed is None else tcfg.seed,
+            "data_seed": tcfg.data_seed,
         }
 
         # FSDP2 — alternative to DeepSpeed. The helper also enables
@@ -601,7 +626,13 @@ class SFTTrainerWrapper(StreamingSetupMixin):
                 lengths=lengths_from_dataset(train_ds),
                 max_seq_len=cfg.data.max_length,
                 batch_size=batch_size,
-                seed=getattr(tcfg, "seed", 0) or 0,
+                # #341 — this lookup used to be defensive cover for an
+                # attribute that did not exist, so it was always 0. The field
+                # exists now; unset still resolves to 0 so existing multipack
+                # runs keep their row order.
+                seed=(
+                    DEFAULT_MULTIPACK_SEED if tcfg.seed is None else tcfg.seed
+                ),
             )
             console.print("[green]Multipack FFD bin-packing sampler enabled[/]")
         else:
@@ -980,6 +1011,39 @@ class SFTTrainerWrapper(StreamingSetupMixin):
                 f"[green]LISA:[/] layerwise importance sampling "
                 f"({tcfg.lisa_num_layers} layer(s) every "
                 f"{tcfg.lisa_interval_steps} steps, LoRA off)"
+            )
+        elif tcfg.lora.r == 0:
+            # #340 — plain full fine-tuning. Until now the `else` below applied
+            # LoRA unconditionally and the only way to train without an adapter
+            # was `unfrozen_parameters: ['.*']`, i.e. the Spectrum regex feature
+            # used as a workaround. `r: 0` is the spelling classifier.py has
+            # read as "no adapter" since v0.71.12 and the one card.py already
+            # resolves to a dense model.
+            #
+            # Deliberately NOT `requires_grad_(True)`: `freeze_layers` /
+            # `freeze_ratio` ran above and stay legal here (training everything
+            # above layer N is a real technique), so this branch respects
+            # whatever they froze instead of silently undoing it. The schema
+            # already guarantees quantization='none', so no k-bit prep has
+            # frozen the base underneath us.
+            trainable = [
+                param for param in self.model.parameters() if param.requires_grad
+            ]
+            if not trainable:
+                raise ValueError(
+                    "training.lora.r=0 requests full fine-tuning but no "
+                    "parameter is trainable — check training.freeze_layers / "
+                    "training.freeze_ratio, or set lora.r >= 1 to train an "
+                    "adapter instead. Refusing rather than running a no-op."
+                )
+            # Mirrors the Spectrum branch: with gradient checkpointing a frozen
+            # input embedding breaks the backward pass, and get_peft_model does
+            # this internally on the LoRA path. Harmless without checkpointing.
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+            console.print(
+                f"[green]Full fine-tuning:[/] {len(trainable)} parameter "
+                f"tensor(s) trainable (lora.r=0, no adapter)"
             )
         else:
             # LoRA — with MoE-aware target modules if moe_lora is enabled

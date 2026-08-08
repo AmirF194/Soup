@@ -47,6 +47,122 @@
 - [Knowledge Distillation (BETA, v0.52.0)](#knowledge-distillation-beta-v0520)
 - [EBFT + GDPO (BETA, v0.52.0)](#ebft--gdpo-beta-v0520)
 - [gpt-oss `reasoning_effort` + `train_on_eot` (v0.52.0)](#gpt-oss-reasoning_effort--train_on_eot-v0520)
+- [Seeds & reproducibility (`training.seed`)](#seeds--reproducibility-trainingseed)
+- [Full fine-tuning (`lora.r: 0`)](#full-fine-tuning-lorar-0)
+
+---
+
+## Seeds & reproducibility (`training.seed`)
+
+Two knobs, both unset by default:
+
+```yaml
+training:
+  seed: 1234        # weight init of new params, data order, dropout
+  data_seed: 99     # optional — data order ONLY, so init stays fixed
+```
+
+`seed` reaches `TrainingArguments.seed` (which `Trainer.__init__` hands to
+`transformers.set_seed`, covering `random`, `numpy` and `torch`) and the
+multipack FFD sampler. `data_seed` reaches `TrainingArguments.data_seed`; set it
+alongside `seed` to vary only the order rows are seen in while holding
+initialisation fixed.
+
+**Why you want this.** Without a seed knob every run of a config took the same
+default, so "run it again with a different seed" was impossible: replicates of
+one arm differed only by row permutation and GPU nondeterminism. That understates
+run-to-run spread, and spread is the yardstick a real between-arm difference has
+to beat. Three replicates at three seeds is the cheapest honest error bar you can
+put on a training change:
+
+```bash
+for s in 1 2 3; do
+  soup train --config soup.yaml --output "runs/seed-$s" \
+    && echo "seed $s done"   # set training.seed: $s in the config per run
+done
+```
+
+**Defaults are unchanged, deliberately.** Leaving both unset reproduces every
+pre-existing run exactly: `TrainingArguments` still gets `seed=42`
+(HuggingFace's own default) and `data_seed=None`, and the multipack sampler
+still gets `0` — the value it has had since v0.37.0. The fields are
+`Optional[int]` rather than defaulting to 42 precisely so the trainer can tell
+"unset" from "explicitly 42" and keep those two different historical defaults
+intact.
+
+Bounds: `[0, 2**32 - 1]` (`set_seed` feeds `numpy.random.seed`, which rejects
+anything outside that range), `0` is a legitimate seed, and a YAML `true` is
+rejected rather than silently becoming seed 1. `data_seed` is forwarded to
+Accelerate's dataloader configuration and needs `accelerate >= 1.1.0`;
+below that, transformers warns and ignores it (`seed` is unaffected).
+
+**Scope.** `training.seed` / `training.data_seed` currently reach
+`TrainingArguments` on the **SFT** trainer (`task: sft`). The other task
+wrappers build their own `TrainingArguments` and still take HF's defaults, so
+setting the field on e.g. a DPO run is accepted but has no effect there yet.
+(The `pretrain` and layer-streaming paths do pick `seed` up for their
+samplers.)
+
+**Not a determinism guarantee.** A fixed seed makes the *software* RNG
+reproducible. It does not make CUDA kernels bit-reproducible — non-deterministic
+atomics, autotuned algorithms and a different GPU or library version can still
+move the last digits. For bit-exact reruns you also need
+`torch.use_deterministic_algorithms(True)`, which Soup does not set for you.
+
+## Full fine-tuning (`lora.r: 0`)
+
+Train every parameter, no adapter:
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: sft
+training:
+  quantization: none    # full-FT trains float weights
+  lora:
+    r: 0                # <- no adapter; the base itself trains
+```
+
+`lora.r: 0` is the supported spelling for plain full fine-tuning. It is the one
+`soup`'s classifier trainer has read as "no adapter" since v0.71.12, and the one
+`soup card` already resolves to a dense model rather than an adapter — so the
+model card, the registry entry and the trainer all agree without extra flags. On
+a rank of 0 the SFT trainer skips `get_peft_model` entirely: `soup train` prints
+`Full fine-tuning: N parameter tensor(s) trainable (lora.r=0, no adapter)`
+instead of `LoRA applied`, and the output directory holds a complete model, not
+an adapter to merge.
+
+Requirements, each rejected at config load with the reason named:
+`task: sft`, `backend: transformers`, `modality: text`, and
+`quantization: none` (quantized weights cannot be trained directly — use LoRA
+on top of them, i.e. QLoRA). It is mutually exclusive with every LoRA feature
+(`use_dora` / `use_vera` / `use_olora` / `use_rslora` / `rank_pattern` /
+`alpha_pattern` / `init_strategy` / `moe_lora` / `use_longlora` /
+`relora_steps` / `loraplus_lr_ratio`) — a LoRA knob next to `r: 0` is a
+contradiction rather than something to silently ignore — and with the other two
+"LoRA off" modes, [Spectrum](#spectrum--targeted-training-on-layer-snr-soup-spectrum-scan-v07123)
+(`unfrozen_parameters`) and LISA (`lisa_enabled`), since each independently
+decides what trains. It cannot be combined with layer streaming: streaming keeps
+the decoder on the meta device and trains only the adapter, so there would be
+nothing to full fine-tune.
+
+`freeze_layers` / `freeze_ratio` **do** stay legal with `r: 0` — "train
+everything above layer N" is a real technique — and the trainer respects
+whatever they froze instead of silently unfreezing it. If they leave nothing
+trainable the run is refused rather than burning GPU-hours on a no-op.
+
+Pick between the three "LoRA off" modes by how much you want to train:
+
+| Spelling | Trains | Use when |
+| --- | --- | --- |
+| `lora.r: 0` | everything | you have the VRAM and want the strongest baseline |
+| `unfrozen_parameters` ([Spectrum](#spectrum--targeted-training-on-layer-snr-soup-spectrum-scan-v07123)) | a hand-picked / SNR-ranked set | you want full-FT quality on the layers that matter |
+| `lisa_enabled` (LISA) | a rotating random subset | you want full-FT quality at LoRA-like memory |
+
+> Full fine-tuning needs far more memory than LoRA: optimizer state alone is
+> ~8 bytes per parameter for AdamW. `batch_size: "auto"` estimates memory from
+> a LoRA-shaped model, so on a full-FT run it errs optimistic — set
+> `batch_size` explicitly, or start low and raise it. (This is not new to
+> `r: 0`; the same is true of the Spectrum and LISA full-FT paths.)
 
 ---
 

@@ -3962,17 +3962,22 @@ back to back, so each card contributes exactly one of each. At the observed haza
 that needs roughly 20 arms per mode to have any power, which is about six hours on
 eight cards.
 
-**That experiment was launched and produced nothing.** Eight workers went up at
-20:04 local, one per card, each running both modes at its own seed in sequence
-(seeds 30–37, striding by 8). Sixteen arms had started by 20:31 and none had yet
-finished its 200 steps — the first completions were due around 21:10. At roughly
-20:35 the machine stopped answering: first SSH banner-exchange timeouts, then no
-ICMP at all. It did not come back.
+**That experiment was launched.** Eight workers went up at 20:04 local, one per
+card, each running both modes at its own seed in sequence (seeds 30–37, striding
+by 8).
 
-So the balanced arm contributes **zero data points**, and the attrition question
-closes this session exactly where the paragraph above leaves it. The design is
-recorded rather than the result because the design is the part that survives:
-`balworker.sh` in the scratch harness is what a follow-up should re-run.
+At roughly 20:35 the machine stopped answering — SSH banner-exchange timeouts
+first, then 100% ICMP loss. This section was written at that point as "produced
+nothing, did not come back", the balanced arm was closed at zero data points, and
+that was committed.
+
+**That was wrong, and the correction is left in place rather than edited away.**
+The outage was the network, not the machine: at 21:01 it answered again with
+`up 2 days, 9:57` — no reboot — load average 8.00, all eight workers still alive
+and 21 arms started. The workers ran through the whole outage; nothing was lost
+but my ability to watch it. The lesson is narrow and worth keeping: *unreachable*
+is not *gone*, and a record written during an outage should say which one it
+observed.
 
 One defect in that harness, found while reading its logs and worth naming so the
 next person does not trust the wrong column: it logs

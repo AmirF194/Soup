@@ -3580,6 +3580,78 @@ needed a better argument about what ought to be true. That is the move STEP 24
 closed on — ask the external system rather than ourselves — arriving here as a
 correction *to* STEP 24 rather than as its conclusion.
 
+## STEP 27 — the reward-hack controller, replicated: giving GRPO a seed it never had
+
+STEP 25 ended with a specific, affordable ask: **at least 5 seeds per mode,
+roughly 25 runs at ~55 min each**, and it could not be paid because that estimate
+is of *sequential* execution and the session was ending. Eight cards had been idle
+for most of the previous day. This step pays it in parallel.
+
+It also has to solve the thing STEP 25 named as unsolved in its own last paragraph:
+**`task: grpo` has no seed knob at all.** `training.seed` (#341, STEP 24) reaches
+the SFT wrapper only; `grpo.py` builds its own `GRPOConfig`, which inherits
+`TrainingArguments`' default `seed=42`. So STEP 25's "five runs" were five runs of
+**the same seed**, differing only in GPU nondeterminism — which is exactly the
+within-mode spread it then had to measure against.
+
+### The seed had to be injected from outside, because `src/` is frozen
+
+A release is being assembled off this tree, so no shipped file was touched. The
+seed is forced by a wrapper on `PYTHONPATH`-free ground — a launcher script that
+imports Soup's own CLI after patching two things:
+
+- `set_seed(S)` at process start, because Soup applies `get_peft_model` **before**
+  the trainer object exists, so LoRA's `lora_A` init is drawn before
+  `Trainer.__init__` gets to call `set_seed(args.seed)`;
+- `TrainingArguments.__post_init__` stamped to set `seed` and `data_seed`.
+  `GRPOConfig` subclasses `TrainingArguments` and calls `super().__post_init__()`,
+  so the stamp lands on the object TRL actually consumes.
+
+### The control, run before any long run
+
+A patch that computes a seed and fails to install it looks identical in its own
+logs to one that works — the same failure shape STEP 25 checked for on the beta
+dual-write. So the patch was verified against behaviour, not against reading:
+three probes on three cards, the real 400-prompt config, killed after the first
+few reward-function calls.
+
+| probe | seed | mean proxy RM, reward-fn call 1 |
+|---|---|---|
+| A | 42 | `-0.5709912318270653` |
+| B | 42 | `-0.5709912318270653` — identical, **element by element** |
+| C | 7 | `-0.2243849327787757` |
+
+Same seed reproduces to the last digit; a different seed does not. `[SEEDPATCH]
+GRPOConfig.seed=7 data_seed=7` in the log confirms the stamp reached `GRPOConfig`
+rather than some other `TrainingArguments`.
+
+The seed-42 value is also a bridge to STEP 25, which recorded its A/A floor as
+`-0.5709912776947021` on **five** identical runs. The two agree to seven
+significant figures and differ in the eighth. That difference is not explained
+here and is not treated as agreement-to-the-last-digit: STEP 25's number is TRL's
+own logged `reward` metric and this one is a float64 mean taken in the reward
+function, so the two are summed differently over the same 16 scores.
+
+### Design: paired seeds, which STEP 25 could not do
+
+Because a seed now fixes both LoRA init and data order, `log_only` and
+`kl_control` can be run **at the same seed**, so the pair shares its starting
+point and its batch order and differs only where the controller acts. That is a
+paired comparison rather than two independent samples, and it is the single
+largest power gain available without more GPU time.
+
+- 2 modes x 8 seeds = **16 runs**, 8 concurrent (one per card), two per card.
+- Everything else identical to STEP 25: Qwen2.5-7B-Instruct, LoRA r32/a64,
+  `task: grpo`, the `OpenAssistant/reward-model-deberta-v3-large-v2` proxy,
+  GSM8K 400 prompts, lr 2e-4, `grpo_beta` 0.02, batch 16 x 8 generations, 512-token
+  cap, `info_rm` detector.
+- **Held-out evaluation is mandatory per arm**, not best-effort: 200 GSM8K items,
+  greedy, run on the same card immediately after training, with the adapter and the
+  mitigation log snapshotted out of the run directory first. STEP 25's held-out arm
+  was empty because crashes destroyed the adapters before anyone read them.
+
+Results follow as they land.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

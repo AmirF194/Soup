@@ -19,6 +19,29 @@ It composes two families:
 
 No lm-eval, no network, no torch — the whole surface is CPU-testable and the
 ``soup ci init`` core-only install keeps working.
+
+#316 — two of the three behavioural suites measured NOTHING on a real model.
+Measured on an H100 against Meta-Llama-3.1-8B-Instruct, both were **harness**
+defects, not model failures:
+
+- ``mini_tool_call`` scored **0.000/40**. The prompts were bare user questions
+  with no tool schema anywhere, so a fully tool-capable model correctly answered
+  in prose and 0 of 40 outputs contained any JSON. The fixture now renders a
+  candidate tool menu (name + description) ahead of each question, and names the
+  ``{"function": {"name": ...}}`` envelope the scorer actually parses. The menu
+  is a *selection* task — 8 candidates drawn deterministically from the suite's
+  34 tools, excluding near-synonyms of the correct one so a miss means lost
+  tool-calling rather than an ambiguous prompt.
+- ``mini_format_json`` scored **0.000/40** because 38/40 answers were inside a
+  ```json fence and the container check parsed the whole string. Extraction is
+  now bounded (see ``_extract_json_container``).
+- Both were additionally truncated by a 64-token generation budget; see
+  ``BEHAVIOURAL_MAX_NEW_TOKENS``.
+
+A suite pinned at 0.000 contributes nothing to the gate but also cannot *fall*,
+which is precisely how the defect stayed invisible. Each repair therefore ships
+with a control against the symmetric failure — a schema that hands over the
+answer, or an extractor eager enough to pin the suite at 1.000.
 """
 
 from __future__ import annotations
@@ -56,6 +79,25 @@ DEFAULT_GENERAL_SUITE: Tuple[str, ...] = tuple(MINI_BENCHMARKS) + EXTENDED_SUITE
 _MAX_FIXTURE_BYTES = 4 * 1024 * 1024
 # Cap a single model output before scoring (mirrors diagnose ``_MAX_OUTPUT_LEN``).
 _MAX_OUTPUT_LEN = 64 * 1024
+
+#: Generation budget the behavioural suites need (#316).
+#:
+#: ``live_eval.make_generator`` defaults to 64 new tokens, which is sized for the
+#: MCQ suites — they answer in a single letter. Measured on an H100 against
+#: Meta-Llama-3.1-8B-Instruct, 64 truncated **31/40** tool calls and **15/40**
+#: JSON fences; 31 of those 32 tool-call failures were a single missing closing
+#: brace. A caller building generators for these suites must pass this instead,
+#: or it scores the budget rather than the model.
+BEHAVIOURAL_MAX_NEW_TOKENS = 256
+
+# A JSON container must BEGIN within this many characters of the output. A model
+# that emits 2 KB of prose before its JSON did not "respond with JSON"; scanning
+# the whole output for any bracket pair would credit incidental braces in prose
+# and pin the suite at a constant 1.0 — exactly as blind as the 0.0 it replaces.
+_MAX_CONTAINER_SCAN_CHARS = 2048
+# ...and at most this many candidate start positions are tried, so a
+# pathological payload ("[" * 20000) costs a bounded number of failed parses.
+_MAX_CONTAINER_SCAN_STARTS = 48
 
 _fixture_cache: dict[str, Tuple[dict, ...]] = {}
 
@@ -156,11 +198,100 @@ def _fraction_passing(
     return passed / len(items)
 
 
+def tool_names_in_prompt(prompt: str) -> list[str]:
+    """The tool names a rendered ``mini_tool_call`` prompt shows the model.
+
+    The fixture embeds its candidate menu as a single JSON-array line, so this
+    reads the real menu rather than regexing prose. Returns ``[]`` for a prompt
+    with no menu (which is itself the #316 defect — see the module docstring).
+    """
+    if not isinstance(prompt, str):
+        return []
+    for line in prompt.splitlines():
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            entries = json.loads(line)
+        except Exception:  # noqa: BLE001 — a prose line that merely starts with "["
+            continue
+        if not isinstance(entries, list):
+            continue
+        names = [
+            entry["name"]
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        ]
+        if names:
+            return names
+    return []
+
+
+def _extract_json_container(text: str):
+    """The first JSON object/array in ``text``, or ``None``.
+
+    Model answers arrive wrapped: measured on an H100, **38 of 40**
+    ``mini_format_json`` answers were inside a ```json fence and 15 of those
+    fences were unclosed (truncated by the 64-token budget). Parsing the whole
+    string scored the *envelope*, not the JSON, and the suite read 0.000 for a
+    model emitting correct JSON.
+
+    The scan is deliberately bounded on both axes (see the module constants):
+    an extractor that hunts the entire output for any bracket pair turns the
+    suite into a constant 1.0, which detects exactly as little as a constant 0.0.
+    """
+    if not isinstance(text, str) or "\x00" in text or len(text) > _MAX_OUTPUT_LEN:
+        return None
+    # Fast path: the whole output IS the container (the pre-#316 behaviour, kept
+    # so a bare answer's semantics are byte-identical).
+    try:
+        parsed = json.loads(text.strip())
+    except Exception:  # noqa: BLE001 — wrapped / malformed; fall through to the scan
+        pass
+    else:
+        return parsed if isinstance(parsed, (dict, list)) else None
+    decoder = json.JSONDecoder()
+    starts = 0
+    for idx, char in enumerate(text[:_MAX_CONTAINER_SCAN_CHARS]):
+        if char not in "{[":
+            continue
+        starts += 1
+        if starts > _MAX_CONTAINER_SCAN_STARTS:
+            break
+        try:
+            # raw_decode stops at the end of the value, so trailing prose — or a
+            # fence the budget cut off mid-close — does not invalidate it.
+            parsed, _end = decoder.raw_decode(text, idx)
+        except Exception:  # noqa: BLE001 — incl. RecursionError on deep nesting
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return None
+
+
+def _unwrap_tool_call(output: str) -> str:
+    """Re-serialise the first JSON object in ``output`` for the tool scorer.
+
+    ``eval.custom._parse_tool_call`` parses the whole string too, so a correct
+    call inside a fence is the same packaging-vs-content miss as above. This can
+    only ever *reveal* a call — ``tool_call_name_match`` still requires an exact
+    function-name match, so unwrapping cannot credit the wrong tool.
+    """
+    extracted = _extract_json_container(output)
+    if isinstance(extracted, dict):
+        return json.dumps(extracted)
+    return output if isinstance(output, str) else ""
+
+
 def _score_tool_call(items: Tuple[dict, ...], gen: GeneratorFn) -> float:
     from soup_cli.eval.custom import tool_call_name_match
 
     return _fraction_passing(
-        items, gen, lambda item, out: tool_call_name_match(out, item.get("expected", ""))
+        items,
+        gen,
+        lambda item, out: tool_call_name_match(
+            _unwrap_tool_call(out), item.get("expected", "")
+        ),
     )
 
 
@@ -173,13 +304,7 @@ def _is_json_container(text: str) -> bool:
     catches broadly so a deeply-nested payload's ``RecursionError`` (which the
     json C-scanner can raise even under the length cap) scores as invalid.
     """
-    if not isinstance(text, str) or "\x00" in text or len(text) > _MAX_OUTPUT_LEN:
-        return False
-    try:
-        parsed = json.loads(text)
-    except Exception:  # noqa: BLE001 — malformed / too-deep JSON is just "not a container"
-        return False
-    return isinstance(parsed, (dict, list))
+    return _extract_json_container(text) is not None
 
 
 def _score_format_json(items: Tuple[dict, ...], gen: GeneratorFn) -> float:
@@ -223,6 +348,7 @@ def score_bundled_suite(name: str, gen: GeneratorFn) -> float:
 
 
 __all__ = [
+    "BEHAVIOURAL_MAX_NEW_TOKENS",
     "DEFAULT_GENERAL_SUITE",
     "EXTENDED_SUITE_NAMES",
     "MINI_FORMAT_JSON",
@@ -231,4 +357,5 @@ __all__ = [
     "is_bundled_suite",
     "load_suite_items",
     "score_bundled_suite",
+    "tool_names_in_prompt",
 ]

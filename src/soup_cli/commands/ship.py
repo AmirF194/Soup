@@ -394,13 +394,27 @@ def _resolve_generators(
     base: str, tuned: Optional[str], adapter: Optional[str], device: Optional[str]
 ) -> Tuple[Callable[[str], str], Callable[[str], str]]:
     """Build ``(base_gen, tuned_gen)`` from live_eval (greedy decode)."""
+    # #316 — the behavioural suites need a budget that fits a real tool call.
+    # At make_generator's default of 64, 31 of 40 tool calls and 15 of 40 JSON
+    # fences were truncated ONE CLOSING BRACE short and scored 0.000 on a model
+    # that produces them correctly. Extraction cannot repair truncated JSON and
+    # must not try — a decoder lenient enough to guess the missing brace would
+    # credit incidental braces in prose instead.
+    from soup_cli.eval.gate_suites import BEHAVIOURAL_MAX_NEW_TOKENS
     from soup_cli.utils import live_eval
 
-    base_gen = live_eval.make_generator(base, device=device)
+    base_gen = live_eval.make_generator(
+        base, device=device, max_new_tokens=BEHAVIOURAL_MAX_NEW_TOKENS
+    )
     if adapter:
-        tuned_gen = live_eval.make_generator(base, adapter=adapter, device=device)
+        tuned_gen = live_eval.make_generator(
+            base, adapter=adapter, device=device,
+            max_new_tokens=BEHAVIOURAL_MAX_NEW_TOKENS,
+        )
     elif tuned:
-        tuned_gen = live_eval.make_generator(tuned, device=device)
+        tuned_gen = live_eval.make_generator(
+            tuned, device=device, max_new_tokens=BEHAVIOURAL_MAX_NEW_TOKENS
+        )
     else:  # pragma: no cover — _verdict_live guarantees one of tuned/adapter
         raise ValueError("need --tuned or --adapter")
     return base_gen, tuned_gen

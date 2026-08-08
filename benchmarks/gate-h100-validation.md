@@ -3797,6 +3797,56 @@ largest power gain available without more GPU time.
 
 Results follow as they land.
 
+### #342 first, because it is what decides how many replicates exist
+
+The crash from STEP 25 is still here and it is the binding constraint, so it was
+characterised before the quality numbers rather than after.
+
+**The same seed does not reproduce the crash.** `log_only` seed 1 died at step 9.
+Re-run at the same seed on the same card, it started **bit-identically** — first
+reward-function call mean `0.8265886483713984` in both — and ran straight past
+step 9. So the crash is downstream of GPU nondeterminism, not of the seed. STEP 25
+said as much; it could not *demonstrate* it, because it had no seed to hold fixed.
+
+**There is a pre-crash signature, and STEP 25's "none" was too strong.** Every
+crashed arm's last logged step looks like this:
+
+| arm | died at | loss on the last step | `grad_norm` | `kl` | clipped |
+|---|---|---|---|---|---|
+| `log_only` s1 | 9 | −0.0101 | **nan** | 0.024 | 0.0 |
+| `log_only` s2 | 35 | 0.0635 | **nan** | 0.242 | 0.0 |
+| `log_only` s3 | 81 | 0.0790 | **nan** | 0.176 | 0.0 |
+| `log_only` s4 | 71 | 0.0852 | **nan** | 0.168 | 0.0 |
+| `log_only` s6 | 32 | 0.0517 | **nan** | 0.284 | 0.0 |
+| `kl_control` s3 | 68 | 0.0568 | **nan** | 0.229 | 0.0 |
+
+**6 of 6: the loss is finite and the gradient norm is nan, on the same step.** The
+step before is unremarkable in every arm — `grad_norm` 0.13–0.36, `kl` 0.09–0.45,
+reward 2–5, no completion clipping. That places the fault in the **backward**: a
+forward that produced a finite loss, followed by gradients that are not finite,
+followed on the next iteration by a device-side assert inside generation, which is
+what a sampler does when it is handed a probability vector containing nan.
+
+This is worth stating precisely because it rules out the obvious explanation. "lr
+2e-4 on a 7B is too hot, the policy diverged" predicts a ramp — rising `kl`, rising
+`grad_norm`, completions running to the cap. None of that is present in any of the
+six. The transition is one step wide and it starts in the backward.
+
+A caution on that table: it also **destroys the mode comparison it appears to
+support.** Five of the six crashes are `log_only`, which reads as an effect until
+one asks whether the controller was doing anything. It was not, in the arm that
+matters: at seed 2 the `kl_control` run took **0 actions** and held `beta` at 0.02
+for its whole life while its `log_only` twin — same seed, same start — died at step
+35. Two mechanically identical runs, one crashed and one did not. So the
+asymmetry cannot be read as the controller protecting anything, at least not from
+this. The counts are reported below with that control attached.
+
+**And waves 1–2 confounded mode with card**: `log_only` ran on the even GPUs and
+`kl_control` on the odd ones, which is exactly the shape that makes a bad card
+look like a treatment effect. Wave 3 is laid out so both arms of a pair run on the
+**same** card, one after the other, which removes the card from the paired
+comparison and puts both modes on every card.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

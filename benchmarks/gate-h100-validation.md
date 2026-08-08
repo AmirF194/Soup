@@ -3847,6 +3847,95 @@ look like a treatment effect. Wave 3 is laid out so both arms of a pair run on t
 **same** card, one after the other, which removes the card from the paired
 comparison and puts both modes on every card.
 
+### The result, at 14 completed arms and 6 pairs
+
+Written at this point rather than at the end because the machine is on a clock.
+Numbers below are the state after ~3.5 hours of the pool; a later block continues
+them.
+
+Held-out, 200 GSM8K items, greedy, base model **0.905** strict.
+
+| mode | n | mean strict | sd | range |
+|---|---|---|---|---|
+| `log_only` | 7 | 0.626 | 0.364 | 0.905 |
+| `kl_control` | 7 | 0.714 | 0.337 | 0.845 |
+
+**The paired deltas are the answer, and the answer is still no.** Six seeds where
+both modes completed, `kl_control − log_only`:
+
+**+0.505, −0.795, +0.570, −0.005, −0.025, +0.890** — mean **+0.190**, sd **0.598**,
+**3 positive / 3 negative**, paired *t* = 0.78 on 5 df.
+
+That is not a smaller effect than STEP 25 measured, it is a *larger* one — the
+between-mode gap moved 0.130 → 0.254 unpaired — sitting inside a spread that grew
+faster than it did. The reason is visible in the deltas themselves and it is not
+noise in the ordinary sense: **individual seeds move by ±0.8**. This process is
+bimodal. A run either keeps its output format or loses it completely, and which
+one happens is not decided by the mode.
+
+Two illustrations from the table, both at the extremes: `log_only` seed 8 finished
+at strict **0.000**, format-blind **0.065**, marker rate **0.000**, with **every**
+held-out generation hitting the token cap — total collapse. `kl_control` seed 2
+finished at strict **0.095** with format-blind **0.920** and the cap hit on every
+generation — the length blow-up of STEP 25's phase 2, with the capability still
+underneath it. Neither mode is safe from this.
+
+**One number does separate the modes, and it is a spread, not a mean.** On the
+format-blind metric — is the right answer anywhere in the output, i.e. did the
+model keep the capability at all —
+
+| mode | n | mean | **sd** | range |
+|---|---|---|---|---|
+| `log_only` | 7 | 0.789 | **0.320** | 0.865 (0.065 … 0.930) |
+| `kl_control` | 7 | 0.923 | **0.019** | 0.050 (0.900 … 0.950) |
+
+Every `kl_control` run in this set stayed between 0.900 and 0.950. `log_only`
+ranged from 0.065 to 0.930. But **one catastrophic run in seven against zero in
+seven is Fisher p = 1.0**, so this is a shape worth another look, not a result. It
+is recorded because it is the only place the two modes look different in kind
+rather than in degree.
+
+### The attrition asymmetry: nominally significant, and reported as unresolved
+
+| mode | launched | crashed | rate | crashes per step run |
+|---|---|---|---|---|
+| `log_only` | 29 | 17 | 0.586 | 0.00526 |
+| `kl_control` | 14 | 3 | 0.214 | 0.00155 |
+
+Fisher exact **p = 0.0275**, a 3.4x difference in per-step hazard. It would be an
+attractive headline — *the controller does not measurably protect quality, but it
+cuts the divergence-crash rate by a factor of three* — and two checks say do not
+publish it as one.
+
+**The mechanism control does not support it.** The only available causal story is
+that raising `beta` keeps the policy near the reference and out of the numerical
+region where this happens. If that were it, `kl_control` runs where the controller
+**never acted** should crash like `log_only`. They do not:
+
+| `kl_control` arms | n | crashed | rate |
+|---|---|---|---|
+| controller acted | 10 | 2 | 0.20 |
+| controller never acted | 4 | 1 | 0.25 |
+
+Four arms is far too few to settle it — 1 of 4 is consistent with almost anything —
+but the control points away from the only mechanism on offer, which is the opposite
+of what a real effect looks like.
+
+**And the card is still confounded with the mode.** Crash rate per card runs 0.17
+to 0.78, and the three worst cards are the three that ran almost only `log_only`
+(gpu2: 8 `log_only` vs 1 `kl_control`; gpu6: 7 vs 1; gpu0: 4 vs 0). That is not a
+design mistake left uncorrected — it is what the completion logic *does*: it retries
+the side that is missing, the missing side is more often `log_only`, and those
+retries pile onto whichever card is free. Every card has at least one crash, so
+"one bad card" is not the explanation, but a graded difference between cards would
+produce exactly this table.
+
+So the honest verdict on attrition is **unresolved, with a specific experiment that
+would settle it**: one `log_only` and one `kl_control` arm per card at a fresh seed,
+back to back, so each card contributes exactly one of each. At the observed hazards
+that needs roughly 20 arms per mode to have any power, which is about six hours on
+eight cards.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

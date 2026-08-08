@@ -69,14 +69,78 @@ def _import_online_dpo():
         ) from exc
 
 
-def _trl_has_judges() -> bool:
-    """True on trl 0.19.x (pairwise ``BasePairwiseJudge`` API), False on trl 1.x."""
-    try:
-        from trl import BasePairwiseJudge  # noqa: F401
+def _trl_accepts(param: str) -> bool:
+    """Does the installed ``OnlineDPOTrainer`` actually take this keyword?
 
-        return True
+    #300 — the previous probe asked ``from trl import BasePairwiseJudge`` and used
+    the answer to decide whether to pass ``reward_model=``. Those two facts
+    DECOUPLED: trl dropped ``reward_model=`` at **0.25.0** and kept
+    ``BasePairwiseJudge`` exported through **0.28.0**, so the probe said yes for
+    every trl in the supported ``<0.27`` range — including whatever a fresh
+    ``pip install "soup-cli[train]"`` resolves — and the wrapper passed a keyword
+    removed five releases earlier::
+
+        TypeError: OnlineDPOTrainer.__init__() got an unexpected keyword
+        argument 'reward_model'
+
+    Measured on trl 0.26.2: the judge path trains, the reward_model path dies
+    before step 0 with no adapter written.
+
+    THE MRO WALK IS LOAD-BEARING, and a naive ``inspect.signature(cls.__init__)``
+    is wrong. On 0.26.2 the top-level ``OnlineDPOTrainer`` is a deprecation shim::
+
+        def __init__(self, *args, **kwargs):
+            warnings.warn("... now located in `trl.experimental` ...")
+            super().__init__(*args, **kwargs)
+
+    so the direct signature reports NO parameters at all and a probe built on it
+    answers False for ``judge`` too — which would have broken the judge path that
+    currently works. The real signature lives one step down the MRO, in
+    ``trl.experimental.online_dpo``. So: walk the MRO and take the first
+    ``__init__`` that is not a pure ``*args/**kwargs`` passthrough.
+    """
+    import inspect
+
+    try:
+        from trl import OnlineDPOTrainer
     except ImportError:
-        return False
+        try:
+            from trl.experimental.online_dpo import OnlineDPOTrainer
+        except ImportError:
+            return False
+
+    for base in OnlineDPOTrainer.__mro__:
+        init = base.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            params = inspect.signature(init).parameters
+        except (TypeError, ValueError):  # pragma: no cover - C-level __init__
+            continue
+        named = {
+            name: spec
+            for name, spec in params.items()
+            if name != "self"
+        }
+        if not named:
+            continue
+        if all(
+            spec.kind in (spec.VAR_POSITIONAL, spec.VAR_KEYWORD)
+            for spec in named.values()
+        ):
+            continue  # a passthrough shim - it forwards everything, so it says nothing
+        return param in named
+    return False
+
+
+def _trl_has_judges() -> bool:
+    """Does this trl take a pairwise ``judge=``?
+
+    Kept as the judge path's own question, and answered from the signature for
+    the same reason as :func:`_trl_accepts` — the old import probe agreed with
+    reality only by coincidence.
+    """
+    return _trl_accepts("judge")
 
 # Fallback chat template for base models that ship none. Unlike the shared
 # ``constants.DEFAULT_CHAT_TEMPLATE``, this one emits an assistant generation
@@ -376,9 +440,13 @@ class OnlineDPOTrainerWrapper:
             reward_tok = AutoTokenizer.from_pretrained(
                 tcfg.reward_model, trust_remote_code=self._trust_remote_code
             )
-            if has_judges:  # trl 0.19.x
+            # #300 — ask whether THIS trl takes `reward_model=`, not whether it
+            # exports a judge class. trl 0.25-0.28 answers NO to the first and
+            # YES to the second, which is exactly the range the `<0.27` cap
+            # resolves in, so the old proxy sent a removed keyword on every
+            # supported install.
+            if _trl_accepts("reward_model"):
                 return {"reward_model": reward, "reward_processing_class": reward_tok}
-            # trl 1.x — a reward model is one of reward_funcs
             return {
                 "reward_funcs": [reward],
                 "reward_processing_classes": [reward_tok],

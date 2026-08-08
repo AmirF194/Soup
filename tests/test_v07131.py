@@ -655,11 +655,24 @@ class TestBuildJudgeOrReward:
             "transformers.AutoTokenizer.from_pretrained", lambda *a, **k: object()
         )
         result = _online_dpo_wrapper()._build_judge_or_reward(_Tcfg(reward="some/rm"))
-        if _TRL_HAS_JUDGES:  # trl 0.19.x
+        # #300 — this used to branch on `_TRL_HAS_JUDGES`, the SAME predicate the
+        # production code branched on, so it asserted that the code returned what
+        # its own condition said and could not fail. It stayed green while
+        # `reward_model=` was being passed to a trl that removed it at 0.25.0.
+        #
+        # It now asks the installed trl instead. `tests/test_issue300_online_dpo_kwargs.py`
+        # carries the stronger form (binding every built kwarg against the real
+        # signature); this one keeps the shape assertion honest.
+        from soup_cli.trainer.online_dpo import _trl_accepts
+
+        if _trl_accepts("reward_model"):
             assert set(result.keys()) == {"reward_model", "reward_processing_class"}
-        else:  # trl 1.x — a reward model is one of reward_funcs
+        else:
             assert set(result.keys()) == {"reward_funcs", "reward_processing_classes"}
             assert len(result["reward_funcs"]) == 1
+        assert not [k for k in result if not _trl_accepts(k)], (
+            f"built {sorted(result)} but this trl accepts none of the missing ones"
+        )
 
     def test_precedence_override_wins(self):
         import soup_cli.trainer.online_dpo as od

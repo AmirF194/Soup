@@ -18,10 +18,18 @@ appear in the order they were run, not in the order they would read best.
 
 > **STATUS, read this first.** The defect in item 4 is **REPAIRED** (STEP 14) and
 > the repair is gated on real 32B at 256/256 gradients, +2.9% VRAM, −4.8%
-> throughput. Items 1 and 4 below describe the state *as measured*, which is what a
-> working record is for; they are no longer the state of the shipped code. A second
-> defect, #328, was diagnosed to a cause in Soup and also repaired (STEP 15). The
-> steps are in the order they happened, not in the order they read best.
+> throughput; **72B was not re-run after the fix.** Items 1 and 4 below describe the
+> state *as measured*, which is what a working record is for; they are no longer the
+> state of the shipped code. A second defect, #328, was diagnosed to a cause in Soup
+> and also repaired (STEP 15). The steps are in the order they happened, not in the
+> order they read best.
+>
+> **And read this before quoting any "exact" from this file:** every exactness claim
+> here is two independent measurements — the **forward** (logits, `torch.equal`) and
+> the **backward** (LoRA gradients) — and above ~165 MiB per NF4 layer they
+> disagreed. "Bit-exact at 72B" is a *forward* statement; 72B's backward was
+> measured WRONG 8/320. The per-model ledger with both halves, the quantisation, the
+> MiB/layer and the reference is at the end of the summary below.
 
 ## What this session established
 
@@ -30,12 +38,16 @@ appear in the order they were run, not in the order they would read best.
    0.5B, 8B, 14B, 32B and 72B. Every previously published bit-exactness result
    was on 3-layer from-config checkpoints, because a 4 GB card cannot hold a
    resident 8B to compare against.
-   **The BACKWARD is a separate claim and, AS MEASURED, it did not hold above
-   ~165 MiB per NF4 layer** — gradients were exact at 0.5B / 8B / 14B and wrong at
-   32B / 72B (item 4). Nothing in this record says "bit-exact" about a model without
-   saying which half; see the table in STEP 6, which exists because two readers
-   took the unqualified phrase to cover both. **STEP 14 repairs the backward and
-   re-gates it at 256/256 on real 32B.**
+   **The BACKWARD is a separate claim, measured separately, and AS MEASURED it did
+   not hold above ~165 MiB per NF4 layer** — gradients were exact at 0.5B / 8B /
+   14B and wrong at 32B / 72B (item 4). **The two are not in tension: 72B's NF4
+   layer is ~432 MiB, far above the threshold, and 72B's entry in this record is
+   "forward exact, backward WRONG 8/320". Nowhere is 72B called exact in the
+   backward.** Nothing here says "bit-exact" about a model without saying which
+   half; the full per-model ledger is immediately below this list, and it exists
+   because two readers took the unqualified phrase to cover both halves and
+   reported a contradiction that is not there. **STEP 14 repairs the backward and
+   re-gates it at 256/256 on real 32B; 72B was not re-run after the fix.**
 2. **The published laptop throughput reproduces on completely different
    hardware.** Llama-3.1-8B NF4: 119.6 tok/s in 3.32 GB peak on an RTX 3050
    Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
@@ -120,6 +132,47 @@ appear in the order they were run, not in the order they would read best.
     The full-fine-tuning control trains to completion, which both isolates the
     trigger and explains why an earlier ZeRO-3 run passed.
 
+### The exactness ledger — read this before quoting any "exact" from this file
+
+Every exactness claim in this record is **two independent claims**, measured
+separately: the **forward** (logits, `torch.equal`) and the **backward** (every
+LoRA gradient tensor). Above the threshold in item 4 they disagree — the forward
+is exact while the backward is not — so a phrase like "bit-exact at 72B" is only
+meaningful with the half named.
+
+This is the whole table, up front, so nothing has to be inferred by combining two
+sentences from different sections. It repeats the table in STEP 6 verbatim and
+adds the reference and post-repair columns. **A cell that was not measured says
+so; no cell is left blank.**
+
+| model | quant | MiB/layer | **forward** (logits) | **backward** (LoRA grads), `pin=True` | backward, `pin=False` | 5-step loss curve | reference compared against | **backward after the STEP 14 repair** |
+|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | NF4 | 7 | exact `0.0` | exact 96/96 | not tested | identical | resident **NF4**, same box | not tested *(was already exact)* |
+| Llama-3.1-8B | NF4 | 105 | exact `0.0` | exact 128/128 *(50 backwards)* | not tested | identical | resident **NF4**, same box | not tested *(was already exact)* |
+| Llama-3.1-8B | bf16 | 480 | exact `0.0` | exact 128/128 | not tested | not tested | resident **bf16**, same box | n/a — bf16 never affected |
+| Qwen2.5-14B | NF4 | 132 | exact `0.0` | exact 192/192 *(50 backwards)* | not tested | identical | resident **NF4**, same box | not tested *(was already exact)* |
+| Qwen2.5-14B | bf16 | 570 | exact `0.0` | exact 192/192 | not tested | not tested | resident **bf16**, same box | n/a — bf16 never affected |
+| Qwen2.5-32B | NF4 | 234 | exact `0.0` | **WRONG 8/256** | exact 256/256 | **diverged**, rel 0.0586 | resident **NF4**, same box | **exact 256/256**, 5 reps (STEP 14 gate) |
+| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 | resident **NF4**, same box | **not tested** — 72B was not re-run after the fix |
+
+How to read it:
+
+- **The forward column is uniform and the backward column is not.** That is the
+  whole finding, and it is why the two are never collapsed into one verdict here.
+  Logits being `torch.equal` at 72B says nothing about 72B's gradients, and the
+  record does not claim otherwise anywhere.
+- **The reference always matches the numerics of the thing under test** — streamed
+  NF4 against resident NF4, streamed bf16 against resident bf16. Never streamed NF4
+  against resident bf16, whose quantisation error is wider than the defect and would
+  hide it.
+- **MiB/layer is the axis the defect keys on**, bracketed at 163.8–171.5 MiB
+  (item 4). Both rows above it are broken pre-repair; every row below it is exact.
+  The bf16 rows at 480 and 570 MiB/layer are the control that the axis is not bytes
+  alone.
+- **The last column is post-repair state, not a second opinion on the same runs.**
+  Only 32B was re-gated. 72B's pre-repair "WRONG 8/320" is what was measured, and
+  nobody has measured it since the fix.
+
 ### Why this session needed someone else's hardware
 
 **Seven defects were repaired** — #331, #328, the `use_liger` crash, the silent
@@ -161,15 +214,20 @@ box *in principle*, not merely inconveniently:
 1. **Bit-exactness at real model sizes.** The shipped bit-exactness gates use
    tiny from-config checkpoints (3 layers, hidden 32, vocab 64) because the
    standard demands a *resident* reference and a resident 8B does not fit in
-   4 GB. So the strongest existing claim is "exact on 135M". On an 80 GB card a
+   4 GB. So the strongest existing claim is "forward exact on 135M, with a
+   non-zero layer-0 gradient" — and those fixtures carry an NF4 layer of 0.01
+   MiB, against the 163.8–171.5 MiB threshold this session found. On an 80 GB card a
    resident NF4 8B / 14B / 32B all fit, which turns that into "exact on real
-   models". This is the most valuable of the three.
+   models" and, as it turned out, into the first opportunity to compare a full
+   gradient set against a resident reference at all. This is the most valuable of
+   the three.
 2. **A comparison against DeepSpeed ZeRO-3 CPU offload** on the same hardware,
    same data, same model. There is currently no such comparison anywhere in the
    record, and it is the first thing a reviewer asks.
-3. **RAM vs disk tier.** v0.72.3 shipped the disk tier bit-exact but with its
-   *speed* relative to RAM explicitly unmeasured. See "Constraint 2" below —
-   this box probably cannot answer it either, for a different reason.
+3. **RAM vs disk tier.** v0.72.3 shipped the disk tier with its forward bit-exact
+   against both the RAM tier and a resident model on tiny from-config checkpoints,
+   but with its *speed* relative to RAM explicitly unmeasured. See "Constraint 2"
+   below — this box probably cannot answer it either, for a different reason.
 
 Plus two things that only 8 cards make practical: **variance** (every published
 number so far is n=1) and a **size sweep**.
@@ -432,6 +490,13 @@ cannot go green on this class of machine.
 
 ## STEP 2 — bit-exactness at real model sizes
 
+**What this step measures: the FORWARD.** Every "bit-exact" in this section means
+`torch.equal` on logits against a resident reference of matching quantisation. The
+backward is checked here only as "layer-0 gradient non-zero and every layer
+non-zero" (check 2 below) — a liveness check, not an equality one. The full
+gradient-vs-resident comparison starts in STEP 2b, and it is where 32B and 72B
+part company with the forward.
+
 The point of the whole trip. The shipped gates compare a streamed model against
 a **resident** model of the same numerics, and on a 4 GB card the largest thing
 with a resident reference is a 3-layer toy. Here the reference fits.
@@ -515,9 +580,12 @@ curves_equal  true             curve_max_rel  0.0
 meta_params  288               store 0.18 GB pinned, tier ram
 ```
 
-### **Llama-3.1-8B-Instruct, NF4, CUDA bf16 — bit-exact**
+### **Llama-3.1-8B-Instruct, NF4 (105 MiB/layer), CUDA bf16 — forward bit-exact**
 
-The result this trip existed for.
+The result this trip existed for. Reference: a resident **NF4** Llama-3.1-8B on
+the same box. 8B's backward is checked against that same reference later, in STEP
+2b and STEP 6, and comes back exact 128/128 over 50 consecutive backwards — but
+that is a separate measurement, not this one.
 
 ```
 CUDA_VISIBLE_DEVICES=0 python /root/gate/bitexact.py \
@@ -553,7 +621,9 @@ CUDA_VISIBLE_DEVICES=0 python /root/gate/bitexact.py \
 `max_abs_logit_diff` is exactly `0.0` and `torch.equal` is true over a
 `[1, 128, 128256]` logits tensor whose largest element is 26.875 — so this is
 equality on real values, not equality of two zeros. 128 adapter tensors copied,
-so it is not the vacuous comparison. All 32 layers receive gradient.
+so it is not the vacuous comparison. All 32 layers receive gradient — which says
+the gradients are *live*, not that they are *equal* to the resident reference;
+that comparison is STEP 2b's.
 
 `total_params` reports 8,030,261,248, i.e. the honest count from the sharder
 rather than PEFT's inflated NF4 figure — the v0.72.2 display defect is fixed and
@@ -569,24 +639,29 @@ reference and never frees it before timing the streamed loss curve, so the
 the streamed number is *larger* than the resident one, which would otherwise
 contradict the entire feature.
 
-Left in the record rather than deleted. It does not touch the bit-exactness
-claim — that comparison requires both models in memory *by construction* — but a
-real streamed-peak number has to come from a separate single-model run.
+Left in the record rather than deleted. It does not touch the forward
+bit-exactness claim — that comparison requires both models in memory *by
+construction* — but a real streamed-peak number has to come from a separate
+single-model run.
 
 ### 14B and 32B — logits bit-exact, and then 32B's loss curve did not match
 
 Run in parallel on separate cards (GPU 1 and GPU 2). Parallelism cannot affect
 an equality claim, only a timing one, and no timing is claimed here.
 
-| model | params | layers | store (pinned) | shard | copied | max abs logit diff | bit-exact | layer-0 grad | layers w/ grad | curves equal |
+All four rows are **NF4**, streamed against a resident **NF4** reference. "Forward
+bit-exact" is `torch.equal` on logits; "layer-0 grad" and "layers w/ grad" are
+liveness checks on the backward, **not** equality against the reference.
+
+| model | params | layers | store (pinned) | shard | copied | max abs logit diff | **forward** bit-exact | layer-0 grad *(non-zero?)* | layers w/ grad | curves equal |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Qwen2.5-0.5B | 494,032,768 | 24 | 0.18 GB | 1.0 s | 96 | 0.0 | yes | 9.093866e-01 | 24/24 | yes |
 | Llama-3.1-8B | 8,030,261,248 | 32 | 3.35 GB | 23.3 s | 128 | 0.0 | yes | 1.736659e-01 | 32/32 | yes |
 | Qwen2.5-14B | 14,770,033,664 | 48 | 6.35 GB | 35.9 s | 192 | 0.0 | yes | 1.185666e-02 | 48/48 | yes |
 | Qwen2.5-32B | 32,763,876,352 | 64 | 14.99 GB | 79.2 s | 256 | 0.0 | yes | 6.008708e-03 | 64/64 | **no** |
 
-All four are bit-exact in the **forward**. 32B is the odd one: `curves_equal:
-false`, `curve_max_rel: 0.0586`.
+All four are bit-exact in the **forward**, and nothing here is yet a claim about
+the backward. 32B is the odd one: `curves_equal: false`, `curve_max_rel: 0.0586`.
 
 ```
 streamed               resident                diff
@@ -722,9 +797,11 @@ and rep 3's `worst_rel` came out 8.5330 in one run and 55.9389 in another.
   produces gradients that disagree with a deterministic resident reference on
   every layer that requires a transfer, from the second backward pass onward.
   The forward stays bit-exact throughout.
-- **Confirmed:** 0.5B, 8B and 14B do not show it — 96/96, 128/128 and 192/192
-  gradients bit-exact across repeated passes, and 5-step curves identical to
-  resident.
+- **Confirmed:** 0.5B, 8B and 14B in NF4 (7, 105 and 132 MiB/layer) do not show
+  it — 96/96, 128/128 and 192/192 **gradient** tensors bit-exact against the same
+  resident NF4 reference across repeated passes, and 5-step curves identical to
+  resident. These three are the only sizes where the *backward* is exact as well
+  as the forward.
 - **Not established:** the exact threshold, whether it is per-layer bytes,
   layer count, or transfer-vs-compute ratio; whether it appears at 8B under a
   longer sequence or larger batch (which lengthen compute, and would *narrow* the
@@ -736,8 +813,9 @@ and rep 3's `worst_rel` came out 8.5330 in one run and 55.9389 in another.
   make a measurement pass, and this is a finding to hand over, not a patch to
   smuggle in.
 
-Practical reading for now: **layer streaming is verified exact through 14B and
-is not trustworthy at 32B** until the pool synchronisation is fixed. The
+Practical reading for now: **the forward is verified exact at every size measured,
+including 32B; the backward is verified exact through 14B NF4 and is not
+trustworthy at 32B** until the pool synchronisation is fixed. The
 published claims — all at 8B and below — are unaffected, and the 8B row of this
 session independently reproduces them on different hardware, a different OS and a
 much newer torch.
@@ -764,8 +842,10 @@ valid evidence.** The 8B control is what exposed the flaw:
 8B resident   train_loss 0.030412952972255880  grad_norm 0.019042968750
 ```
 
-8B is bit-exact under the controlled harness (128/128 gradients), yet differs
-here by 5.4%. So the gap cannot be the gradient defect. The cause is that the
+8B NF4 is bit-exact in **both** halves under the controlled harness (logits
+`torch.equal`, and 128/128 gradient tensors against a resident NF4 reference),
+yet differs here by 5.4%. So the gap cannot be the gradient defect. The cause is
+that the
 two paths **initialise LoRA independently** — `build_streamed_model` seeds its
 adapter init itself, the resident path takes the global seed — so the runs start
 from different `lora_A` matrices and must diverge whatever the gradients do. The
@@ -1009,15 +1089,20 @@ and is flagged as such.
 72B was the explicit bonus, to be attempted only if everything before it went
 cleanly. It did, and it turned out to be the run that cracked the 32B defect.
 
-### Qwen2.5-72B-Instruct, NF4 — forward bit-exact, 80/80 layers trained
+### Qwen2.5-72B-Instruct, NF4 (432 MiB/layer) — forward bit-exact, all 80 layers receiving gradient, and the **backward WRONG 8/320**
 
 ```
 params 72,706,203,648   layers 80   store 33.74 GB pinned   shard 185.4 s
 copied 320 adapter tensors
-max_abs_logit_diff 0.0   bit_exact True   logit_abs_max 38.5
-layer0_lora_grad 7.973011e-02   80/80 layers non-zero
+max_abs_logit_diff 0.0   bit_exact True   logit_abs_max 38.5      # <- FORWARD
+layer0_lora_grad 7.973011e-02   80/80 layers non-zero            # <- liveness, not equality
 curves_equal False   curve_max_rel 0.129
 ```
+
+`bit_exact True` in that block is the **forward** field of the harness's JSON — it
+is `torch.equal` on logits against a resident NF4 72B, nothing more. `80/80 layers
+non-zero` says every layer received *a* gradient, not the *right* one. The gradient
+equality check is three code blocks down and it comes back **8/320**.
 
 The store is 33.74 GB against the box's 62.96 GB page-locked ceiling, so it
 pins. Sharding took 185.4 s. And the throughput:
@@ -1074,17 +1159,29 @@ rep 2: grads exact 320/320  80 layers  worst_abs 0.000000e+00
 rep 3: grads exact 320/320  80 layers  worst_abs 0.000000e+00
 ```
 
-**With pinning disabled, layer streaming is bit-exact at 72B.** Every model
-tested — 0.5B, 8B, 14B, 32B, 72B — produces gradients bit-identical to a
-resident reference of the same numerics.
+**With pinning disabled, the streamed BACKWARD is bit-exact at 72B NF4 too** —
+320/320 gradient tensors, against the same resident NF4 reference that the
+`pin=True` arm above failed against at 8/320. Every model tested — 0.5B, 8B, 14B,
+32B, 72B, all NF4 — produces gradients bit-identical to a resident reference of
+the same numerics **once `pin=False`**. The forward was already exact in every one
+of these runs, pinned or not; it is the backward column that moves.
 
 So the correct statement is not "layer streaming breaks above 14B" — the
-algorithm is exact at every size measured, up to 72B, once pinning is off. The
-next step was to find what actually triggers it.
+algorithm is exact in **both** halves at every size measured, up to 72B, once
+pinning is off. Under the shipped `pin=True`, 32B and 72B keep their exact forward
+and lose their backward. The next step was to find what actually triggers it.
 
 ---
 
 ## STEP 6 — isolating the trigger, including four hypotheses that were wrong
+
+**Every `EXACT` / `WRONG` and every `n/m` count in this step is a BACKWARD
+verdict** — the fraction of LoRA *gradient* tensors bit-identical to a resident
+reference of matching quantisation, across repeated backward passes. The forward
+is `torch.equal` in every single run below, broken rows included; it is never the
+thing that varies here, which is why it is not tabulated per row. The quantisation
+is stated per row because it is one of the two axes the defect keys on, the other
+being MiB/layer.
 
 The natural first story — *a race whose window opens once the per-layer transfer
 is large enough* — is wrong. It was tested four ways and survived none of them.
@@ -1227,17 +1324,25 @@ disagree — the forward is exact while the backward is not. Two external reader
 took an unqualified "bit-exact at 8B / 14B / 32B / 72B" to mean gradients too,
 computed 72B's NF4 layer at ~449 MiB against the 165 MiB threshold, and reported
 a contradiction. The record was literally correct and still misread; this table
-is the fix.
+is the fix. It is repeated at the top of the file, with the post-repair column,
+so it is reachable without finding this section.
 
-| model | quant | MiB/layer | **forward** (logits) | **backward** (gradients), pinned | backward, `pin=False` | 5-step loss curve |
-|---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | NF4 | 7 | exact `0.0` | exact 96/96 | — | identical |
-| Llama-3.1-8B | NF4 | 105 | exact `0.0` | exact 128/128 *(50 backwards)* | — | identical |
-| Llama-3.1-8B | bf16 | 480 | exact `0.0` | exact 128/128 | — | — |
-| Qwen2.5-14B | NF4 | 132 | exact `0.0` | exact 192/192 *(50 backwards)* | — | identical |
-| Qwen2.5-14B | bf16 | 570 | exact `0.0` | exact 192/192 | — | — |
-| Qwen2.5-32B | NF4 | 234 | exact `0.0` | **WRONG 8/256** | exact 256/256 | **diverged**, rel 0.0586 |
-| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 |
+**No cell is blank. A dash would read as "it matched"; anything not measured says
+"not tested".**
+
+| model | quant | MiB/layer | **forward** (logits) | **backward** (gradients), pinned | backward, `pin=False` | 5-step loss curve | reference |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | NF4 | 7 | exact `0.0` | exact 96/96 | not tested | identical | resident NF4 |
+| Llama-3.1-8B | NF4 | 105 | exact `0.0` | exact 128/128 *(50 backwards)* | not tested | identical | resident NF4 |
+| Llama-3.1-8B | bf16 | 480 | exact `0.0` | exact 128/128 | not tested | not tested | resident bf16 |
+| Qwen2.5-14B | NF4 | 132 | exact `0.0` | exact 192/192 *(50 backwards)* | not tested | identical | resident NF4 |
+| Qwen2.5-14B | bf16 | 570 | exact `0.0` | exact 192/192 | not tested | not tested | resident bf16 |
+| Qwen2.5-32B | NF4 | 234 | exact `0.0` | **WRONG 8/256** | exact 256/256 | **diverged**, rel 0.0586 | resident NF4 |
+| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 | resident NF4 |
+
+The `pin=False` column is "not tested" on five rows because the pinned arm already
+came back exact there — there was nothing to rescue. It is not a gap in the
+evidence for those rows; it is a measurement with no question behind it.
 
 Throughput and peak VRAM, kept separate because they are a different claim:
 
@@ -1297,9 +1402,9 @@ checkpointing OFF (test)    -> ERROR  RuntimeError: one of the variables needed 
     [CUDABFloat16Type [5120]] is at version 16; expected version 15
 ```
 
-The control reproduces the defect, so the arm is live. The test arm did not turn
-bit-exact and did not stay wrong — **it crashed**, which answers neither branch
-of the hypothesis as posed.
+The control reproduces the defect, so the arm is live. The test arm's gradients did
+not turn bit-exact and did not stay wrong — **it crashed**, which answers neither
+branch of the hypothesis as posed.
 
 But the crash says something precise. `[5120]` is a bf16 tensor of exactly
 `hidden_size` — a layernorm weight, which an NF4 shard keeps in bf16 inside the
@@ -1340,7 +1445,7 @@ result. The earlier full reproducer had orpo and simpo failing identically.)
 
 | | #328 | the NF4 defect |
 |---|---|---|
-| quantisation | fires on **both** `none` and `4bit` | **NF4 only** — bf16 exact at 935 MiB/layer |
+| quantisation | fires on **both** `none` and `4bit` | **NF4 only** — bf16's backward exact at 935 MiB/layer |
 | model size | fires at **0.05 MiB/layer** | needs **> ~165 MiB/layer** |
 | task | **preference losses only**; SFT passes | fires on **SFT** |
 | manifestation | **crashes** with a `meta` tensor | **silent** wrong gradients |
@@ -1427,6 +1532,14 @@ to lose.
 
 ## STEP 9 — the mechanism: **aliasing, not a race**
 
+**Scope, as in STEP 6: every `EXACT` / `WRONG` and every `n/m` below is a
+BACKWARD verdict** — LoRA gradient tensors against a resident reference of
+matching quantisation. All arms here are **NF4** on the synthetic 32-layer /
+935-vs-241 MiB-per-layer reproducer or on real 32B, unless a row says `bf16`.
+The forward is bit-exact in every arm, control and patched alike; that is the
+premise of the whole step (the corruption is a stale *reference* read in the
+backward, so the forward computes on correct data by construction).
+
 STEP 6 rejected four hypotheses and STEP 7 rejected a fifth, but none of them
 produced a mechanism. Two facts made the obvious "race" story suspect: reading
 the shipped code shows `_body` calls `pool.wait(idx)` **and** builds the
@@ -1483,8 +1596,8 @@ weights zero-copy) and matters for anyone costing a real repair.
 
 Facts (1) and (2) — NF4-only, and the sharp size threshold — remain open. The
 bf16 path aliases the pool in exactly the same way (`_substituted_weights`
-returns `buffers[ckpt]` itself) and is exact at 935 MiB/layer, 3.9x the bytes at
-which NF4 fails. Something about how bitsandbytes' 4-bit matmul retains its
+returns `buffers[ckpt]` itself) and its **backward** is exact at 935 MiB/layer,
+3.9x the bytes at which NF4's backward fails. Something about how bitsandbytes' 4-bit matmul retains its
 operands across the backward differs from a plain `F.linear`, and this session
 did not establish what. **No mechanism is claimed for (1) and (2)**; what is
 claimed is that the failure is aliasing and that de-aliasing removes it.
@@ -1847,7 +1960,7 @@ both self-defeating, and *why*.
 
 | fact | explanation |
 |---|---|
-| NF4 only; bf16 exact at 935 MiB/layer | bf16 goes through `MmBackward0`, a native op using `save_for_backward`, so checkpoint discards and recomputes it. bnb bypasses that mechanism. |
+| NF4 only; bf16's **backward** exact at 935 MiB/layer | bf16 goes through `MmBackward0`, a native op using `save_for_backward`, so checkpoint discards and recomputes it. bnb bypasses that mechanism. |
 | forward bit-exact, backward wrong | the corruption is a stale *reference* taken in the forward; the forward itself computes on correct data |
 | survivors = the last `stream_buffers` layers | exactly the layers whose slot was never refilled |
 | correctness returns at `buffers == n_layers` | nothing is ever refilled |
@@ -1907,7 +2020,9 @@ one buffer per layer:
 Four tensors per layer are what this LoRA configuration trains (`q_proj` and
 `v_proj`, A and B each), so "exact tensors = 4 x buffers" is "the last `buffers`
 layers are correct" restated. At `buffers == n_layers` nothing is ever recycled
-and the model is bit-exact.
+and the **backward** becomes bit-exact too — this table is a gradient table
+throughout, on the NF4 32-layer synthetic reproducer, against a resident NF4
+reference; the forward was already exact at every buffer count.
 
 That turns the earlier prediction into a measurement, and it is the mechanism's
 tightest confirmation: **the defect is exactly the eviction**. It also closes off
@@ -2011,9 +2126,10 @@ it.*
 The largest gap in the whole project, and this record said so itself: *"No model
 was trained to convergence and no downstream quality was evaluated anywhere in
 this session."* That was true of the project, not just the session. Bit-exactness
-proves the mechanism does not corrupt the arithmetic. It does not prove a model
-trained by streaming is as **good** — and the entire project rests on the
-principle that "the loss went down" is not enough.
+— of the forward, and of the backward below the threshold — proves the mechanism
+does not corrupt the arithmetic. It does not prove a model trained by streaming is
+as **good** — and the entire project rests on the principle that "the loss went
+down" is not enough.
 
 **Setup.** `Llama-3.1-8B-Instruct`, **bf16 both arms** (the cleanest possible
 claim — matched numerics, so any difference is the streaming path itself).
@@ -2325,6 +2441,12 @@ that silently failed is distinguishable from a kernel that genuinely agreed.
 Forcing verified: **24/24 forced rows ran with 0 fallback calls.** The forced rows
 are real agreements or real disagreements, not failed patches.
 
+**The reference in this step is different from everywhere else in this file.**
+It is not streamed-vs-resident: both arms are resident, and the comparison is
+`dequantize_4bit` + `F.linear` (variant 2) against `bitsandbytes.MatMul4Bit` on
+the same NF4 weight and `quant_state`. So "bit-exact" here means *this repair does
+not change the arithmetic*, not *streaming matches a resident model*.
+
 | | rows | forward bit-exact | gradient bit-exact |
 |---|---|---|---|
 | default dispatch, M in 1..4096, 6 shapes, 5 seeds | 300 | no (only where fused ran) | **yes, 300/300** |
@@ -2402,7 +2524,12 @@ Both arms in ONE process against ONE deterministic resident NF4 reference. The
 must reproduce the defect; without that, a passing `variant2` arm is equally
 consistent with "this configuration never triggered it".
 
-64 layers, NF4, `stream_buffers=2`, `pin=True`, seq 128, 5 repeats.
+64 layers, NF4 (234 MiB/layer — above the 163.8–171.5 MiB threshold, which is why
+this is the model the gate had to use), `stream_buffers=2`, `pin=True`, seq 128,
+5 repeats. **The gated quantity is the BACKWARD**; 32B's forward was already
+bit-exact before the repair and stays so after it, which is exactly why the loss
+row below is identical in all three columns and proves nothing on its own. A `—`
+in the reference column means "not applicable, this column *is* the baseline".
 
 | | control (repair off) | variant 2 | resident reference |
 |---|---|---|---|
@@ -2649,9 +2776,27 @@ The counterfactual is why nothing was lowered:
 So #327's acceptance criterion — seq-768 DPO no longer refused — is deliberately
 **not met**, and the issue stays open saying so. What shipped instead is the
 constant split into its two measured terms (summing to the unchanged 14) plus an
-**opt-in, upward-only** calibration, which closes a hole that did exist: a future
-stack growing a fourth fp32 buffer would be under-budgeted by 12.5% today with
-nothing to catch it.
+**upward-only calibration API** — `calibrated_logits_bytes_per_element` — aimed at
+a hole that does exist: a future stack growing a fourth fp32 buffer would be
+under-budgeted by 12.5% today with nothing to catch it.
+
+> **Correction, made while deciding #327 and stated here rather than quietly
+> edited.** The sentence above originally read "an opt-in, upward-only
+> calibration", which reads as something a user can turn on. It is **an API, not
+> yet wired into the pre-flight**: `calibrated_logits_bytes_per_element` has no
+> caller in `src/`, `trainer/stream_setup.py` never passes
+> `logits_bytes_per_element=` to `estimate_stream_peak_vram`, and there is no flag
+> or environment variable that reaches it. It is exercised only by
+> `tests/test_issue327_logits_estimate.py`. So the hole it was written to close is
+> still open. Filed as **#348**. Nothing about the measurements in this step
+> changes — the constant, the fit and the counterfactual table are unaffected.
+
+The decision on the constant itself was taken after this session and is recorded
+on **#327**: 14 stays, deliberately. The user-visible symptom — a configuration
+that would fit being refused with no way through — is addressed instead by an
+explicit override (**#347**), and the constant debate is ended for good only by
+measuring at the real shape after `setup()` rather than predicting (**#349**),
+since a synthetic probe cannot observe the retention by construction.
 
 ## STEP 17 — #78: the first measurement of FlashAttention and Liger, and what it found
 
@@ -3661,10 +3806,12 @@ Results follow as they land.
   costs 8x peak VRAM, `pin=False` costs 7.41x throughput. Filed as #331 with the
   synthetic reproducer.
 - **Why the defect is NF4-only, and why its boundary is so sharp, is not
-  explained.** The bf16 path aliases the pool identically and is exact at 3.9x
-  the bytes. Seven hypotheses were tested and rejected; none replaced them.
-- **The threshold is a bracket, not a number** — 163.8 MiB/layer exact, 171.5
-  broken, 4.7% wide.
+  explained.** The bf16 path aliases the pool identically and its **backward** is
+  exact at 3.9x the bytes. Seven hypotheses were tested and rejected; none
+  replaced them.
+- **The threshold is a bracket, not a number** — 163.8 MiB/layer with the backward
+  exact, 171.5 with it broken, 4.7% wide. The forward is exact on both sides and at
+  every size in this record, so the threshold is a property of the backward alone.
 - **The defect is not demonstrated end-to-end through `soup train`.** Both
   attempts were confounded because the CLI does not pin the adapter-init seed.
   The evidence is the controlled harness.
@@ -3732,14 +3879,25 @@ original three points below rather than folded into them, so the record shows wh
 was concluded when.
 
 - Its headline configuration is 8B NF4 at **105 MiB per layer**, comfortably
-  below the 163.8–171.5 MiB boundary found here, and it survives a 50-backward
-  soak with `worst_abs = 0.0`.
+  below the 163.8–171.5 MiB boundary found here, and its **gradients** survive a
+  50-backward soak against a resident NF4 reference with `worst_abs = 0.0`.
 - Its throughput claim is independently reproduced on different hardware, a
   different OS and a much newer stack: 119.6 tok/s / 3.32 GB there against a
   median 113.00 tok/s / 3.32 GB here.
-- Its exactness claim is *strengthened*, not weakened: what it could only assert
-  on 3-layer from-config checkpoints is now shown against resident references at
-  8B, 14B, 32B and 72B.
+- Its exactness claim is *strengthened*, not weakened — **and the two halves are
+  strengthened by different amounts, which is the part a v2 must not blur**. What
+  it could only assert on 3-layer from-config checkpoints is now shown against
+  resident references of matching quantisation:
+  - **forward** (logits `torch.equal`) at 8B, 14B, 32B **and 72B**;
+  - **backward** (every LoRA gradient tensor) at 8B and 14B, i.e. **at and below
+    the preprint's own scope**; at 32B and 72B the pre-repair backward was WRONG
+    under `pin=True` and exact only with `pin=False`, and after the STEP 14 repair
+    32B is exact 256/256 while **72B has not been re-measured**.
+
+  So "verified at 72B" is a forward statement and only a forward statement. The
+  preprint asserts nothing at 72B, so nothing in it depends on the distinction —
+  but a v2 that reuses this session's sizes has to carry it, or it will read as a
+  gradient claim that was never made.
 
 What the session adds is **scope beyond** what the preprint claims — behaviour at
 32B and above, which it never asserted — plus the defect that lives there. If a
@@ -3759,21 +3917,25 @@ pinning result have to go with it.
    the 32B delta as the expected direction. Silently carrying it forward is not one
    of them.
 
-2. **The exactness protocol's own fixtures moved.** The paper's bit-exactness checks
-   ran at token counts that sit **inside** bitsandbytes' fused-kernel M window,
-   where the repaired streamed path (which always dequantises) and a resident model
-   (which does not, at small M) differ by one bf16 ulp *by construction*. The
-   property still holds for the shipped code — re-verified at 128 tokens, exactly
-   0.0 on CUDA — but the *conditions* under which "bit-exact" is true are now
-   explicit, and a v2 that repeats the protocol has to state the token count. See
-   STEP 13 for the measured window and STEP 14 for the re-verification.
+2. **The exactness protocol's own fixtures moved — the FORWARD half of it.** The
+   paper's bit-exactness checks ran at token counts that sit **inside**
+   bitsandbytes' fused-kernel M window, where the repaired streamed path (which
+   always dequantises) and a resident model (which does not, at small M) differ by
+   one bf16 ulp *by construction*. Only the **forward** assertion is exposed: the
+   gradient is bit-exact across that window too, 15/15 on the CI fixture shape and
+   423/423 overall (STEP 13), because variant 2's backward *is* bitsandbytes'
+   backward. The property still holds for the shipped code — the forward
+   re-verified at 128 tokens, exactly 0.0 on CUDA — but the *conditions* under
+   which "bit-exact" is true are now explicit, and a v2 that repeats the protocol
+   has to state the token count. See STEP 13 for the measured window and STEP 14
+   for the re-verification.
 
 Neither of these invalidates a published number. Both change what a **v2** may
 claim without re-measuring, which is why they are here rather than in a footnote.
 
 A third, smaller point: the paper describes the method as exact and the record now
-contains a period in which the *backward* was not, above a size the paper never
-claimed. A v2 that mentions the defect and its repair is more credible than one
+contains a period in which the *backward* was not — in NF4, above ~165 MiB per
+layer, i.e. above a size the paper never claimed. A v2 that mentions the defect and its repair is more credible than one
 that does not, given that #331 and this record are both public.
 
 ## Reproducing

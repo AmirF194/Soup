@@ -19,7 +19,7 @@ They are the evidence behind the preprint:
 | [`gate-v0.72.2-nf4.md`](gate-v0.72.2-nf4.md) | NF4 quantised streaming | Llama-3.1-8B at 119.6 tok/s in a 3.32 GB peak |
 | [`gate-v0.72.3-breadth.md`](gate-v0.72.3-breadth.md) | Nine architectures, batching, accumulation, resume, disk tier | Peak-VRAM predictor at 0.85% worst-case error; accumulation is per-token I/O-neutral |
 | [`gate-v0.72.4-preference-losses.md`](gate-v0.72.4-preference-losses.md) | DPO / ORPO / SimPO / KTO over the streaming engine | DPO's reference model costs no extra weights — 0.914x the SFT peak, against +730.44 MB for a real second instance |
-| [`gate-h100-validation.md`](gate-h100-validation.md) |  The method on someone else's hardware: bit-exactness at real sizes, convergence quality, DeepSpeed, variance | Bit-exact to 72B; 2.93x DeepSpeed ZeRO-3 offload in 9.7x less VRAM; and a silent wrong-gradient defect in the NF4 path above ~165 MiB/layer |
+| [`gate-h100-validation.md`](gate-h100-validation.md) |  The method on someone else's hardware: bit-exactness at real sizes, convergence quality, DeepSpeed, variance | **Forward** bit-exact to 72B and **backward** bit-exact to 14B NF4; 2.93x DeepSpeed ZeRO-3 offload in 9.7x less VRAM; and a silent wrong-gradient defect in the NF4 path above ~165 MiB/layer |
 
 ## Hardware
 
@@ -49,6 +49,14 @@ figure, and why the fit decision refuses rather than warns.
 - **The correctness reference always matches the numerics under test** — a
   streamed NF4 run is compared against a *resident NF4* run, never against
   resident bf16, which would hide a real defect inside quantisation error.
+- **"Bit-exact" is always two claims, never one.** The **forward** (logits,
+  `torch.equal`) and the **backward** (every LoRA gradient tensor) are measured
+  independently and do not always agree: in `gate-h100-validation.md` the forward
+  is exact at every size up to 72B while the backward, pre-repair, was wrong above
+  ~165 MiB per NF4 layer. So "bit-exact at 72B" on its own is not a statement this
+  record makes — check which half, at which quantisation, at which MiB/layer. That
+  file opens with a per-model ledger giving all four for every row, and marks
+  anything unmeasured "not tested" rather than leaving it blank.
 - **Derived figures are labelled as arithmetic.** Where a line says "1M tokens =
   2.3 h", that is division, not a measured wall-clock run.
 

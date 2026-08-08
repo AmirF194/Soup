@@ -4037,6 +4037,57 @@ output root. Whether the root save produced a clean adapter, or produced nothing
 is the question the 100-step run below is set up to answer, with the output
 directory kept instead of cleaned.
 
+### The 100-step run: it passes, the repair holds, and the fault was in my harness
+
+Two attempts, because the first one did not survive to be read.
+
+**Attempt 1 died on an NCCL collective timeout after ~28 minutes of training.** The
+per-card samples show the shape of it: seven cards at 100% utilisation and **rank 4
+at 0%**, holding, until the watchdog fired — `Last enqueued NCCL work: 15836, last
+completed: 15835`. One collective never returned. Exit 1, no adapter.
+
+**Attempt 2, the identical command, completed all 100 steps in ~68 minutes,
+exit 0.** So the hang is **1 of 2 and did not reproduce at the same point** — the
+second attempt was already past step 20 when the first had died. It is recorded as
+an unexplained hang on this box, not as a property of the recipe, and this is a
+PCIe machine with no NVLink, which STEP 12 already noted is the interconnect these
+collectives most depend on.
+
+For #41's stated criterion — *100 steps, assert loss decreased* — the answer is
+**6.2353 → 0.0**, first five `[6.2353, 6.2932, 6.2495, 6.2811, 6.2068]`, last five
+all `0.0`. Worth the same caveat STEP 20 attached to the same dataset: it is
+templated synthetic text and loss saturates near zero everywhere, so this
+establishes that the plumbing runs, and nothing about quality.
+
+**And the adapter question resolves the other way.** The log prints `Normalised 320
+adapter keys saved through torch.compile's wrapper`, and the two files differ
+exactly as that implies:
+
+| file | tensors | canonical keys | `_orig_mod.` keys |
+|---|---|---|---|
+| output root | 320 | **320** | 0 |
+| `checkpoint-100` | 320 | **0** | **320** |
+
+The root adapter is clean and alive — 160/160 non-zero `lora_B`, max abs 0.004992.
+**So #335's repair does hold at 70B scale**, which was not previously demonstrated
+above 0.5B. The "dead adapter" in the probe run above was my harness reading the
+wrong file: its `find … | sort | tail -1` sorts the output root *before* the
+`checkpoint-*` subdirectory and then takes the last one. I wrote that check, it was
+wrong, and it produced a false accusation against a repair that works — kept here
+because the correction is the point.
+
+What survives is a **narrower** version of the same defect: the repair covers the
+*final* save only, and HF's own end-of-epoch checkpoints still carry the prefix on
+every key. Anyone resuming from one, or handing a `checkpoint-*` directory to
+`PeftModel.from_pretrained`, gets #335's original behaviour — a file full of real
+numbers that loads as zeros.
+
+**Sharding was not verified in these arms.** The STEP 20 probe that established
+"local params = total ÷ 4 exactly" fails here with
+`TypeError('FullyShardedDataParallel does not support len()')` on all eight ranks,
+so the per-rank parameter accounting is missing. 56 GB per card at SM 1980 MHz is
+what was measured; no claim about whether the base is sharded is made from it.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

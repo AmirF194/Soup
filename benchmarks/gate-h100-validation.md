@@ -3853,7 +3853,24 @@ Written at this point rather than at the end because the machine is on a clock.
 Numbers below are the state after ~3.5 hours of the pool; a later block continues
 them.
 
-Held-out, 200 GSM8K items, greedy, base model **0.905** strict.
+**First, what the instrument itself can resolve** — measured, because none of
+STEP 25's numbers had this and several differences below turn out to sit under it.
+The base model, no adapter, the identical 200-item greedy evaluation, **five times**:
+
+| | 1 | 2 | 3 | 4 | 5 | spread |
+|---|---|---|---|---|---|---|
+| strict | 0.920 | 0.905 | 0.905 | 0.915 | 0.905 | **0.015** |
+| format-blind | 0.930 | 0.910 | 0.915 | 0.920 | 0.915 | **0.020** |
+
+Greedy decoding is not deterministic here: GPU reduction order moves the logits in
+their last bits, an argmax flips, and the continuation diverges from there. **So
+this instrument repeats to about 1.5 points on strict and 2.0 on format-blind, on a
+model that is not changing at all.** Anything smaller than that is not a
+measurement. It also retroactively validates STEP 25's base figure — 0.905 is what
+three of these five runs returned.
+
+Held-out, 200 GSM8K items, greedy, base model **0.905–0.920** strict (that range,
+not a point).
 
 | mode | n | mean strict | sd | range |
 |---|---|---|---|---|
@@ -3890,10 +3907,19 @@ model keep the capability at all —
 | `kl_control` | 7 | 0.923 | **0.019** | 0.050 (0.900 … 0.950) |
 
 Every `kl_control` run in this set stayed between 0.900 and 0.950. `log_only`
-ranged from 0.065 to 0.930. But **one catastrophic run in seven against zero in
-seven is Fisher p = 1.0**, so this is a shape worth another look, not a result. It
-is recorded because it is the only place the two modes look different in kind
-rather than in degree.
+ranged from 0.065 to 0.930.
+
+Read that against the instrument floor above and it says something sharper than a
+variance ratio: **`kl_control`'s whole 0.050 range is 2.5x the instrument's own
+0.020**, i.e. its seven runs are barely distinguishable from each other *or from
+the untrained base*, which is what "kept the capability" means. `log_only` has one
+run that is not in that world at all. By the same reading, four of the six paired
+format-blind deltas (+0.010, +0.025, +0.030, −0.005) are **inside** the instrument
+floor and should not be read as differences; only +0.055 and +0.840 clear it.
+
+But **one catastrophic run in seven against zero in seven is Fisher p = 1.0**, so
+this is a shape worth another look, not a result. It is recorded because it is the
+only place the two modes look different in kind rather than in degree.
 
 ### The attrition asymmetry: nominally significant, and reported as unresolved
 

@@ -3962,6 +3962,25 @@ back to back, so each card contributes exactly one of each. At the observed haza
 that needs roughly 20 arms per mode to have any power, which is about six hours on
 eight cards.
 
+**That experiment was launched and produced nothing.** Eight workers went up at
+20:04 local, one per card, each running both modes at its own seed in sequence
+(seeds 30–37, striding by 8). Sixteen arms had started by 20:31 and none had yet
+finished its 200 steps — the first completions were due around 21:10. At roughly
+20:35 the machine stopped answering: first SSH banner-exchange timeouts, then no
+ICMP at all. It did not come back.
+
+So the balanced arm contributes **zero data points**, and the attrition question
+closes this session exactly where the paragraph above leaves it. The design is
+recorded rather than the result because the design is the part that survives:
+`balworker.sh` in the scratch harness is what a follow-up should re-run.
+
+One defect in that harness, found while reading its logs and worth naming so the
+next person does not trust the wrong column: it logs
+`rc=$?` **after** a `$(date -Is)` substitution, so the recorded return code is the
+date command's and is always 0. Nothing downstream reads it — crash detection scans
+the run log for the device-side assert, and the held-out step is gated on the
+adapter file existing — but the column is meaningless.
+
 ## STEP 28 — #41: the 70B multi-GPU recipe, and it does not run
 
 `llama3-70b-fsdp2` is one of three multi-GPU recipes Soup ships. It has never been

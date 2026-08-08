@@ -3986,6 +3986,38 @@ date command's and is always 0. Nothing downstream reads it — crash detection 
 the run log for the device-side assert, and the held-out step is gated on the
 adapter file existing — but the column is meaningless.
 
+#### Interim reading at 23 balanced arms — recorded now because the machine is on a clock
+
+The wave is still running; this is what it looked like at 21:10, written down rather
+than held back in case the box does not survive the night.
+
+| mode | launched | crashed | rate | hazard/step |
+|---|---|---|---|---|
+| `log_only` | 12 | 9 | 0.750 | 0.00867 |
+| `kl_control` | 11 | 4 | 0.364 | 0.00605 |
+
+Fisher exact **p = 0.0995**. The direction is the same as the unbalanced pool, and
+now **every card shows it in the same direction** — gpu0 2/2 vs 1/2, gpu1 2/2 vs
+1/2, gpu5 2/2 vs 1/2, and no card where `log_only` crashes less than `kl_control`.
+That is the card confound broken, which is what this arm was for.
+
+**And it makes the result harder to believe, not easier.** Within `kl_control`, the
+arms that *never acted* crashed 3 of 10 while the single arm that acted crashed 1 of
+1 — again pointing away from "raising β keeps the policy out of trouble". Reading
+the controller settles why: `_run_bang_bang` calls `_apply_coefficient` on **every
+step**, including a `hold`, and in this configuration `grpo_beta` and
+`reward_hack_beta_floor` are both `0.02`, so the write puts the value that is
+already there. **A `kl_control` run that never acts is numerically identical to its
+`log_only` twin.** Ten of the eleven `kl_control` arms above are in that state.
+
+So if this separation survives to a large sample it is a paradox to be written as
+one — a difference between two runs the code says are the same computation — and
+the far likelier reading at n=23 is that it is noise with a direction. The pooled
+`kl_control` rate has already moved 0.21 → 0.44 as arms accumulated. Final numbers,
+with the wave stopped cleanly at 06:30 by a scheduled flag so no arm is counted as
+"launched and not crashed" merely because the machine was reclaimed mid-run, belong
+in the morning's reading.
+
 ## STEP 28 — #41: the 70B multi-GPU recipe, and it does not run
 
 `llama3-70b-fsdp2` is one of three multi-GPU recipes Soup ships. It has never been

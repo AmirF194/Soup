@@ -3962,6 +3962,81 @@ back to back, so each card contributes exactly one of each. At the observed haza
 that needs roughly 20 arms per mode to have any power, which is about six hours on
 eight cards.
 
+## STEP 28 — #41: the 70B multi-GPU recipe, and it does not run
+
+`llama3-70b-fsdp2` is one of three multi-GPU recipes Soup ships. It has never been
+executed by anything: `test_multi_gpu.py` checks that its YAML parses, and #41 asks
+for a 100-step smoke train because "upstream tokenizer / model-loader changes could
+silently break them". It needs eight 80 GB cards, which is why it waited for the
+end of this session rather than sharing them with #286.
+
+**One substitution, recorded rather than buried.** The recipe names
+`meta-llama/Llama-3.1-70B-Instruct`, which is gated, and this box has no HF token —
+the same reason STEP 2 used a NousResearch mirror for 8B. The stand-in is
+**Qwen2.5-72B-Instruct**, already in the local cache, 80 layers, hidden 8192. What
+is under test is the recipe's *shape* — 4-bit base, FSDP full-shard,
+`use_fsdp2_compile`, LoRA r16, `max_length` 4096, batch 1 x accum 8 — on eight
+cards at 70B class. Every arm below is that shape; only the weights differ. It is
+printed into the head of every log.
+
+### It fails before step 1, and the second control names the reason
+
+| arm | change from the recipe | outcome |
+|---|---|---|
+| **as shipped** | — | `ValueError: Cannot flatten integer dtype tensors` |
+| control | `use_fsdp2_compile: false` | **identical error** |
+| + storage | `bnb_4bit_quant_storage: bfloat16` | `ValueError: Must flatten tensors with uniform dtype but got torch.bfloat16 and torch.float32` |
+| + dtype | 723 fp32 parameters cast to bf16 | **trains** |
+
+All eight ranks load the checkpoint (5–6 min), print `Training started!`, reach
+46 448.6 MiB allocated each — and then FSDP refuses to flatten a unit containing
+bitsandbytes' packed `uint8` storage. **The `use_fsdp2_compile: false` control gets
+the same error**, so `torch.compile` is not implicated: the blocker is FSDP plus
+4-bit, and the recipe pairs them by design.
+
+`bnb_4bit_quant_storage` is a knob Soup already has, and `quant_menu.py` already
+warns that FSDP + BNB 4-bit without it "causes all-gather to upcast to fp32" —
+which understates it. It is not a performance foot-gun, it is a hard stop. Setting
+it moves the failure exactly one step: the base is now bf16 and PEFT's freshly
+created LoRA weights are still fp32, and FSDP wants one dtype per unit.
+
+The last row is a probe, not a fix, and it is what makes the diagnosis complete.
+An external `sitecustomize` on `PYTHONPATH` — no repo edit, same technique as the
+STEP 20 sharding probe — wraps `peft.get_peft_model` and casts every floating
+parameter to bf16 before accelerate wraps the model. It reports the same thing on
+all eight ranks: **`before={'torch.float32': 723, 'torch.bfloat16': 560} cast=723
+after={'torch.bfloat16': 1283}`**, and the run trains, 56 GB per card.
+
+So the shipped recipe is **two changes** from running, one of which is expressible
+in its own config today and one of which is not: there is no config surface for the
+adapter's dtype.
+
+### Two things found on the way, both user-visible
+
+**A 131 MB adapter checkpoint costs 37 GB of disk.** The 12-step probe's checkpoint
+directory holds `adapter_model.safetensors` at 131 118 496 bytes next to
+`pytorch_model_fsdp.bin` at **36 981 387 757** bytes and an `optimizer.bin` of
+262 476 043 — a full consolidated copy of the base model written for a run that
+trains 0.18% of it. On a box with 250 GB free that is seven checkpoints from full,
+and this session has twice been stopped by a full disk.
+
+**The adapter the probe run wrote is dead.** `exit_code=0`, and the only adapter on
+disk carries torch.compile's prefix on **all 320 keys**
+(`_orig_mod.base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight`), with
+160 non-zero `lora_B` **in the file** and, on reload through
+`PeftModel.from_pretrained`, 48 keys matched and **0 non-zero** — PEFT warns about
+missing keys and leaves `lora_B` at its zero init. That is #335, the failure this
+session already repaired once at 0.5B.
+
+**It is not yet established that the repair failed**, and the difference matters.
+`strip_compile_prefix` is present in the installed tree and is called on
+`self._output_dir` — the *final* save. What was checked here is
+`checkpoint-12`, an end-of-epoch checkpoint written by HF's Trainer, which that
+call does not touch; the harness fell back to it because it found no adapter at the
+output root. Whether the root save produced a clean adapter, or produced nothing,
+is the question the 100-step run below is set up to answer, with the output
+directory kept instead of cleaned.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

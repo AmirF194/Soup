@@ -3038,6 +3038,62 @@ both. The remaining repairs — tool schema in the prompt, a larger token budget
 and extracting the first JSON container instead of parsing the envelope — are
 recorded in #316 rather than done here.
 
+## STEP 23 — `--replay` against real catastrophic forgetting (#314)
+
+The earlier attempt measured +4% forgetting on a 135M LoRA and could answer
+nothing. Making the forgetting real was most of the work, and one substitution is
+what made the experiment answerable at all.
+
+**What it took.** Full fine-tuning rather than LoRA (8 030 261 248 of
+8 030 261 248 params trainable on Llama-3.1-8B-Instruct). Genuinely dissimilar
+tasks — rigid machine-checkable JSON against real Alpaca prose, with brace
+characters excluded from B so it contains no JSON. And, the load-bearing one: **an
+old task the base model could not already do.** The obvious `{name, age, city,
+job}` extraction was discarded because **the untouched base scored 0.9867 on it**,
+so any post-B drop would have measured instruction drift rather than loss of a
+taught skill. Rebuilt with an arbitrary convention (keys `nm/ag/ct/jb`,
+surname-first, city uppercased, case-sensitive): base **0.0000**, after the A run
+**1.0000** — the skill is 100% attributable to training.
+
+**Forgetting, once real, is total.** 1.0000 -> 0.0000 exact match (300/300 ->
+0/300) in every replicate, spread 0.0000. The failure mode is specific: content
+survives, format dies — `Ferreira, Elena, 61, Krakow, stonemason)`.
+
+| arm | rows | held-out A exact | held-out B tok-F1 |
+|---|---|---|---|
+| no replay (control) | 3000 | **0.0000** | 0.4100 (0.0041) |
+| replay 0.01 | 3030 | **1.0000** | 0.4109 (0.0066) |
+| replay 0.02 | 3061 | **1.0000** | 0.4099 (0.0061) |
+| replay 0.05 | 3158 | **1.0000** | 0.4124 (0.0176) |
+| replay 0.10 | 3333 | **1.0000** | 0.4098 (0.0050) |
+| replay 0.30 | 4286 | **1.0000** | 0.4058 (0.0143) |
+
+**9 no-replay runs all scored 0.0000; 15 replay runs all scored 1.0000. Zero
+overlap, zero within-arm spread.** Thirty replay rows out of 3030 restore 300/300.
+
+**The decisive control is `padB`** — identical 4286 rows and identical step count
+to r=0.30, but the extra 1286 rows are fresh Alpaca instead of old task A:
+**0.0000**. Retention comes from replay *content*, not from extra steps or extra
+data. Without that arm the result would have been equally consistent with "more
+data helps", which is the reading a reviewer would reach for first.
+
+Cost to the new task is **not resolvable against within-arm spread for r <= 0.10**
+(B token-F1 deltas +0.0024, −0.0002, −0.0042, all inside the arms' own spreads).
+Only r=0.30 shows a real cost, with disjoint B-loss ranges. So the shipped 0.1
+default is comfortably safe.
+
+Limitations kept: A-retention is **binary-saturating**, so the knee is bounded
+below 0.01 rather than located; task A is a *format convention*, cheap to
+re-anchor from 30 examples, and a knowledge-heavy old task would plausibly need
+more; only 2 epochs of B were tested.
+
+**And a finding about this record's own method:** the replicates differ only in
+row ordering plus GPU nondeterminism, **not in the trainer RNG**, because Soup
+exposes no training-seed knob at all — every run is `seed=42, data_seed=None`
+(#341). Several steps in this file use within-arm spread as the yardstick a
+between-arm difference must beat; that spread is currently missing its largest
+natural source.
+
 ## What was not done, and what these numbers do not say
 
 - **The RAM-vs-disk gap is still unmeasured.** No NVMe on this box; see the DISK

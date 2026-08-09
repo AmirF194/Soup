@@ -4055,6 +4055,34 @@ and caught this time only because a model scoring 1.000 elsewhere and 0.423 here
 was too odd to accept. The numbers above come from a second pass that classifies
 each failure explicitly.
 
+### An instrument failure worth recording, because it is the session's third of a kind
+
+Three of this session's monitors were shell loops of the form:
+
+```bash
+until ! pgrep -f "soup_cli.cli train"; do sleep 10; done
+```
+
+**They never terminate.** `pgrep -f` matches against full command lines, and the
+loop's own command line contains the string it searches for, so it finds *itself*
+and waits forever. Three accumulated over the afternoon, and a chained
+"train-then-evaluate" script built the same way never started its evaluation half
+although training had finished minutes earlier.
+
+It belongs next to the other two because it is the same failure, in a third guise:
+
+| where | the instrument became part of what it measured |
+|---|---|
+| #356 | the harness truncated the answer it was scoring |
+| the first `mini_mmlu` probe | the detector searched for `(A)` while the model wrote `$oxed{A}$` |
+| these monitors | the watcher matched its own command line |
+
+In all three the wrong answer was *plausible* — "the model can't do it", "training
+is still running" — which is precisely why none was caught by looking at the
+result. Two were caught by a number disagreeing with an independently published
+one; this one by an adapter file existing while the watcher still claimed the run
+was in progress.
+
 ### `pin=False` with the repair: no regression, and NOT a gate
 
 The repair was gated at `pin=True`, so the obvious complement is `pin=False`. Run

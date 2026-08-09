@@ -2739,11 +2739,69 @@ three runs (3.659843683242798 and 0.37352198362350464), so the spread above is
 scheduling, not numerics.
 
 Caveats: 64 rows and 1 epoch means an 11–14 s train step where setup is a large
-share of wall time, so these ratios are directional; batch 2 only; and
-**`orpo`/`simpo`/`kto` are still untimed** — only `dpo` was run, because it is the
-one with a reference model and therefore the one whose cost claim was in doubt.
+share of wall time, so these ratios are directional; batch 2 only.
 
-Logs: `/root/logs/bench_pref_*.{log,samples}`.
+#### All four preference losses, and the cost tracks the mechanism exactly
+
+`orpo`, `simpo` and `kto` added, same configuration, n=3 each:
+
+| task | reference model? | samples/s (median) | vs SFT | peak VRAM |
+|---|---|---|---|---|
+| `sft` | — | 6.082 | 1.00x | 3 689 MiB |
+| `orpo` | **none** (genuinely reference-free) | 5.973 | 0.98x | 3 719 MiB |
+| `simpo` | **none** (genuinely reference-free) | 5.946 | 0.98x | 3 719 MiB |
+| `dpo` | same base, adapters disabled | 4.665 | **0.77x** | 3 733 MiB |
+| `kto` | same base + a **separate** KL forward | 3.595 | **0.59x** | 3 669 MiB |
+
+**The ordering is the mechanism, measured.** ORPO and SimPO carry no reference
+term at all and run at SFT speed. DPO pays one extra traversal of the layer stack
+for its reference forward. KTO pays more again because its KL batch is a
+*separate* forward rather than a concatenated one — which is exactly why v0.72.4
+budgets it at 1x rows while the other three are budgeted at 2x. Nothing here was
+tuned to produce that ordering; it falls out of running the four tasks unchanged.
+
+**Peak VRAM is flat across all five — within 64 MiB, or 1.7%.** That is the claim
+this whole slot rests on: none of the four preference losses holds a second copy
+of the base. A second resident NF4 8B would be ~5.6 GB.
+
+Two things not to over-read: `kto`'s row is a **different dataset** (unpaired, so
+128 rows against 64, and a 34 s train step), so its samples/s is not directly
+comparable to the paired losses — only its VRAM is. And every `train_loss` here
+reproduced to the last digit across all three runs of every task, so the spread in
+the throughput column is scheduling, not numerics.
+
+Logs: `/root/logs/bench_pref_*.{log,samples}`, `/root/logs/bench_pf_*.{log,samples}`.
+
+### End-to-end through the CLI, with the seed pinned — and one new defect
+
+STEP 2b closed with two inconclusive attempts to show the defect through
+`soup train`, both confounded because the CLI pinned no adapter-init seed, and it
+recorded the gap: *"two `soup train` runs of one unchanged config do not reproduce
+each other"* (1.4–1.8% apart). `training.seed` (#341) has since landed. Re-run:
+
+| config | run 1 `train_loss` | run 2 `train_loss` | peak VRAM |
+|---|---|---|---|
+| `stream_layers: true` | 3.6995859146118164 | **3.6995859146118164** | **3 681 MiB** |
+| `stream_layers: false` | 3.6887452602386475 | 3.686117172241211 | 12 087 MiB |
+
+**The streamed path is now bit-reproducible run to run** — the gap STEP 2b
+recorded is closed on that half, and a CLI-level A/B against a streamed arm now
+means something.
+
+**The resident path still is not.** Same seed, same config, two runs, 0.071%
+apart. That is a new defect and it is filed as **#354**. It is not #353 (seed
+reaching only the SFT wrapper) — this *is* `task: sft`. The most likely candidate,
+untested here: the streamed path quantises **offline into shards** and reloads
+identical bytes every run, while the resident path quantises **at load time**,
+which would explain exactly this asymmetry — and would mean a resident 4-bit model
+is not the fixed reference the correctness gates assume it is.
+
+Also measured, incidentally: **streaming holds an 8B in 3 681 MiB against the
+resident path's 12 087 MiB — 3.28x less — and costs 1.13x the wall time**
+(5.75–5.87 against 6.32–6.65 samples/s). First time that trade has been measured
+through the shipped CLI on a real model rather than in a harness.
+
+Logs: `/root/logs/bench_e2e_*.{log,samples}`.
 
 ## STEP 15 — #328 diagnosed and fixed: nobody was setting `gradient_checkpointing`
 
@@ -4318,9 +4376,13 @@ what was measured; no claim about whether the base is sharded is made from it.
 - **The threshold is a bracket, not a number** — 163.8 MiB/layer with the backward
   exact, 171.5 with it broken, 4.7% wide. The forward is exact on both sides and at
   every size in this record, so the threshold is a property of the backward alone.
-- **The defect is not demonstrated end-to-end through `soup train`.** Both
-  attempts were confounded because the CLI does not pin the adapter-init seed.
-  The evidence is the controlled harness.
+- **The defect is still not demonstrated end-to-end through `soup train`**, but
+  the stated reason no longer holds. `training.seed` (#341) landed and the streamed
+  path is now bit-reproducible run to run, so a CLI-level A/B against a streamed
+  arm is meaningful. What blocks the demonstration now is that the defect is
+  repaired — and that **the resident arm still does not reproduce itself** (#354),
+  so the comparison arm is the unreliable half. The evidence for the defect remains
+  the controlled harness.
 - **The quality result resolves ~1pp, not less.** 300 held-out items, five
   paired subsets, and an uncontrolled adapter-init seed. "No difference detected"
   is not "no difference".
@@ -4330,13 +4392,13 @@ what was measured; no claim about whether the base is sharded is made from it.
 - **The 8-GPU comparison is on hardware where streaming's premise does not
   apply**, and on a PCIe box with no NVLink, which is the interconnect ZeRO-3
   most depends on.
-- **Only `dpo` of the four preference losses was benchmarked** — when the
-  throughput work was done `dpo`/`orpo`/`simpo`/`kto` streamed all failed on this
-  torch before training started (FINDING 2). That cause is found and fixed
-  (STEP 15) and `dpo` is now measured against `sft` through the real CLI (see
-  STEP 14's preference subsection), but `orpo`/`simpo`/`kto` have still not been
-  timed, and the `dpo` runs are 64 rows / 1 epoch, short enough that setup is a
-  large share of wall time.
+- **The preference-loss timings are short runs** — all four are now measured
+  against `sft` through the real CLI (STEP 14's preference subsection), which
+  closes FINDING 2's gap, but they are 64 rows / 1 epoch, short enough that setup
+  is a large share of an 11–14 s train step. The ordering they produce
+  (reference-free at SFT speed, DPO 0.77x, KTO 0.59x) is mechanism-consistent and
+  reproducible; the absolute ratios are directional. `kto` additionally runs a
+  different dataset (unpaired, 128 rows), so only its VRAM compares directly.
 - **The repair is gated at two model sizes and swept over four more shapes** —
   real 32B and real 72B NF4 at seq 128 / `stream_buffers=2`, plus 32B at seq 32,
   seq 512, buffers 3 and buffers 4, 5 repeats each, every point with a control arm

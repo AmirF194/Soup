@@ -12,76 +12,335 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
-**Fixed — `accelerate launch` now works for every trainer, not six of them.**
-`device_map="auto"` shards one model across every visible GPU, and transformers
-refuses it outright under a distributed launch (`You can't train a model that has
-been loaded with device_map='auto' in any distributed mode`), so the exact
-`accelerate launch --num_processes 8` command `soup train --gpus 8` prints died on
-every rank. The first pass replaced that line in six trainers; nine sites still
-carried it — `bco`, `distill`, `embedding`, `ipo`, `online_dpo`, `orpo`,
-`reward_model`, `simpo` and PPO's own reward-model loader — and `orpo`/`simpo` are
-two of the four preference losses v0.72.4 ships layer streaming for, so the feature
-was half-fixed inside one release. All fifteen sites now go through
-`utils/gpu.resolve_device_map`, which returns `{"": LOCAL_RANK}` when `WORLD_SIZE>1`
-and `"auto"` otherwise. The regression guard no longer parametrizes over a
-hand-written list of trainer names — the list is what hid the nine — but scans every
-module in `soup_cli/trainer/`, with a control proving the scanner can fail.
+## [0.73.0] - 2026-08-09
 
-**Added — `--deepspeed zero3_offload`, a ZeRO-3 preset that offloads parameters to
-CPU.** `zero3` set `offload_param: none` and the only offload *preset* was stage 2,
-optimizer-only, so the configuration a user short of VRAM actually wants could not be
-named on the command line — the DeepSpeed comparison in
-`benchmarks/gate-h100-validation.md` (STEP 3) had to be run from hand-written JSON.
-Measured there on one H100 (Llama-3.1-8B, bf16, LoRA r=8, 256 steps): 21.65 tok/s at
-a 38,135 MiB peak. `offload_optimizer` deliberately stays `none` — turning it on
-makes DeepSpeed JIT-build `cpu_adam`, which needs a matching CUDA toolkit and fails
-without one (`CUDAMismatchException`, then `'DeepSpeedCPUAdam' object has no
-attribute 'ds_opt_adam'`); copy the emitted JSON and flip it if you have `nvcc`. Note
-the pre-existing `soup fetch deepspeed_configs zero3-cpu-offload` example is *not*
-this config: it turns optimizer offload on, so it is the variant that needs a
-toolkit, and it is a file to edit rather than a `--deepspeed` name.
+**The release that came out of three days on somebody else's hardware.**
 
-**Fixed — the GEMM-ceiling test could not pass on a datacenter GPU.** The
-plausibility bound on `measure_gemm_tflops` was `< 200 TFLOPS`, written when the only
-hardware this project had run on was an RTX 3050 Laptop. An H100 returns a correct
-786.5 TFLOPS and the assertion fired, making the streaming suite un-greenable on
-server cards. The bound is now documented against real silicon peaks, and a second
-test times the same matmul independently and requires the probe to agree within 10x —
-so the check still catches a unit or FLOP-count error on any card instead of
-degenerating into `assert > 0`.
+Every number this project had ever published was measured on one machine: an RTX 3050
+Laptop, 4 GB, Windows. From 5–9 August it ran on a borrowed 8×H100 box (Ubuntu 24.04,
+a much newer torch / bitsandbytes / trl / peft stack) for the first time. That found
+**one silent correctness defect in layer streaming, four backends that had never
+actually run, and a documented multi-GPU entry point that had never launched** — plus
+the first evidence that the laptop result reproduces on hardware nothing like it. The
+full record, published as written including six rejected hypotheses and three false
+positives that controls caught, is
+[`benchmarks/gate-h100-validation.md`](benchmarks/gate-h100-validation.md).
 
-**Fixed — the `trl` bounds shipped in v0.72.4 were wrong at both ends.**
+This is a **minor** bump, not a v0.72.x patch: it adds two capabilities that did not
+exist, and repairs four backends.
 
-- **The ceiling was over-tight by five releases.** v0.72.4 capped `trl<0.25` from a
-  table claiming `max_prompt_length` was removed for `bco` at 0.25 and for
-  `kto`/`orpo`/`simpo` at 0.26. It was not. What happened at 0.25 and 0.26 is that
-  those config classes *moved* into `trl/experimental/` while staying publicly
-  re-exported from `trl` with the field intact — a module relocation read as a field
-  removal. The real stages are **`kto` at 0.27, `bco`/`orpo`/`simpo` at 0.28,
-  `dpo`/`ipo` at 0.29**, so the cap is now **`<0.27`** and `trl` 0.25.0–0.26.2 are
-  usable again. Settled by construction, not by reading source: all six configs build
-  on 0.26.2 with the exact keyword arguments the wrappers pass, and 0.27.0 raises
-  `KTOConfig.__init__() got an unexpected keyword argument 'max_prompt_length'`
-  while `dpo` and `orpo` still build.
-- **The floor was impossible.** `>=0.7.0` could never have worked: `setup()` imports
-  `GRPOTrainer` unconditionally and `trl` first exports it at **0.14.0**
-  (`OnlineDPOTrainer` / `KTOTrainer` / `BCOTrainer` / `BasePairwiseJudge` arrive at
-  0.11.0; 0.7.0 has none of them). The floor is now `>=0.14.0`. Resolvers pick the
-  newest allowed version, so this only bit under a constraints file or anyone reading
-  the metadata as a statement of support.
-- One detail in the v0.72.4 note was also imprecise: `ORPOConfig` and `CPOConfig` are
-  not deleted at 0.29 — the modules survive under `trl/experimental/`. They are
-  removed from the public `trl` namespace, which is what Soup imports, so the 0.29
-  break is an `ImportError` rather than a rejected keyword argument. Worse, not
-  milder, than described.
+### Added
 
-**Fixed — encoding corruption in `pyproject.toml`.** Fourteen em-dashes had been
-round-tripped through cp1251. Thirteen were in comments; one was the `unit` pytest
-marker description, which `pytest --markers` prints to users.
+- **`training.seed` and `training.data_seed` (#341).** Every Soup run trained at
+  seed 42 with no way to change it, so "run this twice with a different seed" was
+  impossible. Both default to `None` rather than to `42` on purpose: an unset seed has
+  to reproduce **two** different historical defaults — HF's 42 for `TrainingArguments`
+  and 0 for the multipack sampler since v0.37.0 — and a plain `42` default would have
+  silently re-ordered every existing multipack run.
+  **Scope, stated rather than left as a footgun:** wired into the SFT trainer only.
+  Other task wrappers build their own `TrainingArguments`, so setting it on a DPO run
+  parses and does nothing — tracked as #353.
+- **Full fine-tuning as `lora.r: 0` (#340).** The SFT trainer's full-FT branch was
+  dead code with no way to reach it. `r: 0` was chosen on repo evidence, not taste:
+  three consumers already treat rank 0 as "no adapter", and `r: 0` previously crashed
+  inside PEFT, so no config that worked before changes meaning. `lora.r` also gained a
+  lower bound — `r: -5` used to parse and die inside PEFT.
+- **`--deepspeed zero3_offload`** — ZeRO-3 with CPU parameter offload. `zero3` set
+  `offload_param: none` and the only offload *preset* was stage 2, optimizer-only, so
+  the configuration a user short of VRAM actually wants could not be named on the
+  command line. Measured on one H100 (Llama-3.1-8B, bf16, LoRA r=8, 256 steps):
+  **21.65 tok/s at a 38,135 MiB peak**. `offload_optimizer` deliberately stays `none` —
+  turning it on makes DeepSpeed JIT-build `cpu_adam` against a matching CUDA toolkit
+  and fail without one; copy the emitted JSON and flip it if you have `nvcc`.
+- **`trl` support widened to `>=0.14.0,<0.29`** (#326), behind a capability-probe
+  compat layer (`trainer/_trl_compat.py`) rather than a version table — a version
+  table is what was wrong twice before. The trainers now ask each config class whether
+  it accepts `max_prompt_length`, and resolve `ORPOConfig`/`CPOConfig`/`BCOConfig`
+  through `trl.experimental` when trl 0.29 drops them from the public namespace. All
+  six preference trainers construct **and train to identical losses** on trl 0.26.2,
+  0.28.0 and 1.9.2.
 
-**Fixed — `docs/commands.md`.** Missing newlines collapsed five commands onto two
-lines, hiding three of them from readers, and the page promised "the full command
-list" while omitting seven commands that are documented on the topic pages.
+### Fixed — backends that had never been run
+
+- **`soup train --gpus N` never launched at all (#77).** `accelerate launch` takes a
+  script path positionally, and Soup handed it `sys.executable` — so accelerate opened
+  the Python binary and parsed it as source (`SyntaxError: source code cannot contain
+  null bytes`). Every rank died before the trainer existed. The documented multi-GPU
+  entry point has been dead since it shipped, invisible to single-GPU CI because that
+  path skips the launcher wrapper entirely. Separately, `--no-reexec` printed a command
+  with every user flag dropped, so following the hint literally trained without
+  `--fsdp`.
+- **DeepSpeed could not train a LoRA model on any stage (#336).** HF builds two
+  optimizer parameter groups and with LoRA the no-decay group is *empty*; DeepSpeed
+  drops it, leaving one group against two `base_lrs`, and torch's scheduler then hits a
+  strict-`zip` length mismatch. Verified repaired on 2×H100 with real `soup train`:
+  zero2 6790.2 tok/s, zero3 1025.3, zero++ 977.1, all exit 0 with a live adapter
+  (96/96). `zero++` failed earlier and independently — it set fp16 quantised
+  weights/gradients against a bf16 model and hardcoded `zero_hpz_partition_size: 8`
+  regardless of the real world size; both are now derived, and the rewrite is printed
+  rather than applied silently.
+- **`use_fsdp2_compile` wrote an adapter that reloads as all zeros (#335).** Under
+  `torch.compile` the Trainer saves *through* the wrapper, so every key came out as
+  `_orig_mod.base_model.model...`. The tensors were genuinely trained
+  (max|lora_B| 7.0e-3 measured) and `PeftModel.from_pretrained` matched none of them —
+  emitting only a `UserWarning` and leaving `lora_B` at its zero init. Measured on
+  4×H100: **0 of 96 non-zero** against 96/96 for the paired non-compile run, reproduced
+  3/3, with the run exiting 0 throughout.
+- **`soup serve --backend sglang` returned 500 on every generation (#76).** sglang
+  0.5.16's `Runtime.generate` returns a JSON *string*; Soup subscripted it as a dict.
+  Deterministic, not a race — the backend loaded cleanly and then failed 100% of
+  requests. It had genuinely never been run, because SGLang does not support Windows.
+- **The vLLM backend ignored the model's chat template (#332).** `utils/vllm.py`
+  hand-rolled a `"User: ...\nAssistant:"` prompt while the transformers backend used
+  `apply_chat_template`, so every vLLM user's model saw a format it was never trained
+  on. On Llama-3.1-8B + LoRA, identical server and sampling params, only the prompt
+  differing: a run-on loop burning all 200 tokens **before**, an 8-token answer
+  **after**. Both backends now share one `build_chat_prompt`.
+- **Three vLLM serving defects (#333)**, each verified live: `finish_reason` was
+  hardcoded `"stop"` even at `completion_tokens == max_tokens`; `--dashboard` silently
+  no-opped (`/metrics` returned 404 with nothing printed); and `--max-model-len` did not
+  exist although the engine factory already accepted it. `--dashboard` on a backend that
+  cannot serve it now warns at startup naming the backend instead of doing nothing.
+
+### Fixed — training paths that silently did the wrong thing
+
+- **`data.max_length` was capped at 1024 on every SFT run (#78).** `SFTTrainer`
+  converts `TrainingArguments` with `SFTConfig(**args.to_dict())`, and `max_length` is
+  an SFT-only field that `TrainingArguments` does not carry — so it always took
+  `SFTConfig`'s default. Measured before the fix: `data.max_length=4096` gave 1024
+  tokens per sample, with no warning.
+- **`training.use_liger: true` crashed at step 0 (#78).** Soup patched the model but
+  never set `TrainingArguments.use_liger_kernel`, the flag TRL reads to know the fused
+  path returns `logits=None`; its entropy metric then ran on `None`. Reproduced across
+  the whole supported trl pin, so the feature did not run at all. Separately, Liger's
+  architecture match was a *substring of the model name*, so any model loaded from a
+  local directory trained without Liger on a flag the user had explicitly set — it now
+  reads `AutoConfig.model_type`.
+- **FlashAttention 3 was selected from a version that can never report 3 (#334).**
+  Dao-AILab ships FA3 as `flash_attn_3`; `flash_attn` itself stays in the 2.x line, so
+  the branch could not fire for any real install — and had it fired, it produced an
+  `attn_implementation` transformers would reject. On Hopper hardware users silently got
+  FA2 or SDPA while the docs advertised FA3. Both detectors now ask transformers.
+  This makes detection honest; it does not make FA3 measurable here.
+
+### Fixed — layer streaming
+
+- **A silent wrong-gradient defect on large NF4 models (#331).**
+  `bitsandbytes.MatMul4Bit` stashes the packed weight and `quant_state` on `ctx` as
+  plain attributes instead of through `save_for_backward`, so gradient checkpointing
+  cannot discard and recompute them. The reference is captured in the forward, *aliases
+  the streaming buffer pool*, and is read in the backward after that slot has been
+  refilled. Result: a bit-exact forward, a healthy-looking loss curve, and wrong
+  gradients on every layer but the last `stream_buffers`. It bites NF4 above a threshold
+  bracketed at **163.8–171.5 MiB per layer** — so 32B and 72B, never 8B or 14B, and
+  never bf16.
+  The repair keeps the weight out of that function entirely: dequantise inside the
+  checkpointed region and use a native matmul, which saves the dequantised weight
+  through the ordinary mechanism. Gated against a resident NF4 reference with a
+  repair-disabled control arm in the same process: **real 32B 256/256 gradient tensors
+  exact against the control's 8–12/256**, at +2.9% peak VRAM and −4.8% throughput; and
+  again on **real 72B — the size where the defect was worst — 320/320 against 8/320**,
+  at +2.6% and −3.7%. De-aliasing was measured and rejected first: bnb holds the
+  reference across the whole forward-to-backward span, so any copy is O(model), which
+  took real 32B from 4,220 to 19,720 MiB and deletes the feature's premise.
+- **All four preference losses died on newer trl (#328).**
+  `should_enable_hf_gradient_checkpointing` existed so the HF Trainer does not
+  checkpoint an already-checkpointed streamed model twice — and only `sft.py` ever
+  called it. TRL's default is `False` on trl 0.19.1 and `True` on 0.26.2, so one
+  omission had two opposite symptoms: an explicit `gradient_checkpointing: true`
+  silently dropped on the older stack, and on the newer one HF checkpointed the *inner*
+  decoder layer, recomputed it after the reparametrisation context had exited, and
+  killed dpo/orpo/simpo/kto with `Tensor on device cuda:0 is not on the expected
+  device meta!`.
+- **Layer streaming is now refused when `nn.DataParallel` would engage.** HF wraps the
+  model in DataParallel whenever more than one CUDA device is visible and the run is not
+  distributed, and DataParallel requires every parameter on `device_ids[0]` — streaming
+  keeps the decoder on `meta` by design. It accounted for 8 of the 9 streaming-suite
+  failures on the H100 box and is unreachable on a one-GPU machine. It refuses rather
+  than quietly using 1 of 8 cards.
+- **`device_map="auto"` broke every distributed launch, in fifteen places.**
+  transformers refuses `device_map="auto"` outright under a distributed launch, so the
+  exact `accelerate launch` command `soup train --gpus 8` prints died on every rank. A
+  first pass fixed six trainers; nine sites still carried it. All fifteen now go through
+  `utils/gpu.resolve_device_map`, and the regression guard scans every module in
+  `soup_cli/trainer/` instead of a hand-written list — the list is what hid the nine.
+- **`LOGITS_BYTES_PER_ELEMENT` is split into two independently measured terms** (#327).
+  The 14 is 12 + 2, measured stage by stage on an H100 with zero spread across three
+  repeats, and only the 2 differs between stacks. It is deliberately **not lowered** —
+  see Known Limitations. What is new is an opt-in, upward-only calibration
+  (`max(14, measured + 2)`), which closes a real unguarded hole: a future stack that
+  grew a fourth fp32 buffer would be under-budgeted by 12.5% today with nothing to catch
+  it. Default behaviour is byte-identical and the pre-flight path takes no new CUDA.
+
+### Fixed — eval, ship and export
+
+- **Two of `soup ship`'s three behavioural suites measured nothing (#316).** On
+  Meta-Llama-3.1-8B-Instruct, `mini_tool_call` scored **0.000** and `mini_format_json`
+  **0.000** on a model that does both correctly. All harness defects: the tool-call
+  prompt never told the model tools exist, the JSON check ran `json.loads` over the
+  whole output while 38 of 40 answers sit inside a ```` ```json ```` fence, and the
+  generation budget was taking `make_generator`'s default of 64, truncating 31 of 40
+  tool calls one closing brace short.
+- **The refusal detector missed the apostrophe models actually type (#316).** The
+  patterns spelled the contraction with U+0027; Llama-3.1 writes U+2019. Over the
+  shipped 40-item `mini_safety` suite, **28 of 40 refusals scored as non-refusals** and
+  the suite reported 0.300 for a model whose true refusal rate is 1.000 — a 0.70 error
+  against a 0.05 regression threshold, i.e. 14× the thing it exists to detect.
+- **`soup train --task online_dpo` passed a keyword trl removed at 0.25 (#300).** The
+  probe asked whether `BasePairwiseJudge` was importable and used the answer to decide
+  whether to pass `reward_model=`; those two facts had decoupled, so the probe said yes
+  for every trl in the supported range. It now asks the signature — through an MRO walk,
+  because on 0.26.2 the top-level class is a deprecation shim whose direct signature
+  reports no parameters at all.
+- **A quantised GGUF export deleted a previously exported f16 (#144).** The f16
+  intermediate was named `{model}.f16.gguf` next to the output — exactly the default
+  output name of a `--quant f16` export — and unlinked when quantisation finished. So
+  exporting q4_0 destroyed an earlier f16 export, even with an unrelated `--output`.
+  Reproduced. It now lives in a private temp directory. Separately, the convert
+  dependencies were installed only after an auto-clone, so `--llama-cpp /path` and an
+  already-present checkout both died on `ModuleNotFoundError: sentencepiece`.
+
+### Fixed — packaging and docs
+
+- **`requires-python` now has an upper bound: `>=3.10,<3.13` (#358).** CI tests 3.10,
+  3.11 and 3.12 and nothing above. Without a ceiling, pip on 3.13+ resolved torch wheels
+  nobody here has run, and the failure was not a Soup error message — it was a loader
+  crash inside `c10.dll` / `libc10.so` before any Soup code executed, leaving the user
+  nothing to act on. The bound is **3.13, not 3.14**: 3.13 is equally untested.
+  `tests/test_requires_python_bound.py` derives the bound from the CI matrix, so
+  widening one without the other fails the suite.
+- **The `trl` bounds shipped in v0.72.4 were wrong at both ends**, and were corrected
+  before #326 widened them again. The ceiling was over-tight by five releases: the
+  v0.72.4 table read a `trl/experimental/` *relocation* as a field removal. The floor
+  `>=0.7.0` was impossible — `setup()` imports `GRPOTrainer`, first exported at 0.14.0.
+  One detail in the v0.72.4 note was also imprecise: `ORPOConfig`/`CPOConfig` are not
+  deleted at 0.29, they leave the public namespace — an `ImportError` rather than a
+  rejected keyword, which is worse, not milder.
+- **The layer-streaming pre-flight panel was titled after a flag that does not exist**
+  (#329). It read `soup train --stream-layers`; there is no such option — streaming is
+  enabled by `training.stream_layers` in `soup.yaml`. It is the first thing a streaming
+  run prints, so it was the feature's most-read line of documentation, and it pointed at
+  a `No such option`.
+- **Seven of the eight configs in `examples/configs/` did not parse.** They were written
+  against a pre-nesting schema, so `soup train --config examples/configs/sft_basic.yaml`
+  — the first command `examples/README.md` tells you to run — failed validation. Also
+  fixed while there: two configs declared `format: sharegpt` for preference-shaped data
+  (a silently wrong training run, not an error), `target_modules` listed `out_proj`
+  which no Llama has, and `vision_llama.yaml` pointed at files that have never existed
+  in this repo. `tests/test_examples_configs.py` now parses every one of them.
+- **`soup data demo` metadata described files other than the ones it ships.**
+  `sharegpt_demo` declared `format: sharegpt` for prompt/chosen/rejected rows — the
+  value a user copies straight into `data.format` — and `grpo_demo` declared
+  `reasoning`, which is not in the schema's format literal at all.
+- **Encoding corruption in `pyproject.toml`** (fourteen em-dashes round-tripped through
+  cp1251, one of them in the `unit` pytest marker description that `pytest --markers`
+  prints), and **`docs/commands.md`**, where missing newlines collapsed five commands
+  onto two lines and the page promised "the full command list" while omitting seven.
+
+### Changed — documentation corrected against measurement
+
+- **LISA delivers the quality half of its claim, not the memory half (#306).** Measured
+  at 3B and 8B on an H100 with LISA engagement verified three independent ways: it beats
+  full fine-tuning at both learning rates, and it is **1.22× LoRA's VRAM at 3B and 1.51×
+  at 8B**, with the gap *widening* with scale — embeddings, LM head and final norm stay
+  trainable every interval and are 70.7% of everything LISA trains at 8B. The docs now
+  say that plainly, and say when LISA is still the right choice.
+- **FlashAttention and Liger were measured for the first time**, at **1.015×** and
+  **1.051× / −12.9% VRAM**, against documented claims of "2–4×" and "20–60% / 20–40%".
+  Both claims are corrected in the docs.
+- **The GEMM-ceiling test could not pass on a datacenter GPU.** Its plausibility bound
+  was `< 200 TFLOPS`, written when the only hardware this project had was an RTX 3050;
+  an H100 returns a correct 786.5 TFLOPS and the assertion fired.
+
+### Validation (measured, not changed)
+
+- **The laptop result reproduces on completely different hardware.** Llama-3.1-8B NF4:
+  119.6 tok/s in a 3.32 GB peak on the RTX 3050 against a **median 113.00 tok/s in the
+  same 3.32 GB** on an H100 — first outside evidence that the method is bound by
+  host-to-device transfer, not by the GPU. (See Known Limitations for what the laptop
+  figure does and does not now mean.)
+- **Forward bit-exactness at real model sizes**, not just on toys: logits `torch.equal`
+  against a resident reference of matching numerics at 0.5B, 8B, 14B, 32B and 72B. Every
+  previously published bit-exactness result was on 3-layer from-config checkpoints,
+  because a 4 GB card cannot hold a resident 8B to compare against. *Backward*
+  exactness is a separate claim measured separately — see #331 above and the per-model
+  ledger at the top of the gate record.
+- **A streamed model is as good as a resident one.** Paired over five disjoint training
+  subsets and judged by Soup's own `soup ship`: mean difference **+0.006 against an
+  identical 0.013 within-arm spread**, in bf16; **+0.0053 against spreads of 0.0333 and
+  0.0200** in NF4. This had never been measured anywhere in the project.
+- **Against DeepSpeed ZeRO-3 CPU offload**, same box, same data, same model:
+  **2.93× the throughput at 9.7× less peak VRAM** at matched numerics. The honest
+  reading is narrow, and the same session establishes it: eight cards of ZeRO-3 are
+  *slower* than one card training resident for a model that fits. Layer streaming is
+  not "faster than DeepSpeed" — it is for the case where the one card you have is too
+  small.
+
+### Known limitations
+
+- **The `training.seed` knob reaches the SFT trainer only** (#353). Every other task
+  builds its own `TrainingArguments`; setting it there parses and does nothing.
+- **A resident 4-bit run is still not bit-reproducible from a seed** (#354), while a
+  streamed one is. `get_peft_model` builds `lora_A` *before* `Trainer.__init__` calls
+  `set_seed`, so the adapter init escapes the seed. Diagnosed with three competing
+  hypotheses each killed by a control; the one-line fix is verified in the gate record
+  but **not shipped here**. It has a real consequence for `soup ship`: three runs of one
+  unchanged resident config moved `mini_common_sense` by 0.375 and `mini_mmlu` by 0.269
+  against a `forgetting_threshold` of 0.05, so five of seven suites can cross the
+  regression line on a re-run that changed nothing.
+- **The layer-streaming VRAM pre-flight still over-predicts** (#327), and
+  `LOGITS_BYTES_PER_ELEMENT` was deliberately left at 14 rather than lowered to the
+  measured loss-path value. The asymmetry decides it: over-predicting refuses a config
+  that would have worked — visible, annoying, data intact. Under-predicting on Linux is
+  a clean OOM, but on **Windows/WDDM there is no exception at all** — it silently spills
+  to host memory (measured: 9.27 GB allocated on a 4.29 GB card with nothing raised) and
+  the claim "peak is bounded by one layer" quietly stops being true. The counterfactual
+  settles it: 14 under-predicts 0 of 10 measured rows (worst +0.85% over), the lower
+  value under-predicts 10 of 10 (worst −10.49%). The practical cost is that a streamed
+  DPO run is refused from `max_length: 768` on a 4 GB card.
+- **`bitsandbytes` still has the defect #331 works around.** Soup no longer sends
+  streamed NF4 weights through `MatMul4Bit`, but the underlying library behaviour —
+  saving tensors outside `save_for_backward` where checkpointing cannot see them — is
+  upstream and unchanged. Filed as
+  [bitsandbytes-foundation/bitsandbytes#2034](https://github.com/bitsandbytes-foundation/bitsandbytes/issues/2034).
+- **DeepSpeed + LoRA is repaired in `sft.py` only** (#336). The other trainer wrappers
+  still hit the empty-parameter-group failure under DeepSpeed, a user-supplied
+  `--deepspeed my.json` is passed through unresolved, and ZeRO++ hierarchical
+  partitioning is unit-tested but never exercised across two nodes.
+- **`utils/sglang.py` still has both of the defects the vLLM rewrite fixed** — its own
+  hand-rolled prompt and a hardcoded `finish_reason`. Named rather than silently
+  skipped.
+- **The closed-loop reward-hacking controller's mechanism is confirmed; its efficacy is
+  not** (#286). At 7B the between-mode difference of 0.130 sits *inside* the within-mode
+  spread of 0.140–0.195. Settling it needs ≥5 seeds per mode.
+- **Two `soup ship` leg-2 suites have scoring gaps that outrank capability** (#346,
+  #357). `mini_tool_call` ranks by brace hygiene — Llama-3.1-8B names the right tool
+  40/40 and scores 0.225 — and `mini_mmlu` loses 8 of 26 items because
+  `extract_mcq_letter` does not know `\boxed{C}`, scoring the 8B at 0.423, below a 0.5B.
+  Adding that one form takes it to 0.731 and the inversion disappears. A third
+  suspected inversion (#356) was **withdrawn as a measurement error of our own** — it
+  was measured at a 64-token budget where `soup ship` uses 256.
+- **The 70B FSDP2 recipe could not be smoke-tested** (#41): it needs all eight cards, so
+  it could not be parallelised with anything else in the session.
+- **The RAM-vs-disk streaming throughput gap remains unmeasured** (#325), and layer
+  streaming remains **BETA**.
+
+### A note on the preprint
+
+[DOI 10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064) is unaffected in
+its correctness claims: its configuration is 8B NF4 at **105 MiB per layer**, comfortably
+below the 163.8–171.5 MiB boundary of #331, and it survives a 50-backward soak at
+`worst_abs = 0.0`. What this release changes is **scope**, not validity — exactness moves
+from 3-layer from-config toys to resident references at 8B / 14B / 32B / 72B. A version 2
+of the record carrying the H100 validation, the resident references, the DeepSpeed
+comparison and the disclosed defect is in preparation.
+
+One number should be read with a caveat: **the published 119.6 tok/s laptop figure was
+measured before the #331 repair and has not been re-run on repaired code.** The repair
+cost −4.8% throughput at 32B, so treat the laptop figure as a pre-repair number until
+someone re-measures it on an RTX 3050. An H100 cannot substitute — the whole point of the
+H100 result is that this method is transfer-bound, so its throughput does not carry across
+machines.
 
 ## [0.72.4] - 2026-08-03
 
@@ -125,10 +384,11 @@ their `trl` config, and `trl` removed it in stages. So anyone who ran
 `pip install 'soup-cli[train]'` and resolved to a recent `trl` had
 `soup train --task orpo` fail on import.
 
-> **Correction (see [Unreleased]).** This release shipped the cap as `<0.25` on the
+> **Correction (see [0.73.0]).** This release shipped the cap as `<0.25` on the
 > strength of a staged-removal table that was itself wrong. The real stages are
-> `kto` at 0.27, `bco`/`orpo`/`simpo` at 0.28 and `dpo`/`ipo` at 0.29; the cap is
-> now `<0.27`.
+> `kto` at 0.27, `bco`/`orpo`/`simpo` at 0.28 and `dpo`/`ipo` at 0.29. v0.73.0 first
+> corrected the cap to `<0.27` and then raised it to `<0.29` behind a capability-probe
+> compat layer, so the trainers no longer set the cap at all.
 
 That was already true before this release and nothing caught it: the `trl` imports
 live inside `setup()`, which no test had ever called on those wrappers, so CI stayed

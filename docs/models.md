@@ -65,6 +65,12 @@ Rows are `{"audio": <path>, "text": <transcript>}` with `data.format: asr`. See
 
 ## Optional Extras
 
+> **Python 3.10, 3.11 or 3.12.** Since v0.73.0 the package declares
+> `requires-python = ">=3.10,<3.13"`. Those are exactly the versions CI tests. Without the
+> upper bound, pip on 3.13+ resolved PyTorch wheels nobody had validated, and the failure was
+> not a Soup error message — it was a loader crash inside `c10.dll` / `libc10.so` before any
+> Soup code ran. If you are on 3.13+, create a 3.12 environment; support widens when CI does.
+
 The core `pip install soup-cli` is a light install — the CLI, config system, and data tools, with
 no PyTorch. Add `[train]` to fine-tune, or install other extras only when you need them:
 

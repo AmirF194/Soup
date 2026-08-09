@@ -1,4 +1,4 @@
-"""v0.72.5 — the #331 repair: keep streamed NF4 weights out of ``MatMul4Bit``.
+"""v0.73.0 (#331) — the repair: keep streamed NF4 weights out of ``MatMul4Bit``.
 
 WHY THIS EXISTS
 

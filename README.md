@@ -21,7 +21,7 @@
 <p align="center">
   <a href="https://pypi.org/project/soup-cli/"><img src="https://img.shields.io/pypi/v/soup-cli?color=blue" alt="PyPI"></a>
   <a href="https://pepy.tech/project/soup-cli"><img src="https://img.shields.io/pepy/dt/soup-cli?color=blue" alt="Downloads"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.10--3.12-blue" alt="Python 3.10-3.12">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License">
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="Tests"></a>
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -43,7 +43,10 @@ soup train
 **Fine-tune an 8B model on a 4 GB laptop GPU.** Layer streaming keeps the frozen base out of
 VRAM and feeds it to the GPU one decoder layer at a time. Measured on an RTX 3050 Laptop 4 GB:
 Llama-3.1-8B-Instruct + NF4 at **119.6 tok/s, 3.32 GB peak** — bit-exact against a normal
-resident run. Opt-in (`stream_layers: true`) and still BETA —
+resident run, and reproduced independently on an H100 at 113.00 tok/s in the same 3.32 GB.
+(The tok/s figure was measured on v0.72.2, before the v0.73.0 correctness repair that cost
+−4.8% at 32B; it has not been re-run on a 4 GB card since.) Opt-in (`stream_layers: true`)
+and still BETA —
 [how it works](docs/performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724) ·
 [all measurements](benchmarks/) · [paper](https://doi.org/10.5281/zenodo.21771064)
 
@@ -64,42 +67,68 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.72.4 — align on a laptop: DPO, ORPO, SimPO and KTO over layer streaming.** Layer
-streaming keeps the frozen base out of VRAM and feeds it to the GPU one decoder layer at
-a time. It used to support supervised fine-tuning only; now it runs the preference
-losses too.
+**v0.73.0 — three days on somebody else's hardware.** Every number Soup had ever published
+came from one machine: a 4 GB RTX 3050 laptop running Windows. From 5–9 August it ran on a
+borrowed 8×H100 box. That found real bugs, and it confirmed the headline claim on hardware
+nothing like the one it was made on.
 
-- **DPO's reference model is free.** DPO needs a reference to compare against, and a
-  second copy of the model would double memory and defeat the whole point. Soup uses
-  *the same streamed base with its adapters switched off* — one set of weights, one
-  stream. Measured on an RTX 3050 4 GB: streamed DPO peaked at **0.914×** the
-  supervised-fine-tuning peak. Forcing a real second model in the same test cost
-  **+730 MB — exactly one copy of the weights.**
-- **KTO is not reference-free**, however it is usually described: it picks its reference
-  the same way DPO does, so it gets the same treatment. ORPO and SimPO genuinely are.
-- **Bit-exact against a normal, non-streamed run** of the same loss — `0.0` difference,
-  the bar every release in this series has to clear.
-- **The VRAM pre-flight knows a paired loss is twice the rows**, because chosen and
-  rejected go through the model as one tensor.
-- **Honest cost:** the reference is free in *memory*, not in *time* — DPO reads the
-  layer stack **1.52×** as often per step as supervised fine-tuning does.
-- `grpo` / `ppo` stay excluded on purpose: generation re-reads every layer per token,
-  which is exactly what streaming cannot amortise.
-- Still BETA.
+- **The laptop result reproduces elsewhere.** Llama-3.1-8B NF4 streamed: 119.6 tok/s in a
+  3.32 GB peak on the RTX 3050, against a **median 113.00 tok/s in the same 3.32 GB** on an
+  H100. Layer streaming is bound by host-to-device transfer, not by the GPU.
+- **A silent wrong-gradient bug, found and fixed.** On NF4 models above ~165 MiB per layer
+  (32B and up), `bitsandbytes` kept a weight reference where gradient checkpointing could
+  not see it, so the forward stayed exact and the loss curve looked healthy while the
+  *gradients* were wrong. Repaired and gated on real 32B (**256/256 gradient tensors exact**
+  against a control's 8–12/256) and real 72B (**320/320** against 8/320), at −4.8% and
+  −3.7% throughput.
+- **Four backends that had never actually run, now do.** `soup train --gpus N` handed
+  `accelerate` the Python binary and every rank died parsing it as source. DeepSpeed could
+  not train a LoRA model on any stage. SGLang returned 500 on 100% of generations. And
+  `use_fsdp2_compile` wrote adapters that reload as **all zeros** (0 of 96 tensors live).
+- **The vLLM backend now uses your model's chat template**, instead of a hand-rolled
+  `"User:/Assistant:"` string it was never trained on. Same server, same sampling: a run-on
+  loop burning 200 tokens before, an 8-token answer after.
+- **New: `training.seed`** (every run was hardcoded to 42) and **full fine-tuning via
+  `lora.r: 0`** (the code path existed but was unreachable).
+- **A streamed model is as good as a resident one** — paired over five training subsets and
+  judged by Soup's own `soup ship`: mean difference **+0.006** against a **0.013**
+  within-arm spread.
+
+The full measurement record, published as written including the rejected hypotheses and the
+false positives that controls caught, is
+[`benchmarks/gate-h100-validation.md`](benchmarks/gate-h100-validation.md).
 
 ```yaml
 # soup.yaml — then just `soup train --config soup.yaml`
 training:
   stream_layers: true      # base streams out of VRAM; only the adapter trains
   quantization: 4bit       # NF4 — ~4x smaller store, so 8B fits a 4 GB card
-  batch_size: 4            # v0.72.3: bigger batches amortise the weight read
+  batch_size: 4            # bigger batches amortise the weight read
   stream_source: auto      # RAM when it fits, NVMe disk when it does not
+  seed: 1234               # new in v0.73.0
 ```
+
+> Python **3.10–3.12** only. v0.73.0 adds the upper bound that was missing: on 3.13+, pip
+> used to resolve untested PyTorch wheels that crash in the native extension before Soup
+> runs at all.
+
+<details>
+<summary>Previous release — v0.72.4, align on a laptop (DPO / ORPO / SimPO / KTO over layer streaming)</summary>
+
+Layer streaming used to support supervised fine-tuning only; v0.72.4 opened it to the
+preference losses. The risk was one thing: DPO needs a reference model, and a second copy
+would double memory and defeat the point. Soup uses *the same streamed base with its
+adapters switched off* — measured at **0.914×** the SFT peak, where forcing a real second
+instance cost **+730 MB, exactly one copy of the weights**. Bit-exact against a normal
+non-streamed run for all four. Honest cost: free in *memory*, not in *time* — DPO reads the
+layer stack **1.52×** as often per step. `grpo` / `ppo` stay excluded on purpose.
 
 > **Trained with `stream_layers: true` on v0.72.0?** That adapter is inert — its tensors were
 > saved under keys with an extra `.inner.` segment, so every loader returned the untuned base.
 > Fixed in v0.72.1; re-run or re-save. Check with:
 > `python -c "from safetensors.torch import load_file; print([k for k in load_file('adapter_model.safetensors') if '.inner.' in k][:3])"`
+
+</details>
 
 <details>
 <summary>Previous release — v0.71.40, soup reward synth (generate a reward verifier from your data)</summary>
@@ -136,22 +165,6 @@ wins your task but quietly breaks tool-calling now gets a **DON'T SHIP**. Zero n
 ```bash
 soup ship --base ./base --adapter ./my-lora --task-eval my_task.jsonl
 #   exit 0 = SHIP · 2 = DON'T SHIP · 3 = bad flags · 1 = runtime error
-```
-
-</details>
-
-<details>
-<summary>Previous release — v0.71.33, <code>soup draft</code> (measure speculative decoding)</summary>
-
-`soup draft measure` reports a draft model's **acceptance rate** + real plain-vs-assisted tok/s
-(exit 0/2/1 for CI); `soup draft distill` distils your target into a dense tiny draft, auto-wired
-into `soup serve --auto-spec`. The honest result on a small same-family pair: distillation didn't
-move acceptance (69.3% → 69.3%) and assisted decoding was a net slowdown — which is exactly the
-number you want *before* shipping speculative decoding.
-
-```bash
-soup draft measure --target ./my-tuned-model --draft HuggingFaceTB/SmolLM2-135M-Instruct \
-  --prompts prod-prompts.jsonl        # -> acceptance %, real tok/s, ship-or-not
 ```
 
 </details>
@@ -332,7 +345,8 @@ docker compose up   # or build locally
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10, 3.11 or 3.12 (those are the versions CI tests; 3.13+ is not supported yet
+  because the PyTorch stack has not been validated there)
 - GPU with CUDA (recommended), Apple Silicon (MPS), or CPU (experimental — very slow)
 - 8 GB+ VRAM for 7B models with QLoRA
 

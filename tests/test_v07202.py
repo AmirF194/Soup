@@ -1784,7 +1784,7 @@ class TestNF4ParityOnCuda:
         # tokens. At 64 all 14 4-bit linears take _dequant_linear_fallback and
         # parity returns to 0.0; the window boundary and the exactness boundary
         # were measured to coincide exactly. 128 is that boundary with margin.
-        # TestFixtureIsOutsideTheFusedKernelWindow in test_v07205.py pins it.
+        # TestFixtureIsOutsideTheFusedKernelWindow in test_v07300.py pins it.
         ids = torch.randint(
             0, 64, (1, 128), generator=torch.Generator().manual_seed(11)
         ).cuda()

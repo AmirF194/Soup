@@ -13,7 +13,9 @@ cd Soup
 
 ### 2. Set Up Development Environment
 
-**Requirements:** Python 3.10+
+**Requirements:** Python 3.10, 3.11 or 3.12 (`requires-python = ">=3.10,<3.13"`). CI runs
+exactly those three; `tests/test_requires_python_bound.py` derives the declared bound from
+the CI matrix, so widening one without the other fails the suite.
 
 Install the project in editable mode with dev dependencies:
 
@@ -120,7 +122,7 @@ src/soup_cli/
   templates/          - 21 built-in soup.yaml templates (YAML + manifest.json) with load_template loader (v0.39.0, +bco v0.40.0, +4 compliance v0.71.35)
   ui/                 - Web UI (FastAPI + HTML/JS SPA)
 
-tests/                - Test suite (333 files, 17068 tests)
+tests/                - Test suite (347 files, 17344 tests)
 examples/             - Real-world config examples and datasets
 ```
 
@@ -150,7 +152,7 @@ pytest tests/test_data.py::test_detect_alpaca_format -v
 pytest tests/ --cov=soup_cli --cov-report=html
 ```
 
-### Test Files (318 files)
+### Test Files (347 files)
 
 > A representative sample of the suite below. Run `pytest tests/ -v` for the complete list.
 

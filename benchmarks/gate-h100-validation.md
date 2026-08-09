@@ -2704,6 +2704,47 @@ meaningful.
 
 Results: `/root/results/sweep_s{32,128,512}_b{2,3,4}.json`.
 
+### Preference losses over streaming, timed against SFT for the first time
+
+FINDING 2 recorded that all four streamed preference losses died on this torch
+before training started, and the throughput work was done without them. STEP 15
+fixed the cause. This is the first time any of them has been **timed** here, and
+it is done through the real `soup train`, not a harness.
+
+Llama-3.1-8B, NF4, `stream_layers: true`, `stream_source: ram`, buffers 2,
+batch 2, seq 256, 64 rows, 1 epoch, LoRA r=8. `sft` and `dpo` differ in `task`
+and data format and in nothing else. **Sequential, one card** — the parallel
+sweep above is exactly why: contention makes throughput unquotable.
+
+| | run 1 | run 2 | run 3 | median | peak VRAM |
+|---|---|---|---|---|---|
+| `sft` samples/s | 6.082 | 6.090 | 5.840 | **6.082** | **3 689 MiB** (all 3) |
+| `dpo` samples/s | 4.775 | 4.665 | 4.637 | **4.665** | **3 733 MiB** (all 3) |
+
+**Peak VRAM: +1.2%.** That is the number worth having. v0.72.4's central claim is
+that DPO's reference model costs no extra weights, because it is the *same*
+streamed base with adapters disabled — and that claim was measured on a 365M
+fixture (0.914x the SFT peak, against +730.44 MB for a forced second instance).
+Here it holds on a real 8B through the shipped CLI: a second resident copy of an
+NF4 8B would be ~5.6 GB, and the whole observed difference is **44 MiB**.
+
+**Throughput: DPO is 1.30x slower per sample.** v0.72.4 predicted the direction
+from layer reads (1.52x per step) and published "the honest cost is TIME not
+memory". Both halves of that survive contact with a real model. The two numbers
+are not the same metric — reads per step against samples per second — so 1.30
+and 1.52 are not in tension and neither is a correction of the other.
+
+Determinism: each arm reproduced its `train_loss` to the last digit across all
+three runs (3.659843683242798 and 0.37352198362350464), so the spread above is
+scheduling, not numerics.
+
+Caveats: 64 rows and 1 epoch means an 11–14 s train step where setup is a large
+share of wall time, so these ratios are directional; batch 2 only; and
+**`orpo`/`simpo`/`kto` are still untimed** — only `dpo` was run, because it is the
+one with a reference model and therefore the one whose cost claim was in doubt.
+
+Logs: `/root/logs/bench_pref_*.{log,samples}`.
+
 ## STEP 15 — #328 diagnosed and fixed: nobody was setting `gradient_checkpointing`
 
 STEP 1 recorded five failures in `tests/test_v07204.py` on this box's CUDA stack —
@@ -4289,11 +4330,13 @@ what was measured; no claim about whether the base is sharded is made from it.
 - **The 8-GPU comparison is on hardware where streaming's premise does not
   apply**, and on a PCIe box with no NVLink, which is the interconnect ZeRO-3
   most depends on.
-- **Preference losses were not benchmarked** — when the throughput work was done
-  `dpo`/`orpo`/`simpo`/`kto` streamed all failed on this torch before training
-  started (FINDING 2). That cause is now found and fixed (STEP 15), so they DO run
-  here; nobody has re-run the throughput arms against them, so v0.72.4's
-  performance claims remain untested on this box.
+- **Only `dpo` of the four preference losses was benchmarked** — when the
+  throughput work was done `dpo`/`orpo`/`simpo`/`kto` streamed all failed on this
+  torch before training started (FINDING 2). That cause is found and fixed
+  (STEP 15) and `dpo` is now measured against `sft` through the real CLI (see
+  STEP 14's preference subsection), but `orpo`/`simpo`/`kto` have still not been
+  timed, and the `dpo` runs are 64 rows / 1 epoch, short enough that setup is a
+  large share of wall time.
 - **The repair is gated at two model sizes and swept over four more shapes** —
   real 32B and real 72B NF4 at seq 128 / `stream_buffers=2`, plus 32B at seq 32,
   seq 512, buffers 3 and buffers 4, 5 repeats each, every point with a control arm

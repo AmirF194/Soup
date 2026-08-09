@@ -165,6 +165,13 @@ appear in the order they were run, not in the order they would read best.
     and was caught before publication there. **A control only covers the variable it
     varies** — the before/after arms both carried the wrong budget. `mini_safety`
     orders by capability and is healthy.
+20a. **Reported measurement budget matters, and mine did not match the tool's.**
+    `soup ship` generates at `BEHAVIOURAL_MAX_NEW_TOKENS = 256`; two of my suite
+    runs used 64 and 32. One finding died of it (#356), one survived unchanged
+    (#346, re-measured at 256 and *wider*), and one was caught pre-publication
+    (`mini_mmlu`). Any future suite measurement in this record should state its
+    budget, because it is load-bearing for exactly the suites whose models answer
+    at length.
 21. **A scoring function that returns 0.0 instead of raising** (#355).
     `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
     reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error

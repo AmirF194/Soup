@@ -136,6 +136,25 @@ appear in the order they were run, not in the order they would read best.
     fails on an empty no-decay parameter group meeting torch 2.13's strict `zip`.
     The full-fine-tuning control trains to completion, which both isolates the
     trigger and explains why an earlier ZeRO-3 run passed.
+17. **The #331 repair is gated at both sizes where the defect fired, and swept**
+    (STEP 14). Real 72B — where even the *first* backward was corrupted, unlike
+    32B — comes back **320/320 against its control's 8/320**, at −3.7% throughput
+    and +2.6% peak. Four more shapes (seq 32/512, buffers 3/4) are exact except
+    seq 32, which diverges by **3.109e-03 — under one bf16 ulp** — because M ≤ 32
+    is inside bitsandbytes' fused-kernel window, exactly as STEP 13 predicted.
+18. **All four preference losses timed, and the cost tracks the mechanism**
+    (STEP 14). `orpo`/`simpo` run at SFT speed because they carry no reference
+    term; `dpo` costs 0.77x for one extra traversal; `kto` 0.59x because its KL
+    batch is a *separate* forward. **Peak VRAM is flat across all five within
+    1.7%** — none holds a second copy of the base, where a second resident NF4 8B
+    would be ~5.6 GB. Closes FINDING 2's untested-claims gap.
+19. **`training.seed` cannot reach the adapter, and the streamed path is the
+    reproducible one** (STEP 14, #354). A streamed run now repeats bit-for-bit;
+    a resident run with the same seed does not, because `get_peft_model` builds
+    `lora_A` *before* `Trainer.__init__` calls `set_seed`. Three competing
+    hypotheses — load-time quantisation, dropout, a bnb kernel asymmetry — were
+    each killed by a control, and the fix (one correctly-placed `set_seed`) is
+    verified with a control of its own.
 
 ### The exactness ledger — read this before quoting any "exact" from this file
 

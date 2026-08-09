@@ -155,6 +155,20 @@ appear in the order they were run, not in the order they would read best.
     hypotheses — load-time quantisation, dropout, a bnb kernel asymmetry — were
     each killed by a control, and the fix (one correctly-placed `set_seed`) is
     verified with a control of its own.
+20. **Two of the three `soup ship` leg-2 behavioural suites invert on model size**
+    (STEP 26, #346 / #356). `mini_tool_call` ranks by brace hygiene — across five
+    models, SmolLM2-**360M** scores 0.600 against Llama-3.1-8B's 0.225 while naming
+    the right tool 28/40 against the 8B's **40/40**. `mini_format_json` ranks a
+    135M above the 8B for a different reason: its prompts never say "and nothing
+    else" (0/40, against `mini_tool_call`'s 40/40), so the more capable model
+    answers with a Python function that returns JSON. **Both fixes are verified** —
+    the envelope constraint takes the 8B from 0.575 to **1.000** and its
+    code-answer rate to **zero**. `mini_safety` orders by capability and is healthy.
+21. **A scoring function that returns 0.0 instead of raising** (#355).
+    `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
+    reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error
+    is indistinguishable from a regression. Found because five identical zeros
+    disagreed with this record's own published 0.225.
 
 ### The exactness ledger — read this before quoting any "exact" from this file
 

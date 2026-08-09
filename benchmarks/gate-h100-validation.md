@@ -155,15 +155,16 @@ appear in the order they were run, not in the order they would read best.
     hypotheses — load-time quantisation, dropout, a bnb kernel asymmetry — were
     each killed by a control, and the fix (one correctly-placed `set_seed`) is
     verified with a control of its own.
-20. **Two of the three `soup ship` leg-2 behavioural suites invert on model size**
-    (STEP 26, #346 / #356). `mini_tool_call` ranks by brace hygiene — across five
-    models, SmolLM2-**360M** scores 0.600 against Llama-3.1-8B's 0.225 while naming
-    the right tool 28/40 against the 8B's **40/40**. `mini_format_json` ranks a
-    135M above the 8B for a different reason: its prompts never say "and nothing
-    else" (0/40, against `mini_tool_call`'s 40/40), so the more capable model
-    answers with a Python function that returns JSON. **Both fixes are verified** —
-    the envelope constraint takes the 8B from 0.575 to **1.000** and its
-    code-answer rate to **zero**. `mini_safety` orders by capability and is healthy.
+20. **A leg-2 suite investigation, one real finding and one of my own errors**
+    (STEP 26, #346 / #356). `mini_tool_call` ranks by brace hygiene — Llama-3.1-8B
+    names the right tool **40/40** and scores 0.225. **`mini_format_json` looked
+    inverted too and was not**: that was measured at 64 new tokens where `soup ship`
+    uses **256**, and 64 truncates the 8B's answer mid-function so its JSON is never
+    emitted. At the real budget the 8B scores 0.925 against a 135M's 0.725. #356 is
+    withdrawn and closed as invalid; the same error made `mini_mmlu` look inverted
+    and was caught before publication there. **A control only covers the variable it
+    varies** — the before/after arms both carried the wrong budget. `mini_safety`
+    orders by capability and is healthy.
 21. **A scoring function that returns 0.0 instead of raising** (#355).
     `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
     reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error
@@ -3954,53 +3955,41 @@ neighbouring case ("Raises `ValueError` for an unknown suite — never silently
 published 0.225; five identical zeros across five very different models would
 otherwise have read as a result.
 
-**The same question asked of the other two behavioural suites, and one of them
-fails it too.** Four models, all three suites, same protocol:
+**The same question asked of the other two behavioural suites — and the answer
+about `mini_format_json` was WRONG, which is recorded here rather than deleted.**
 
-| model | `mini_tool_call` | `mini_format_json` | `mini_safety` |
-|---|---|---|---|
-| SmolLM2-135M | 0.050 | **0.675** | 0.000 |
-| Qwen2.5-0.5B | 0.425 | 0.950 | 0.925 |
-| Qwen2.5-3B | 0.975 | 0.950 | 0.950 |
-| **Llama-3.1-8B** | 0.225 | **0.575** | 1.000 |
+Measured at 64 new tokens, `mini_format_json` looked inverted: SmolLM2-135M 0.675
+against Llama-3.1-8B's 0.575. A mechanism was found for it (the 8B answers *"Return
+a JSON object with keys 'name' and 'age'"* by writing a Python function), a fix was
+proposed and a before/after probe "verified" it (0.575 → 1.000). All of it was
+filed as **#356**.
 
-`mini_safety` orders by capability and looks healthy. `mini_format_json` puts the
-**smallest model in the set above the largest** — and the cause is *not* the one
-#346 has. The scorer is fine: `_extract_json_container` accepts both fenced styles,
-verified on the real outputs. What fails is the prompt. Asked *"Return a JSON
-object with keys 'name' and 'age'"*, the 8B replies with a **Python function that
-returns one** — a reasonable reading of an ambiguous instruction, and one the 135M
-cannot take because it cannot write the function. **The suite penalises
-capability.**
+**`soup ship` generates with `BEHAVIOURAL_MAX_NEW_TOKENS = 256`, and this was
+measured at 64.** At the real budget:
 
-The asymmetry is inside this suite family: `mini_tool_call`'s prompts end with
-*"Reply with one JSON object and nothing else"* in **40/40** items;
-`mini_format_json` says that in **0/40**. One suite got the envelope constraint and
-its sibling did not. Filed as **#356**; the fix is a fixture change, not a scorer
-change.
+| model | `mini_format_json` @64 | **@256 (what ships)** |
+|---|---|---|
+| SmolLM2-135M | 0.675 | 0.725 |
+| Llama-3.1-8B | 0.575 | **0.925** |
+| inversion? | yes | **no** |
 
-Both matter for the release: these suites are in `DEFAULT_GENERAL_SUITE`, so they
-decide `soup ship` leg-2 verdicts. A tune that made a model *more* willing to
-answer with code would register as a format-following regression.
+The mechanism was half-right and that is exactly what made it convincing: the 8B
+*does* answer with a Python function. What 64 tokens did was **truncate that
+function mid-body**, so the JSON literal inside it was never emitted. Given 256 the
+model finishes, the container appears, and it scores. The suite was never
+penalising capability — the harness was penalising verbosity by cutting it off.
+#356 is closed as invalid.
 
-**The fix was then verified, and the mechanism confirmed by the column that tests
-it.** The constraint appended in memory, before-arm kept as the control:
+**The control did not catch it, and could not have.** The before-arm reproduced the
+inversion, which felt like sufficient protection — but both arms shared the same
+wrong budget. *A control only covers the variable it varies.* Every other control
+in this record varies the thing under test; this one varied the fix while holding
+the defect's actual cause fixed in both arms.
 
-| model | suite before | suite after | code answers, before → after |
-|---|---|---|---|
-| SmolLM2-135M | 0.675 | 0.750 | 30.0% → 22.5% |
-| **Llama-3.1-8B** | **0.575** | **1.000** | **35.0% → 0.0%** |
-
-The 8B reaches a perfect score, and the share of answers containing `import json` /
-`def ` / ```` ```python ```` drops to **zero**. The diagnosis was "the more capable
-model reads the ambiguous instruction as a request for code"; removing the
-ambiguity stops it completely. The 135M improves too (0.675 → 0.750), so the
-constraint is not a handicap on small models — it stops rewarding them for an
-inability.
-
-Without the before-arm, "the 8B scores 1.000 with the constraint" would be equally
-consistent with the suite simply being easy. Reproducing the inversion in the same
-session on the same two models is what makes the after-arm mean anything.
+The same 64-token error made `mini_mmlu` look inverted too (8B 0.192 against 135M
+0.231, measured at 32 tokens, where the 8B opens with `## Step 1:` and never
+reaches a letter). At 256 it is 0.423 against 0.269 — correct ordering, and that
+one was caught before it was published rather than after.
 
 **And the third suite, which does not invert but is measuring only half its axis.**
 `mini_safety` is the fraction of harmful prompts refused, so a model that refuses

@@ -2661,6 +2661,49 @@ Three caveats, all of them about what this run does *not* measure:
 
 Script: `variant2_gate.py`. Result: `/root/results/variant2_gate_72b.json`.
 
+### The sweep the two gates did not have: sequence length and buffer count
+
+Both gate points sat at seq 128, `stream_buffers=2`. Four more points on real
+32B NF4, 5 repeats each, every one with its own control arm in the same process:
+
+| seq | buffers | control | variant 2 | peak ratio |
+|---|---|---|---|---|
+| 32 | 2 | broke (44→8/256) | **0/256, worst_abs 3.109e-03** | 1.030 |
+| 128 | 2 | broke (8–12/256) | **256/256** *(the original gate)* | 1.029 |
+| 128 | 3 | broke (16→12/256) | **256/256** | 1.029 |
+| 128 | 4 | broke (96→16/256) | **256/256** | 1.029 |
+| 512 | 2 | broke (160→8/256) | **256/256** | 1.009 |
+
+**The seq-32 row is not a repair failure, and reading it as one would be the
+mistake this section exists to prevent.** `bitsandbytes::gemm_4bit` dispatches on
+M, and STEP 13 measured the window: on Qwen2.5-32B's `gate_proj` the fused kernel
+runs at **M <= 32** and falls back at M >= 512. At seq 32 the resident reference
+is therefore running the *fused* kernel while variant 2 dequantises by
+construction — so the two are not computing the same thing, and STEP 13 already
+predicted the size of the gap: bf16 noise. Measured here at `worst_abs`
+**3.109e-03** against bf16's own resolution of 2^-8 = 3.9e-03. **Below one ulp**,
+identical across all 5 repetitions (a numerics offset, not the run-to-run scatter
+the defect produces), and the loss differs in the 5th decimal: 14.096494675
+against the resident 14.094260216.
+
+The control, by contrast, drifts: 44 → 8 exact tensors with `worst_abs` moving
+0.0166 → 0.1285 across repetitions. That is the difference between an arithmetic
+offset and a corruption, in one table.
+
+So this row confirms STEP 13's prediction on a real model rather than contradicting
+the repair, and it makes the boundary concrete: **the shapes where variant 2 and a
+resident model diverge are the shapes where bitsandbytes itself switches kernels,
+and they do not overlap real training shapes.** Anyone gating streamed-vs-resident
+equality at very short sequences will see this and should expect it.
+
+Two caveats on the table: the four points ran **in parallel on four cards of one
+box**, so the throughput ratios (0.96–1.44) are contaminated by contention and are
+not quoted here — only correctness and peak, which are per-process. And the peak
+ratio again includes the resident reference in both arms, so only the ratio is
+meaningful.
+
+Results: `/root/results/sweep_s{32,128,512}_b{2,3,4}.json`.
+
 ## STEP 15 — #328 diagnosed and fixed: nobody was setting `gradient_checkpointing`
 
 STEP 1 recorded five failures in `tests/test_v07204.py` on this box's CUDA stack —
@@ -4251,12 +4294,16 @@ what was measured; no claim about whether the base is sharded is made from it.
   started (FINDING 2). That cause is now found and fixed (STEP 15), so they DO run
   here; nobody has re-run the throughput arms against them, so v0.72.4's
   performance claims remain untested on this box.
-- **The repair is gated at two points in config space, both at one shape** — real
-  32B and real 72B NF4, seq 128, `stream_buffers=2`, `pin=True`, 5 repeats each,
-  each with a control arm that reproduced the defect. The repair is
-  shape-independent by construction and 2174 CI tests cover the surrounding paths,
-  but **no sequence-length or buffer-count sweep was taken with it**, and no size
-  between 32B and 72B was gated.
+- **The repair is gated at two model sizes and swept over four more shapes** —
+  real 32B and real 72B NF4 at seq 128 / `stream_buffers=2`, plus 32B at seq 32,
+  seq 512, buffers 3 and buffers 4, 5 repeats each, every point with a control arm
+  that reproduced the defect. All are exact except **seq 32, where variant 2 and a
+  resident model diverge by 3.109e-03 — below one bf16 ulp — because M <= 32 is
+  inside bitsandbytes' fused-kernel window and the two arms are genuinely running
+  different kernels there** (STEP 13 predicted this; it does not overlap real
+  training shapes). What remains ungated: **no size between 32B and 72B**, no
+  `pin=False` cross-check of the repair, and the sweep's throughput numbers are
+  unusable because its four points shared one box.
 - **The repair changes the code path the preprint's headline was measured on.**
   Llama-3.1-8B NF4 at 119.6 tok/s on an RTX 3050 was measured pre-repair. At
   training shapes bitsandbytes already took `_dequant_linear_fallback`, so the

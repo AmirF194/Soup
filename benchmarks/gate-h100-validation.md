@@ -3925,13 +3925,23 @@ the one its name claims.
 coincidence.** Same 40 items, greedy, envelope-agnostic name extraction alongside
 the suite's own score:
 
-| model | tool name correct | braces balanced | suite score |
-|---|---|---|---|
-| SmolLM2-135M | 18/40 | 15/40 | 0.050 |
-| SmolLM2-360M | 28/40 | 37/40 | **0.600** |
-| Qwen2.5-0.5B | 38/40 | 36/40 | 0.425 |
-| Qwen2.5-3B | 40/40 | 40/40 | 0.975 |
-| **Llama-3.1-8B** | **40/40** | **9/40** | **0.225** |
+| model | tool name correct | braces balanced | suite @64 | **suite @256 (what ships)** |
+|---|---|---|---|---|
+| SmolLM2-135M | 18/40 | 15/40 | 0.050 | 0.050 |
+| SmolLM2-360M | 28/40 | 37/40 | 0.600 | **0.675** |
+| Qwen2.5-0.5B | 38/40 | 36/40 | 0.425 | **0.475** |
+| Qwen2.5-3B | 40/40 | 40/40 | 0.975 | not re-run |
+| **Llama-3.1-8B** | **40/40** | **9/40** | 0.225 | **0.225** |
+
+The 256 column exists because the 64-token error that invalidated #356 had to be
+ruled out here too. **It does not apply: the inversion survives and widens to 3.0x**
+(0.675 against 0.225). Two independent confirmations that the harness is now on the
+shipped path — the 8B is *identical* at both budgets and matches this record's own
+independently published 0.225, and Qwen2.5-0.5B comes back at exactly **0.475**,
+the number STEP 26 published before any of these runs. `mini_tool_call`'s outputs
+are short (generation ends at `<|eot_id|>` after 21 tokens), so the budget was
+never load-bearing for this suite — which is precisely why it was for
+`mini_format_json`, whose 8B answers are truncated Python functions.
 
 The 8B row reproduces the 0.225 above exactly, so this is measuring the same thing.
 And the inversion is **worse than the pair it was filed on**: SmolLM2-**360M** names

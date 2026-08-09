@@ -179,7 +179,15 @@ appear in the order they were run, not in the order they would read best.
     15 failures classified at the shipped budget: **8 boxed the right letter**, 6
     boxed a value because the prompt never asks for a letter, **1 is a real miss**.
     Adding that one form takes it to **0.731** and the inversion disappears.
-23. **A scoring function that returns 0.0 instead of raising** (#355).
+23. **The unseeded adapter init makes leg-2 verdicts unreproducible** (STEP 26,
+    #354). Three runs of one unchanged resident config move `mini_common_sense` by
+    **0.375** and `mini_mmlu` by **0.269**, against a `forgetting_threshold` of
+    **0.05** — five of seven suites can cross the regression line on a re-run that
+    changed nothing. Five streamed runs of the same design move **0.0000** on every
+    suite and share one adapter hash, which is what makes the variance
+    attributable. STEP 11's +0.006 is smaller than the 0.0067 process noise of the
+    arm it is compared against.
+24. **A scoring function that returns 0.0 instead of raising** (#355).
     `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
     reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error
     is indistinguishable from a regression. Found because five identical zeros
@@ -4115,9 +4123,43 @@ Two consequences, and the second is the one that matters:
   at the level of the saved weights on the path users actually take by default,
   and it is the arm STEP 11 compares against.
 
-The streamed half of this question is answered exactly and pins to zero. The
-resident half is answered at the artefact level; its held-out consequence was being
-measured when this was written.
+**And the held-out consequence, which is the number that matters:**
+
+| | streamed (n=5) | **resident (n=3)** |
+|---|---|---|
+| task metric, 300 items | 0.886667 ×5 | 0.883333 / 0.886667 / 0.890000 |
+| **spread** | **0.000000** | **0.006667** |
+
+**STEP 11's headline difference is +0.006. The process noise of a single resident
+arm is 0.0067.** The difference is smaller than the noise of the arm it is measured
+against — which STEP 11 half-anticipated by reporting it against a 0.013 spread,
+but that spread was attributed to data variation. Part of it is not.
+
+**Leg-2 is far worse, and this is the release-relevant part:**
+
+| suite | resident values | spread | streamed spread |
+|---|---|---|---|
+| `mini_common_sense` | 0.875 / 1.000 / 0.625 | **0.375** | 0.0000 |
+| `mini_mmlu` | 0.500 / 0.692 / 0.423 | **0.269** | 0.0000 |
+| `mini_tool_call` | 0.150 / 0.075 / 0.150 | 0.075 | 0.0000 |
+| `mini_format_json` | 0.875 / 0.875 / 0.925 | 0.050 | 0.0000 |
+| `mini_instruction` | 1.000 / 0.958 / 1.000 | 0.042 | 0.0000 |
+| `mini_arithmetic` | 1.000 / 1.000 / 0.972 | 0.028 | 0.0000 |
+| `mini_safety` | 1.000 / 0.975 / 1.000 | 0.025 | 0.0000 |
+
+`soup ship`'s default `forgetting_threshold` is **0.05**. `mini_common_sense` moves
+**0.375** between two runs differing in nothing a user can see — **7.5x the
+threshold** — and `mini_mmlu` **5.4x**. **Five of seven suites can cross the
+regression threshold on a re-run of an identical config.** For those two suites a
+leg-2 REGRESSED flag on a resident model is closer to a coin flip than to a
+measurement, and that flag is what turns a SHIP into a DON'T SHIP.
+
+The streamed column is what makes this attributable rather than suggestive:
+identical design, zero spread everywhere. The whole variance is the unseeded
+`lora_A` (#354), which therefore is not a tidiness bug — it is the gate's leg-2
+verdict not being reproducible on the default path.
+
+Caveat: n=3, one model, one dataset. It sizes the effect; it does not calibrate it.
 
 ### An instrument failure worth recording, because it is the session's third of a kind
 

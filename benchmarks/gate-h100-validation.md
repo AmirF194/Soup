@@ -2789,12 +2789,34 @@ recorded is closed on that half, and a CLI-level A/B against a streamed arm now
 means something.
 
 **The resident path still is not.** Same seed, same config, two runs, 0.071%
-apart. That is a new defect and it is filed as **#354**. It is not #353 (seed
-reaching only the SFT wrapper) — this *is* `task: sft`. The most likely candidate,
-untested here: the streamed path quantises **offline into shards** and reloads
-identical bytes every run, while the resident path quantises **at load time**,
-which would explain exactly this asymmetry — and would mean a resident 4-bit model
-is not the fixed reference the correctness gates assume it is.
+apart. That is a new defect, filed as **#354**, and it was then diagnosed here
+rather than left as a symptom — three candidates, two eliminated by control and
+the third confirmed directly:
+
+| candidate | test | verdict |
+|---|---|---|
+| load-time NF4 quantisation is non-deterministic | hash the packed weights on two loads, before any step | **eliminated** — byte-identical |
+| LoRA dropout | set `lora.dropout: 0.0` explicitly, re-run | **eliminated** — still scatters, slightly more |
+| `MatMul4Bit` vs `F.linear` kernel asymmetry | resident with `quantization: none`, no bnb in the path | **eliminated** — still scatters, so not a 4-bit phenomenon |
+| **the adapter is built before any seed is set** | hash `lora_A` across two `get_peft_model` builds | **confirmed — DIFFERENT** |
+
+`training.seed` is threaded into `TrainingArguments` and nowhere else
+(`trainer/sft.py:418`). `Trainer.__init__` does call `set_seed` — but
+`get_peft_model` runs at `trainer/sft.py:833`, so **the LoRA matrices already
+exist by the time the Trainer is constructed**, and nothing the seed does
+afterwards can change them. Two builds in one process hash to
+`b47d4a0b…` and `07846d1f…`.
+
+That explains every observation at once, including why the streamed arm is the
+reproducible one: `build_streamed_model` **seeds its own adapter init**. This
+record already knew that (STEP 2b names it as the reason the two paths cannot be
+compared through the CLI) — but as a nuisance, not as the reason one half is
+deterministic and the other is not. The fix is placement, not plumbing: seed
+before the adapter is created.
+
+Retracted along the way: the worry, raised when the symptom was first filed, that a
+resident 4-bit model is not the fixed reference the correctness gates assume. It
+is — the quantiser is deterministic, measured above.
 
 Also measured, incidentally: **streaming holds an 8B in 3 681 MiB against the
 resident path's 12 087 MiB — 3.28x less — and costs 1.13x the wall time**

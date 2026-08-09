@@ -18,7 +18,8 @@ appear in the order they were run, not in the order they would read best.
 
 > **STATUS, read this first.** The defect in item 4 is **REPAIRED** (STEP 14) and
 > the repair is gated on real 32B at 256/256 gradients, +2.9% VRAM, −4.8%
-> throughput; **72B was not re-run after the fix.** Items 1 and 4 below describe the
+> throughput, and re-gated again at real 72B at 320/320 (the size where the defect
+> was worst). Items 1 and 4 below describe the
 > state *as measured*, which is what a working record is for; they are no longer the
 > state of the shipped code. A second defect, #328, was diagnosed to a cause in Soup
 > and also repaired (STEP 15). The steps are in the order they happened, not in the
@@ -47,7 +48,8 @@ appear in the order they were run, not in the order they would read best.
    half; the full per-model ledger is immediately below this list, and it exists
    because two readers took the unqualified phrase to cover both halves and
    reported a contradiction that is not there. **STEP 14 repairs the backward and
-   re-gates it at 256/256 on real 32B; 72B was not re-run after the fix.**
+   re-gates it at 256/256 on real 32B and at 320/320 on real 72B, each against a
+   control arm that reproduced the defect in the same process.**
 2. **The published laptop throughput reproduces on completely different
    hardware.** Llama-3.1-8B NF4: 119.6 tok/s in 3.32 GB peak on an RTX 3050
    Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
@@ -97,7 +99,10 @@ appear in the order they were run, not in the order they would read best.
     inside the checkpointed region keeps the weight out of `MatMul4Bit` entirely.
     Gated on real 32B against a resident NF4 reference with the repair-disabled arm
     as control: **256/256 gradients exact against the control's 8–12/256**, at
-    **+2.9% peak VRAM and −4.8% throughput** — where the de-aliasing repair rejected
+    **+2.9% peak VRAM and −4.8% throughput** — and gated a second time on **real
+    72B, the size where the defect was worst (even its first backward was
+    corrupted): 320/320 against that control's 8/320, at +2.6% and −3.7%** —
+    where the de-aliasing repair rejected
     in STEP 9 cost O(model). It is not even a numerics change at training shapes:
     `bitsandbytes::gemm_4bit` dispatches on M and already takes `_dequant_linear_fallback`
     at every M measured from 8 to 2048 on real projection shapes.
@@ -153,7 +158,7 @@ so; no cell is left blank.**
 | Qwen2.5-14B | NF4 | 132 | exact `0.0` | exact 192/192 *(50 backwards)* | not tested | identical | resident **NF4**, same box | not tested *(was already exact)* |
 | Qwen2.5-14B | bf16 | 570 | exact `0.0` | exact 192/192 | not tested | not tested | resident **bf16**, same box | n/a — bf16 never affected |
 | Qwen2.5-32B | NF4 | 234 | exact `0.0` | **WRONG 8/256** | exact 256/256 | **diverged**, rel 0.0586 | resident **NF4**, same box | **exact 256/256**, 5 reps (STEP 14 gate) |
-| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 | resident **NF4**, same box | **not tested** — 72B was not re-run after the fix |
+| Qwen2.5-72B | NF4 | 432 | exact `0.0` | **WRONG 8/320** | exact 320/320 | **diverged**, rel 0.1291 | resident **NF4**, same box | **exact 320/320**, 5 reps (STEP 14, second gate point) |
 
 How to read it:
 
@@ -170,8 +175,10 @@ How to read it:
   The bf16 rows at 480 and 570 MiB/layer are the control that the axis is not bytes
   alone.
 - **The last column is post-repair state, not a second opinion on the same runs.**
-  Only 32B was re-gated. 72B's pre-repair "WRONG 8/320" is what was measured, and
-  nobody has measured it since the fix.
+  The two rows that were broken are the two that were re-gated: 32B at 256/256 and
+  72B at 320/320, each against a control arm that reproduced the defect in the same
+  process. The four rows that were already exact were not re-run — there was
+  nothing there to repair.
 
 ### Why this session needed someone else's hardware
 
@@ -2588,12 +2595,71 @@ vacuous M=2048 numerics run, the negative control that rounded away, and this.
   finding that the corruption depends on state carried between backward passes, and
   it is why a single repetition is not a measurement here.
 - Measured at seq 128 on one model. The repair is shape-independent by
-  construction, but only 32B NF4 was gated end to end.
+  construction, and 72B was gated separately below, but each gate is a single
+  sequence length and buffer count.
 
 Script: `variant2_gate.py`. Result: `/root/results/variant2_gate_32b.json`.
 Shipped as `install_dequant_forward` in `src/soup_cli/utils/layer_stream_runtime.py`,
 with a CI test asserting the streamed path makes zero `MatMul4Bit` calls and a
 resident control asserting the counter can see such calls at all.
+
+### The second gate point: 72B, where the defect was worst
+
+The caveat above — "measured at seq 128 on one model, only 32B NF4 gated end to
+end" — is what this run removes. 72B is not simply a larger size: at 32B the
+first backward was correct and repetitions 2+ collapsed, while **at 72B even the
+first backward was wrong**, 8/320 on every repetition. It is the configuration
+where the mechanism fired hardest, so it is the one worth the second gate.
+
+Same harness, same protocol, same single deterministic resident NF4 reference,
+both arms in one process. 80 layers, NF4 (432 MiB/layer), `stream_buffers=2`,
+`pin=True`, seq 128, **5 repeats**. Resident reference: loss 13.035596848 over
+**320** gradient tensors — the full set, so nothing here is the `0/0` vacuity that
+this gate's first run at 32B produced.
+
+| | control (repair off) | variant 2 | resident reference |
+|---|---|---|---|
+| gradients exact | **8 / 320**, all 5 reps | **320 / 320**, all 5 reps | — |
+| wrong layers (of 80) | **78** | **0** | — |
+| worst abs | 3.718732e-01 | **0.0** | — |
+| loss | 13.035596848 | 13.035596848 | 13.035596848 |
+| median tok/s | 95.7 | 92.1 | — |
+| `Linear4bit` modules rewired | **0** | **560** | — |
+
+**Cost: −3.7% throughput (0.963x) and +2.6% on the harness's peak.** Both land
+close to the 32B figures (−4.8%, +2.9%) at 2.2x the parameters, which is what
+"O(window), not O(model)" predicts.
+
+The control reproduced the defect exactly as STEP 5 measured it before the
+repair existed — 8/320, survivors 78 and 79, i.e. the last `stream_buffers`
+layers. Without that arm this run would have been consistent with "72B never
+triggered it", and the rewired-module counts (0 against 560) are what prove the
+two arms were not the same code.
+
+**Every loss is identical to the resident reference, in both arms, to nine
+decimals.** That is the third time this record says it and it is worth saying
+again: the arm whose gradients are wrong on 78 of 80 layers reports a perfect
+loss. No training log can see this defect.
+
+Three caveats, all of them about what this run does *not* measure:
+
+- **The peak VRAM column is not a streaming peak.** The harness holds the 43.4 GB
+  resident reference alongside the streamed model *by construction* — that is what
+  a gradient comparison requires. The absolute numbers (control 45 983 MiB,
+  variant 2 47 182 MiB) therefore describe two models, exactly the invalid-
+  measurement trap recorded at 8B and again in STEP 8. Only the **ratio** between
+  the arms is valid, because the resident half is identical in both.
+- **The shards were rebuilt, and that was `source_fingerprint` working.** The HF
+  cache stores `snapshots/` as symlinks into `blobs/`, which the sharder skips by
+  design (STEP 2), so the source was presented as a directory of **hard links** —
+  same inodes, `df` unchanged by a single byte, no 136 GB copy. The fingerprint is
+  `basename + size + mtime`, and hard links carry the blobs' own mtime rather than
+  the copied tree's, so the cache correctly declined to reuse shards it could not
+  prove came from this source and re-sharded 80 layers. First time that guard has
+  fired on a real scenario rather than in a test.
+- **Still one sequence length and one buffer count.** 72B was not swept.
+
+Script: `variant2_gate.py`. Result: `/root/results/variant2_gate_72b.json`.
 
 ## STEP 15 — #328 diagnosed and fixed: nobody was setting `gradient_checkpointing`
 
@@ -4155,10 +4221,12 @@ what was measured; no claim about whether the base is sharded is made from it.
   checkpointed region, which keeps the weight out of `MatMul4Bit` entirely. Gated on
   **real 32B NF4 against a resident NF4 reference with the repair-disabled arm as
   control: 256/256 gradients exact against that control's 8–12/256, at +2.9% peak
-  VRAM and −4.8% throughput.** What remains open is narrower than the defect was:
-  **72B was not re-run after the fix**, and the two questions in the next bullets —
-  why it is NF4-only and why its boundary is so sharp — are untouched by the repair.
-  #331 carries the synthetic reproducer.
+  VRAM and −4.8% throughput**, and again on **real 72B — the size where the defect
+  was worst, since even its FIRST backward was corrupted — at 320/320 against that
+  control's 8/320, at +2.6% and −3.7%.** What remains open is narrower than the
+  defect was: the two questions in the next bullets — why it is NF4-only and why its
+  boundary is so sharp — are untouched by the repair. #331 carries the synthetic
+  reproducer.
 - **Why the defect is NF4-only, and why its boundary is so sharp, is not
   explained.** The bf16 path aliases the pool identically and its **backward** is
   exact at 3.9x the bytes. Seven hypotheses were tested and rejected; none
@@ -4183,10 +4251,12 @@ what was measured; no claim about whether the base is sharded is made from it.
   started (FINDING 2). That cause is now found and fixed (STEP 15), so they DO run
   here; nobody has re-run the throughput arms against them, so v0.72.4's
   performance claims remain untested on this box.
-- **The repair is gated at one point in config space** — real 32B NF4, seq 128,
-  `stream_buffers=2`, `pin=True`, 5 repeats. The repair is shape-independent by
-  construction and 2174 CI tests cover the surrounding paths, but 72B was not
-  re-run after the fix and no throughput sweep was taken with it.
+- **The repair is gated at two points in config space, both at one shape** — real
+  32B and real 72B NF4, seq 128, `stream_buffers=2`, `pin=True`, 5 repeats each,
+  each with a control arm that reproduced the defect. The repair is
+  shape-independent by construction and 2174 CI tests cover the surrounding paths,
+  but **no sequence-length or buffer-count sweep was taken with it**, and no size
+  between 32B and 72B was gated.
 - **The repair changes the code path the preprint's headline was measured on.**
   Llama-3.1-8B NF4 at 119.6 tok/s on an RTX 3050 was measured pre-repair. At
   training shapes bitsandbytes already took `_dequant_linear_fallback`, so the
@@ -4246,7 +4316,8 @@ was concluded when.
   - **backward** (every LoRA gradient tensor) at 8B and 14B, i.e. **at and below
     the preprint's own scope**; at 32B and 72B the pre-repair backward was WRONG
     under `pin=True` and exact only with `pin=False`, and after the STEP 14 repair
-    32B is exact 256/256 while **72B has not been re-measured**.
+    both are exact against a resident NF4 reference — 32B at 256/256 and 72B at
+    320/320, five repetitions each.
 
   So "verified at 72B" is a forward statement and only a forward statement. The
   preprint asserts nothing at 72B, so nothing in it depends on the distinction —

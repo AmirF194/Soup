@@ -4043,10 +4043,26 @@ truncated** (outputs ran 102–217 new tokens against a 256 cap):
 | genuinely wrong | **1** |
 
 Llama-3.1-8B answers `The final answer is: $oxed{C}$`, and `extract_mcq_letter`
-does not recognise `oxed{}`. **With that one form added the 8B goes 0.423 →
-0.731**, above the 0.5B, and the inversion disappears. Filed as **#357**. The
-6 value-boxed items are a separate, prompt-level issue — the items never ask for a
-letter, the same asymmetry noted on #346.
+does not recognise `oxed{}`. Filed as **#357**, and both proposed fixes were then
+tested separately at the shipped budget, generating once per prompt variant so the
+extraction arms score *identical outputs*:
+
+| arm | score | vs baseline |
+|---|---|---|
+| baseline | 0.423 | — |
+| **`+boxed`** | **0.731** | **+8 items** |
+| `+prompt` ("Answer with the letter only.") | 0.423 | **+0** |
+| `+both` | 0.808 | +10 |
+
+`+boxed` recovers exactly the 8 items the classification predicted and puts the 8B
+above the 0.5B — the inversion disappears on that fix alone. A wrong boxed letter
+still scores zero (control: PASS).
+
+**The prompt fix does nothing on its own, which contradicts what was written when
+the issue was filed.** The instruction changes what the model puts *inside* the box,
+not whether it uses one, so with the shipped extractor those answers stay invisible.
+It pays only after extraction is fixed, and then it is worth **2 further items**,
+not the 6 originally attributed to it.
 
 **And the first probe I wrote to answer this reported the opposite.** It concluded
 "the model genuinely misses these" because it searched for `(A)` while the model

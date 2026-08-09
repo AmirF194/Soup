@@ -3906,6 +3906,40 @@ purely on brace hygiene**. Filed as **#346**. Until that is fixed the suite does
 discriminate — the second table is real — but the axis it discriminates on is not
 the one its name claims.
 
+**Re-measured across five models, because a two-model inversion can be a
+coincidence.** Same 40 items, greedy, envelope-agnostic name extraction alongside
+the suite's own score:
+
+| model | tool name correct | braces balanced | suite score |
+|---|---|---|---|
+| SmolLM2-135M | 18/40 | 15/40 | 0.050 |
+| SmolLM2-360M | 28/40 | 37/40 | **0.600** |
+| Qwen2.5-0.5B | 38/40 | 36/40 | 0.425 |
+| Qwen2.5-3B | 40/40 | 40/40 | 0.975 |
+| **Llama-3.1-8B** | **40/40** | **9/40** | **0.225** |
+
+The 8B row reproduces the 0.225 above exactly, so this is measuring the same thing.
+And the inversion is **worse than the pair it was filed on**: SmolLM2-**360M** names
+the right tool 28/40 and scores 0.600 against the 8B's 40/40 and 0.225 — a 2.7x
+advantage to a model that is wrong about the tool twelve times more often.
+
+Ranked by `brace_balanced` the suite agrees on 4 of 5 positions; ranked by
+`tool_name_correct` it agrees on 2. Where the two orderings conflict, the suite
+sides with braces. That settles the issue's title as a property of the suite across
+the whole size range rather than an artefact of one pair.
+
+**And a defect found by that measurement, not by reading code.** The first pass
+returned **0.000 for all five models**, because `score_bundled_suite` takes a
+`GeneratorFn` and was handed a list — and it returns `0.0` for a non-callable
+rather than raising. In a *scoring* function feeding `soup ship`'s leg 2, `0.0`
+reads as "the model failed every item", i.e. a DON'T-SHIP verdict, so a caller
+error is indistinguishable from a regression and fails in the direction that looks
+like a finding. Its own docstring already promises the opposite for the
+neighbouring case ("Raises `ValueError` for an unknown suite — never silently
+0.0"). Filed as **#355**. What exposed it was disagreeing with this record's own
+published 0.225; five identical zeros across five very different models would
+otherwise have read as a result.
+
 ### Draft distillation does not raise acceptance, and acceptance was not the constraint
 
 `soup draft distill` exists to make a small draft agree with a specific target more

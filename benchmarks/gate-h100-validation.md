@@ -3969,6 +3969,25 @@ Both matter for the release: these suites are in `DEFAULT_GENERAL_SUITE`, so the
 decide `soup ship` leg-2 verdicts. A tune that made a model *more* willing to
 answer with code would register as a format-following regression.
 
+**The fix was then verified, and the mechanism confirmed by the column that tests
+it.** The constraint appended in memory, before-arm kept as the control:
+
+| model | suite before | suite after | code answers, before → after |
+|---|---|---|---|
+| SmolLM2-135M | 0.675 | 0.750 | 30.0% → 22.5% |
+| **Llama-3.1-8B** | **0.575** | **1.000** | **35.0% → 0.0%** |
+
+The 8B reaches a perfect score, and the share of answers containing `import json` /
+`def ` / ```` ```python ```` drops to **zero**. The diagnosis was "the more capable
+model reads the ambiguous instruction as a request for code"; removing the
+ambiguity stops it completely. The 135M improves too (0.675 → 0.750), so the
+constraint is not a handicap on small models — it stops rewarding them for an
+inability.
+
+Without the before-arm, "the 8B scores 1.000 with the constraint" would be equally
+consistent with the suite simply being easy. Reproducing the inversion in the same
+session on the same two models is what makes the after-arm mean anything.
+
 ### Draft distillation does not raise acceptance, and acceptance was not the constraint
 
 `soup draft distill` exists to make a small draft agree with a specific target more

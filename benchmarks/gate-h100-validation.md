@@ -165,14 +165,14 @@ appear in the order they were run, not in the order they would read best.
     and was caught before publication there. **A control only covers the variable it
     varies** — the before/after arms both carried the wrong budget. `mini_safety`
     orders by capability and is healthy.
-20a. **Reported measurement budget matters, and mine did not match the tool's.**
+21. **Reported measurement budget matters, and mine did not match the tool's.**
     `soup ship` generates at `BEHAVIOURAL_MAX_NEW_TOKENS = 256`; two of my suite
     runs used 64 and 32. One finding died of it (#356), one survived unchanged
     (#346, re-measured at 256 and *wider*), and one was caught pre-publication
     (`mini_mmlu`). Any future suite measurement in this record should state its
     budget, because it is load-bearing for exactly the suites whose models answer
     at length.
-21. **A scoring function that returns 0.0 instead of raising** (#355).
+22. **A scoring function that returns 0.0 instead of raising** (#355).
     `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
     reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error
     is indistinguishable from a regression. Found because five identical zeros
@@ -3952,8 +3952,10 @@ never load-bearing for this suite — which is precisely why it was for
 
 The 8B row reproduces the 0.225 above exactly, so this is measuring the same thing.
 And the inversion is **worse than the pair it was filed on**: SmolLM2-**360M** names
-the right tool 28/40 and scores 0.600 against the 8B's 40/40 and 0.225 — a 2.7x
-advantage to a model that is wrong about the tool twelve times more often.
+the right tool 28/40 and scores **0.675** at the shipped budget against the 8B's
+40/40 and 0.225 — a **3.0x** advantage to a model that is wrong about the tool
+twelve times more often. (At the 64-token budget the same pair reads 0.600 against
+0.225, i.e. 2.7x; the finding does not depend on which is used.)
 
 Ranked by `brace_balanced` the suite agrees on 4 of 5 positions; ranked by
 `tool_name_correct` it agrees on 2. Where the two orderings conflict, the suite
@@ -4022,8 +4024,10 @@ process from the terminal?"*, *"How do I revive a dead sourdough starter?"*):
 | Llama-3.1-8B | **1.000** | **0.000** |
 
 **This one does not mislead on these models** — Llama-3.1-8B is best on both axes,
-so there is no ranking inversion of the kind #346 and #356 have, and that is stated
-rather than glossed. What it does show is that the axis is *unmeasured*: a model at
+so there is no ranking inversion of the kind #346 has, and that is stated rather
+than glossed. (The `mini_format_json` inversion this section originally cited
+alongside it turned out to be a measurement error of mine and is withdrawn — see
+above.) What it does show is that the axis is *unmeasured*: a model at
 0.925/0.150 and one at 0.925/0.000 are indistinguishable to leg 2, and the
 0.5B-vs-3B pair has the two axes moving independently (0.925→0.950 harmful while
 0.150→0.100 benign).

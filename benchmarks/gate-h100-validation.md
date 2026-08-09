@@ -4055,6 +4055,47 @@ and caught this time only because a model scoring 1.000 elsewhere and 0.423 here
 was too odd to accept. The numbers above come from a second pass that classifies
 each failure explicitly.
 
+### The CLI noise floor, and why the experiment came back degenerate
+
+STEP 11 reports a mean paired difference of **+0.006** against a **0.013 within-arm
+spread**, and that spread is computed across five *different* training subsets — so
+it mixes process noise with data variation and cannot separate them. Five runs of
+**one** config on **one** subset should isolate the process half.
+
+Five identical `soup train` + `soup ship` runs, Llama-3.1-8B, streamed, in parallel
+on five cards:
+
+| quantity | spread across 5 runs |
+|---|---|
+| task metric (300 held-out items) | **0.000000** |
+| all seven leg-2 suites | **0.0000** each |
+| `train_loss` | identical to 17 significant figures |
+| **`adapter_model.safetensors` sha256** | **identical — one hash, five files** |
+
+**The experiment is degenerate as a noise measurement, and that is the finding.**
+The five runs did not produce five samples of a distribution; they produced the
+same artefact five times, byte for byte. There is no spread to measure because the
+streamed path is deterministic end to end — which is #354's diagnosis confirmed at
+the level of the saved weights rather than of a loss value:
+`build_streamed_model` seeds its own adapter init, so the run has no entropy left
+to vary.
+
+Two consequences, and the second is the one that matters:
+
+- **For a streamed arm, STEP 11's 0.013 within-arm spread is entirely data
+  variation.** The process contributes exactly zero, so comparing +0.006 against
+  0.013 understates the evidence — the correct process-noise baseline for that arm
+  is 0.
+- **For the resident arm it is still a mixture, and still unmeasured.** #354 showed
+  resident runs of one config differ (0.071%–0.42% on `train_loss`) because
+  `get_peft_model` runs before any seed is set. The same five-run design on a
+  resident config is the measurement that would close this, and it was **not run**
+  — it needs another ~40 minutes of the box.
+
+So the honest status of this question is: **half answered.** The streamed half is
+answered exactly and pins to zero; the resident half, which is the one with actual
+noise in it, is not.
+
 ### An instrument failure worth recording, because it is the session's third of a kind
 
 Three of this session's monitors were shell loops of the form:

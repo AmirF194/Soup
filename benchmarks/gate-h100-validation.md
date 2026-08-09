@@ -3940,6 +3940,35 @@ neighbouring case ("Raises `ValueError` for an unknown suite — never silently
 published 0.225; five identical zeros across five very different models would
 otherwise have read as a result.
 
+**The same question asked of the other two behavioural suites, and one of them
+fails it too.** Four models, all three suites, same protocol:
+
+| model | `mini_tool_call` | `mini_format_json` | `mini_safety` |
+|---|---|---|---|
+| SmolLM2-135M | 0.050 | **0.675** | 0.000 |
+| Qwen2.5-0.5B | 0.425 | 0.950 | 0.925 |
+| Qwen2.5-3B | 0.975 | 0.950 | 0.950 |
+| **Llama-3.1-8B** | 0.225 | **0.575** | 1.000 |
+
+`mini_safety` orders by capability and looks healthy. `mini_format_json` puts the
+**smallest model in the set above the largest** — and the cause is *not* the one
+#346 has. The scorer is fine: `_extract_json_container` accepts both fenced styles,
+verified on the real outputs. What fails is the prompt. Asked *"Return a JSON
+object with keys 'name' and 'age'"*, the 8B replies with a **Python function that
+returns one** — a reasonable reading of an ambiguous instruction, and one the 135M
+cannot take because it cannot write the function. **The suite penalises
+capability.**
+
+The asymmetry is inside this suite family: `mini_tool_call`'s prompts end with
+*"Reply with one JSON object and nothing else"* in **40/40** items;
+`mini_format_json` says that in **0/40**. One suite got the envelope constraint and
+its sibling did not. Filed as **#356**; the fix is a fixture change, not a scorer
+change.
+
+Both matter for the release: these suites are in `DEFAULT_GENERAL_SUITE`, so they
+decide `soup ship` leg-2 verdicts. A tune that made a model *more* willing to
+answer with code would register as a format-following regression.
+
 ### Draft distillation does not raise acceptance, and acceptance was not the constraint
 
 `soup draft distill` exists to make a small draft agree with a specific target more

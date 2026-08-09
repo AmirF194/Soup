@@ -172,7 +172,14 @@ appear in the order they were run, not in the order they would read best.
     (`mini_mmlu`). Any future suite measurement in this record should state its
     budget, because it is load-bearing for exactly the suites whose models answer
     at length.
-22. **A scoring function that returns 0.0 instead of raising** (#355).
+22. **`mini_mmlu` loses 8 of 26 items to an extraction gap** (STEP 26, #357).
+    Llama-3.1-8B answers `The final answer is: $oxed{C}$` and
+    `extract_mcq_letter` does not know `oxed{}`, so the 8B scores **0.423 —
+    below a 0.5B** — while scoring 1.000 on two of the other three MCQ suites. All
+    15 failures classified at the shipped budget: **8 boxed the right letter**, 6
+    boxed a value because the prompt never asks for a letter, **1 is a real miss**.
+    Adding that one form takes it to **0.731** and the inversion disappears.
+23. **A scoring function that returns 0.0 instead of raising** (#355).
     `score_bundled_suite` hands back `0.0` for a non-callable `gen` — in leg 2 that
     reads as "the model failed every item", a DON'T-SHIP verdict, so a caller error
     is indistinguishable from a regression. Found because five identical zeros
@@ -4009,6 +4016,56 @@ The same 64-token error made `mini_mmlu` look inverted too (8B 0.192 against 135
 0.231, measured at 32 tokens, where the 8B opens with `## Step 1:` and never
 reaches a letter). At 256 it is 0.423 against 0.269 — correct ordering, and that
 one was caught before it was published rather than after.
+
+### All four MCQ suites at the shipped budget — and a real extraction defect
+
+Having found that the budget was load-bearing, the four MCQ suites were re-run at
+256 (four models, one per card, in parallel — this is correctness, not timing):
+
+| suite | SmolLM2-135M | Qwen2.5-0.5B | Qwen2.5-3B | **Llama-3.1-8B** |
+|---|---|---|---|---|
+| **`mini_mmlu`** | 0.269 | **0.538** | 0.923 | **0.423** |
+| `mini_common_sense` | 0.292 | 0.583 | 1.000 | 0.833 |
+| `mini_instruction` | 0.500 | 0.917 | 1.000 | 1.000 |
+| `mini_arithmetic` | 0.667 | not run | 1.000 | 1.000 |
+
+**`mini_mmlu` puts the 8B below a 0.5B at the correct budget** — and unlike
+`mini_format_json`, this one survives scrutiny, because the same model scores 1.000
+on two of the other three suites.
+
+Every one of the 15 failing items was classified rather than inferred. **None was
+truncated** (outputs ran 102–217 new tokens against a 256 cap):
+
+| what the model did | count |
+|---|---|
+| **boxed the RIGHT letter, scored wrong** | **8** |
+| boxed a *value* instead of a letter (`$oxed{32}$` for "32 degrees") | 6 |
+| genuinely wrong | **1** |
+
+Llama-3.1-8B answers `The final answer is: $oxed{C}$`, and `extract_mcq_letter`
+does not recognise `oxed{}`. **With that one form added the 8B goes 0.423 →
+0.731**, above the 0.5B, and the inversion disappears. Filed as **#357**. The
+6 value-boxed items are a separate, prompt-level issue — the items never ask for a
+letter, the same asymmetry noted on #346.
+
+**And the first probe I wrote to answer this reported the opposite.** It concluded
+"the model genuinely misses these" because it searched for `(A)` while the model
+writes `$oxed{A}$` — the same class of error as #356, twice in one afternoon,
+and caught this time only because a model scoring 1.000 elsewhere and 0.423 here
+was too odd to accept. The numbers above come from a second pass that classifies
+each failure explicitly.
+
+### `pin=False` with the repair: no regression, and NOT a gate
+
+The repair was gated at `pin=True`, so the obvious complement is `pin=False`. Run
+on real 32B: **variant 2 exact 256/256** — the repair does not regress the
+unpinned path.
+
+**But the control returned `control_reproduced_the_defect: False`, and that is
+expected by construction**: without pinning the defect does not fire at all
+(STEP 5). So this configuration cannot distinguish a working repair from a
+configuration that never triggered the bug — the harness prints exactly that
+warning, and it applies. Recorded as a no-regression check, not as a second gate.
 
 **And the third suite, which does not invert but is measuring only half its axis.**
 `mini_safety` is the fraction of harmful prompts refused, so a model that refuses

@@ -2814,9 +2814,28 @@ compared through the CLI) — but as a nuisance, not as the reason one half is
 deterministic and the other is not. The fix is placement, not plumbing: seed
 before the adapter is created.
 
+The proposed fix was then verified on the box, again with the control that makes
+it a test rather than a demonstration:
+
+```
+seeded first  : efa72b5f6fcd2c39dd24f1914d10c509 / efa72b5f6fcd2c39dd24f1914d10c509  -> IDENTICAL
+control (none): 9b9305ce27e219c0d1a4f3428b7ac2e2 / 8b213b95e04ec344dfe1501c2f469984  -> DIFFERENT
+```
+
+Two identical hashes alone would have been equally consistent with "this probe
+cannot see a difference at all" — the exact failure the v0.72.4 gate's first run
+produced. The unseeded arm varying is what gives the result teeth. So one
+correctly-placed `set_seed` is sufficient.
+
 Retracted along the way: the worry, raised when the symptom was first filed, that a
 resident 4-bit model is not the fixed reference the correctness gates assume. It
 is — the quantiser is deterministic, measured above.
+
+**Three of the four hypotheses in this investigation were mine and were wrong.**
+Each is left in #354 with the control that killed it, because the eliminations are
+what make the fourth credible — particularly the `quantization: none` control,
+without which "a bitsandbytes kernel asymmetry" is a plausible, specific and
+entirely incorrect story.
 
 Also measured, incidentally: **streaming holds an 8B in 3 681 MiB against the
 resident path's 12 087 MiB — 3.28x less — and costs 1.13x the wall time**

@@ -4102,15 +4102,22 @@ Two consequences, and the second is the one that matters:
   variation.** The process contributes exactly zero, so comparing +0.006 against
   0.013 understates the evidence — the correct process-noise baseline for that arm
   is 0.
-- **For the resident arm it is still a mixture, and still unmeasured.** #354 showed
-  resident runs of one config differ (0.071%–0.42% on `train_loss`) because
-  `get_peft_model` runs before any seed is set. The same five-run design on a
-  resident config is the measurement that would close this, and it was **not run**
-  — it needs another ~40 minutes of the box.
+- **For the resident arm it is a mixture, and the process half is real.** The same
+  design was then run resident — three runs, one config, one subset:
 
-So the honest status of this question is: **half answered.** The streamed half is
-answered exactly and pins to zero; the resident half, which is the one with actual
-noise in it, is not.
+  | | streamed (n=5) | **resident (n=3)** |
+  |---|---|---|
+  | distinct `adapter_model.safetensors` hashes | **1** | **3** |
+  | `train_loss` | identical to 17 s.f. | 0.084222 / 0.083607 / 0.083428 |
+  | loss spread | **0.000000** | **0.00079 = 0.95%** |
+
+  Three runs of one unchanged config produce three different models. That is #354
+  at the level of the saved weights on the path users actually take by default,
+  and it is the arm STEP 11 compares against.
+
+The streamed half of this question is answered exactly and pins to zero. The
+resident half is answered at the artefact level; its held-out consequence was being
+measured when this was written.
 
 ### An instrument failure worth recording, because it is the session's third of a kind
 

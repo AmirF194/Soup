@@ -74,7 +74,10 @@ appear in the order they were run, not in the order they would read best.
    healthy. It affects 32B and 72B, not 8B or 14B; it is reproducible in about a
    minute on a synthetic 7.7 GB model. The mechanism is **aliasing, not a race**:
    a full `cuda.synchronize()` does not fix it and de-aliasing the pooled buffers
-   does. Six competing hypotheses were tested and rejected along the way.
+   does. Six competing explanations of the *mechanism* were tested and rejected
+   along the way. (Two other counts appear in this record and are not in conflict
+   with this one: nine hypotheses about the *trigger*, numbered `Rejected 1`-`7`
+   and `Hypothesis 8`-`9` below, and seven about the still-unexplained residue.)
 5. **A model trained by streaming is as good as one trained resident.** Paired
    over five disjoint training subsets and judged by Soup's own `soup ship`:
    mean difference +0.006 against an identical 0.013 within-arm spread on both
@@ -4756,8 +4759,10 @@ what was measured; no claim about whether the base is sharded is made from it.
   reproducer.
 - **Why the defect is NF4-only, and why its boundary is so sharp, is not
   explained.** The bf16 path aliases the pool identically and its **backward** is
-  exact at 3.9x the bytes. Seven hypotheses were tested and rejected; none
-  replaced them.
+  exact at 3.9x the bytes. Seven hypotheses aimed at *this question specifically*
+  were tested and rejected; none replaced them. The nine counted elsewhere are
+  about the trigger, and the six about the mechanism — three questions, three
+  counts.
 - **The threshold is a bracket, not a number** — 163.8 MiB/layer with the backward
   exact, 171.5 with it broken, 4.7% wide. The forward is exact on both sides and at
   every size in this record, so the threshold is a property of the backward alone.

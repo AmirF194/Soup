@@ -54,6 +54,8 @@ Listed by first contribution. PR numbers link the work.
   - Batch the PRM reward forward pass in `PRMScorer.__call__` (single `[B, T]` forward) ([#301](https://github.com/MakazhanAlpamys/Soup/pull/301))
 - **Sanjay Santhanam** ([@Sanjays2402](https://github.com/Sanjays2402))
   - Run built-in benchmark gate tasks through `ForgettingDetector` — every `type: benchmark` eval-gate task had always failed ([#315](https://github.com/MakazhanAlpamys/Soup/pull/315))
+- **Nicolás Ramos** ([@nicolasramos](https://github.com/nicolasramos))
+  - `backend: mlx` was never dispatched — every MLX run trained through the transformers wrapper instead, and the saved MLX "adapter" was a full fine-tune because the model was never frozen before LoRA ([#362](https://github.com/MakazhanAlpamys/Soup/pull/362))
 
 ---
 

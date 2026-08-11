@@ -99,7 +99,7 @@ training:
     alpha: 32
 ```
 
-MLX backend supports SFT (live as of #362). DPO and GRPO are refused at config load (`backend: mlx` accepts `sft` only — `_validate_mlx_task`), so their wrappers are a backstop for callers that bypass the validator. Use `soup recipes search --tag mlx` for ready-made Apple Silicon configs.
+MLX backend supports SFT. `backend: mlx` with `task: dpo` or `task: grpo` is refused when the config is loaded, with an error naming the task — upstream `mlx-lm` ships no DPO/GRPO training helper, so those wrappers exist only as a backstop for callers that bypass config validation. Requires `mlx-lm >= 0.31.3`. Use `soup recipes search --tag mlx` for ready-made Apple Silicon configs.
 
 
 ## Unsloth Backend (2-5x Faster Training)

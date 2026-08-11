@@ -71,6 +71,25 @@ Rows are `{"audio": <path>, "text": <transcript>}` with `data.format: asr`. See
 > not a Soup error message — it was a loader crash inside `c10.dll` / `libc10.so` before any
 > Soup code ran. If you are on 3.13+, create a 3.12 environment; support widens when CI does.
 
+### Quoting the extra
+
+**Use double quotes.** `pip install "soup-cli[train]"` is the only spelling that works in every
+shell — `cmd.exe`, PowerShell, bash, and zsh. Every command in the table below uses it.
+
+Older tutorials and videos (including some of ours) show the single-quoted
+`pip install 'soup-cli[train]'`. That is bash / zsh / PowerShell syntax, and it fails on Windows
+`cmd.exe`, which has no single-quote quoting and hands the quotes straight to pip:
+
+```
+ERROR: Invalid requirement: "'soup-cli[train]'": Expected package name at the start of dependency specifier
+```
+
+If you hit that, swap the `'` for `"` — pip is rejecting a literal quote character, nothing is
+wrong with the package. (Dropping the quotes entirely works on Windows too, but zsh then reads
+`[train]` as a glob and fails.)
+
+### The extras table
+
 The core `pip install soup-cli` is a light install — the CLI, config system, and data tools, with
 no PyTorch. Add `[train]` to fine-tune, or install other extras only when you need them:
 

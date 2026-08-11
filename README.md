@@ -28,8 +28,16 @@
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
   <a href="https://discord.gg/8RgVbFA6Zq"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://www.producthunt.com/products/soup-cli"><img src="https://img.shields.io/badge/Product%20Hunt-launch-DA552F?logo=producthunt&logoColor=white" alt="Soup CLI on Product Hunt"></a>
   <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21771064-blue?logo=zenodo&logoColor=white" alt="DOI: 10.5281/zenodo.21771064"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/soup-cli?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-soup-cli">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=dark">
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=light" alt="Soup CLI - Fine-tune an 8B LLM on a 4 GB laptop GPU | Product Hunt" width="250" height="54">
+    </picture>
+  </a>
 </p>
 
 ---
@@ -197,21 +205,10 @@ pip install git+https://github.com/MakazhanAlpamys/Soup.git
 The full extras table (`fast`, `mlx`, `serve`, `eval`, `ui`, `vision`, `audio`, …) lives in
 [`docs/models.md`](docs/models.md#optional-extras).
 
-> **Use double quotes around the extra.** They are the only spelling that works in
-> every shell — `cmd.exe`, PowerShell, bash, and zsh.
->
-> Older tutorials and videos (including some of ours) show the single-quoted
-> `pip install 'soup-cli[train]'`. That is bash / zsh / PowerShell syntax, and it
-> fails on Windows `cmd.exe`, which has no single-quote quoting and hands the
-> quotes straight to pip:
->
-> ```
-> ERROR: Invalid requirement: "'soup-cli[train]'": Expected package name at the start of dependency specifier
-> ```
->
-> If you hit that, swap the `'` for `"` — pip is rejecting a literal quote
-> character, nothing is wrong with the package. (Dropping the quotes entirely
-> works on Windows too, but zsh then reads `[train]` as a glob and fails.)
+> **Double quotes, not single.** `"soup-cli[train]"` is the only spelling that works in every
+> shell — `cmd.exe`, PowerShell, bash and zsh. If you copied `'soup-cli[train]'` from an older
+> tutorial and pip rejected it, that is the reason:
+> [why, and the exact error](docs/models.md#quoting-the-extra).
 
 `soup init`, `soup data …`, and the other data/inspection commands work on the light install.
 Fine-tuning (`soup train`) needs the `[train]` extra.

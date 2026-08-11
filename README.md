@@ -15,7 +15,8 @@
   <a href="#documentation">Docs</a> &middot;
   <a href="docs/commands.md">Commands</a> &middot;
   <a href="docs/models.md">Models</a> &middot;
-  <a href="https://discord.gg/8RgVbFA6Zq">Discord</a>
+  <a href="https://discord.gg/8RgVbFA6Zq">Discord</a> &middot;
+  <a href="https://www.producthunt.com/products/soup-cli">Product Hunt</a>
 </p>
 
 <p align="center">
@@ -27,6 +28,7 @@
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
   <a href="https://discord.gg/8RgVbFA6Zq"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://www.producthunt.com/products/soup-cli"><img src="https://img.shields.io/badge/Product%20Hunt-launch-DA552F?logo=producthunt&logoColor=white" alt="Soup CLI on Product Hunt"></a>
   <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21771064-blue?logo=zenodo&logoColor=white" alt="DOI: 10.5281/zenodo.21771064"></a>
 </p>
 
@@ -93,6 +95,9 @@ nothing like the one it was made on.
 - **A streamed model is as good as a resident one** — paired over five training subsets and
   judged by Soup's own `soup ship`: mean difference **+0.006** against a **0.013**
   within-arm spread.
+- **Written up as preprint v2** (10 Aug), which carries all of the above and roughly doubles the
+  paper — [DOI 10.5281/zenodo.21877316](https://doi.org/10.5281/zenodo.21877316), details under
+  [Citing Soup](#citing-soup).
 
 The full measurement record, published as written including the rejected hypotheses and the
 false positives that controls caught, is
@@ -434,10 +439,31 @@ personal address; it reaches the same person and is a fine fallback.
 
 Layer streaming — training an 8B model on a 4 GB laptop GPU by streaming the frozen base from
 host RAM one decoder layer at a time — is described in a preprint, together with the correctness
-protocol that verifies a streamed run is bit-exact against a resident one:
+protocol that verifies a streamed run against a resident one (forward and backward stated
+separately, because they are two claims and not one).
 
 > Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop
-> GPU.* Zenodo. https://doi.org/10.5281/zenodo.21771064
+> GPU* (v2). Zenodo. https://doi.org/10.5281/zenodo.21877316
+
+**Version 2 (10 August 2026) is current.** The title and the claim are unchanged — 8B on 4 GB —
+and the paper roughly doubled, ~9,000 → ~19,800 words, to carry what the 8×H100 session produced:
+
+- **Replication on hardware nothing like the original**: 119.6 tok/s on the RTX 3050 against a
+  median 113.00 on an H100, at the same 3.32 GB peak. The method is bound by host-to-device
+  transfer, not by the GPU.
+- **A silent wrong-gradient defect, found and repaired.** On NF4 above ~165 MiB per layer the
+  forward stayed bit-exact and the loss curve looked healthy while the gradients were wrong. The
+  cause is named in the upstream library and reported there; the repair is gated against controls
+  on real 32B and 72B.
+- **Bit-exactness at real model sizes** instead of three-layer toys: forward from 0.5B to 72B,
+  backward at 8B and 14B.
+- **Trained-model quality, measured for the first time**, and indistinguishable from a resident run.
+- **A comparison against DeepSpeed** — including the result that does not flatter us: eight cards
+  of ZeRO-3 are slower than one card training resident.
+- **The limitations section rewritten**: four of v1's closed, seven new ones added.
+
+Cite the version you used. `10.5281/zenodo.21771064` is the concept DOI and always resolves to
+the latest version (v2 today); v1 remains citable at its own version DOI.
 
 The measurement records behind every number in it are in [`benchmarks/`](benchmarks/), published
 as written — including the failures, the assumptions that turned out wrong, and the numbers that
@@ -449,8 +475,9 @@ were measured and then discarded.
   author       = {Makazhan, Alpamys},
   year         = {2026},
   publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.21771064},
-  url          = {https://doi.org/10.5281/zenodo.21771064}
+  version      = {v2},
+  doi          = {10.5281/zenodo.21877316},
+  url          = {https://doi.org/10.5281/zenodo.21877316}
 }
 ```
 

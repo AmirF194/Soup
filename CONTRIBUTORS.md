@@ -56,6 +56,8 @@ Listed by first contribution. PR numbers link the work.
   - Run built-in benchmark gate tasks through `ForgettingDetector` — every `type: benchmark` eval-gate task had always failed ([#315](https://github.com/MakazhanAlpamys/Soup/pull/315))
 - **Nicolás Ramos** ([@nicolasramos](https://github.com/nicolasramos))
   - `backend: mlx` was never dispatched — every MLX run trained through the transformers wrapper instead, and the saved MLX "adapter" was a full fine-tune because the model was never frozen before LoRA ([#362](https://github.com/MakazhanAlpamys/Soup/pull/362))
+- **William Yang** ([@wilyan09007](https://github.com/wilyan09007))
+  - `training.seed` reached the SFT wrapper and nothing else — seventeen other task wrappers trained at HF's default 42 with no error, so replicates that differed only in the seed were the same run; the seed is now applied before the adapter is drawn, not only inside `Trainer` ([#381](https://github.com/MakazhanAlpamys/Soup/pull/381))
 
 ---
 

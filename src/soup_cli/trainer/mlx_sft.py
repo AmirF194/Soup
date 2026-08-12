@@ -62,6 +62,14 @@ class MLXSFTTrainerWrapper:
             unsupported.append("Ring Attention")
         if tcfg.use_flash_attn:
             unsupported.append("FlashAttention (MLX has its own attention kernels)")
+        # #353's fourth criterion. #381 threaded training.seed through every
+        # transformers task wrapper; MLX has its own RNG (mx.random) and reads
+        # neither field, so a seeded MLX run is silently unseeded. `is not None`
+        # rather than truthiness: 0 is a real seed.
+        if tcfg.seed is not None:
+            unsupported.append("training.seed (MLX seeds through mx.random)")
+        if tcfg.data_seed is not None:
+            unsupported.append("training.data_seed (MLX seeds through mx.random)")
         if unsupported:
             console.print(
                 "[yellow]MLX backend ignores: " + ", ".join(unsupported) + "[/]"

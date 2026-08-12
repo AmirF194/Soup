@@ -41,6 +41,15 @@ reproducing 70+ versions of notes.
   no seed was coming from exactly that, so those runs are now identical to each other
   and varying a replicate means setting `training.seed` on purpose. The MLX backend
   (`backend: mlx`) is the one path that still reads neither field.
+- **`training.seed` on the MLX backend now says it is ignored (#353, fourth criterion).**
+  MLX has its own RNG (`mx.random`) and none of the MLX wrappers touch it, so a seeded
+  MLX run was silently unseeded — which looks identical to a seeded one until two
+  replicates disagree. That gap only became reachable between #353 being filed and #381
+  landing: `backend: mlx` was never dispatched at all until #362 (#363). Setting either
+  field now appends to the wrapper's existing "MLX backend ignores:" line, naming
+  `training.seed` / `training.data_seed` so it is greppable as written. A warning, not a
+  rejection: a config valid on transformers should not become unloadable by switching
+  backend. Seeding MLX for real is separate work with a separate RNG.
 
 ## [0.73.0] - 2026-08-09
 

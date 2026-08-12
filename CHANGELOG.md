@@ -50,6 +50,30 @@ reproducing 70+ versions of notes.
   `training.seed` / `training.data_seed` so it is greppable as written. A warning, not a
   rejection: a config valid on transformers should not become unloadable by switching
   backend. Seeding MLX for real is separate work with a separate RNG.
+- **Under `use_fsdp2_compile`, every `checkpoint-*` still loads as a dead adapter
+  (#351).** #335's repair runs once, on the output root, after the final `save_model`.
+  HF's Trainer writes its periodic checkpoints through that same `save_model` with
+  `output_dir=<run>/checkpoint-N`, so they come out carrying `_orig_mod.` on every key
+  and nothing ever normalised them. Measured at 70B on 8×H100
+  (`benchmarks/gate-h100-validation.md`, STEP 28): 320 canonical keys in the output
+  root, **320 prefixed ones in `checkpoint-100`**. Resuming is the case that decides
+  how bad this is, and it is worse than #335 was.
+  `PeftModel.from_pretrained` at least warns; `Trainer._load_from_checkpoint` calls
+  `model.load_adapter(...)` and drops its return value, and `load_adapter` deliberately
+  does not warn (it hands the missing keys back in the load result instead, which
+  nothing reads), while `load_state_dict(strict=False)` discards the `_orig_mod.` keys
+  without a word. A resumed run therefore continues from a re-zeroed `lora_B` in total
+  silence: #335's failure shape with its one warning removed. `load_best_model_at_end`
+  was reloading a dead adapter for the same reason, since the Trainer restores
+  `state.best_model_checkpoint` through that same `load_adapter`, and this repairs that
+  path too. Normalising now happens on HF's `on_save`, as each checkpoint is written.
+  Both that callback and the final save are gated on `args.should_save`, the condition
+  `save_model` writes under, so exactly the rank holding the file repairs it rather
+  than all eight opening it at once. The callback is attached in `setup()`, ahead of
+  anything a caller adds later: `HFPushCallback.on_save` uploads `checkpoint-{step}` on
+  this same event and `CallbackHandler` dispatches in insertion order, so a
+  normalisation attached after it would leave `--push-as` publishing the prefixed
+  adapter and keeping the repaired one on local disk.
 
 ## [0.73.0] - 2026-08-09
 

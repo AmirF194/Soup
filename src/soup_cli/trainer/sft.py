@@ -659,6 +659,23 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         self._output_dir = str(output_dir)
         self._batch_size = batch_size
 
+        # #351: normalise every `checkpoint-*` adapter as the Trainer writes it.
+        # The final save is repaired at the end of `train()`; HF dispatches
+        # `on_save` only for the periodic checkpoints, so the two call sites
+        # cover different files and neither is redundant.
+        #
+        # Attached in `setup()` rather than alongside the other callbacks in
+        # `train()` because `CallbackHandler.call_event` dispatches in insertion
+        # order and `HFPushCallback.on_save` UPLOADS `checkpoint-{step}` on this
+        # same event. `--push-as` adds that callback straight to this trainer
+        # once `setup()` has returned (`commands/train.py`), so a normalisation
+        # attached any later than it would publish the prefixed adapter and keep
+        # the repaired one to itself. Being ahead of anything the caller adds is
+        # the whole point of the position.
+        from soup_cli.utils.peft_wiring import attach_compile_prefix_callback
+
+        attach_compile_prefix_callback(self.trainer, tcfg, self._output_dir, console)
+
     def _prepare_raft_dataset(self, dataset: dict, cfg, tcfg):
         """v0.71.10 #199 — build pre-tokenised RAFT rows (answer-only mask).
 
@@ -1500,7 +1517,20 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         # none of them: it warns and leaves lora_B at zero init, i.e. the run
         # exits 0 having written an adapter that does nothing. Measured 0/96
         # non-zero against 96/96 for the paired non-compile run.
-        if getattr(self.config.training, "use_fsdp2_compile", False):
+        # #351: this call covers the FINAL save only. The periodic
+        # `checkpoint-*` directories are written by the same `save_model` and are
+        # normalised by the callback `setup()` attaches, which runs on HF's
+        # `on_save` event. `on_save` is not dispatched for the save below, so
+        # both are needed.
+        #
+        # Gated on `args.should_save` for the reason the callback is: that is the
+        # condition `save_model` gates the write on, so it names the rank that
+        # actually has a file here to repair. Eight ranks opening and rewriting
+        # one adapter is safe only by accident, and `os.replace` on a shared
+        # filesystem is not the guarantee it is on local disk.
+        if getattr(self.config.training, "use_fsdp2_compile", False) and getattr(
+            self.trainer.args, "should_save", True
+        ):
             from soup_cli.utils.peft_wiring import strip_compile_prefix
 
             renamed = strip_compile_prefix(self._output_dir)

@@ -49,6 +49,7 @@ one bf16 ulp: worst 3.95e-3 relative to scale against 2^-8 = 3.9e-3.
 
 import os
 import sys
+import types
 
 import pytest
 
@@ -505,6 +506,27 @@ class TestMultiGpuLaunchArgvIsRunnable:
 # ==========================================================================
 # #335 — use_fsdp2_compile wrote an adapter that reloads as all zeros
 # ==========================================================================
+def _write_adapter(directory, prefix=""):
+    """Write a two-tensor LoRA adapter, optionally through torch.compile's prefix.
+
+    Module-level so #351's checkpoint tests below build the file the same way
+    #335's do. Both are assertions about one exact key spelling, and two copies
+    of the fixture that produces it would drift.
+    """
+    from safetensors.torch import save_file
+
+    directory.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight":
+            torch.ones(4, 8),
+        f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight":
+            torch.full((8, 4), 0.007),
+    }
+    path = directory / "adapter_model.safetensors"
+    save_file(tensors, str(path))
+    return path
+
+
 class TestCompiledAdapterKeysAreCanonical:
     """A run that completes, exits 0, and writes a file that silently does nothing.
 
@@ -524,26 +546,12 @@ class TestCompiledAdapterKeysAreCanonical:
     ``.inner.`` segment, and it is the worst one this project has: nothing raises.
     """
 
-    def _write_adapter(self, directory, prefix=""):
-        from safetensors.torch import save_file
-
-        directory.mkdir(parents=True, exist_ok=True)
-        tensors = {
-            f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight":
-                torch.ones(4, 8),
-            f"{prefix}base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight":
-                torch.full((8, 4), 0.007),
-        }
-        path = directory / "adapter_model.safetensors"
-        save_file(tensors, str(path))
-        return path
-
     def test_the_compile_prefix_is_stripped(self, tmp_path):
         from safetensors.torch import load_file
 
         from soup_cli.utils.peft_wiring import strip_compile_prefix
 
-        path = self._write_adapter(tmp_path / "a", prefix="_orig_mod.")
+        path = _write_adapter(tmp_path / "a", prefix="_orig_mod.")
         changed = strip_compile_prefix(str(tmp_path / "a"))
         assert changed == 2, f"expected both keys rewritten, got {changed}"
         keys = set(load_file(str(path)))
@@ -558,7 +566,7 @@ class TestCompiledAdapterKeysAreCanonical:
 
         from soup_cli.utils.peft_wiring import strip_compile_prefix
 
-        path = self._write_adapter(tmp_path / "a", prefix="_orig_mod.")
+        path = _write_adapter(tmp_path / "a", prefix="_orig_mod.")
         strip_compile_prefix(str(tmp_path / "a"))
         loaded = load_file(str(path))
         b = loaded["base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"]
@@ -572,7 +580,7 @@ class TestCompiledAdapterKeysAreCanonical:
 
         from soup_cli.utils.peft_wiring import strip_compile_prefix
 
-        path = self._write_adapter(tmp_path / "a")
+        path = _write_adapter(tmp_path / "a")
         before = set(load_file(str(path)))
         assert strip_compile_prefix(str(tmp_path / "a")) == 0
         assert set(load_file(str(path))) == before
@@ -584,6 +592,209 @@ class TestCompiledAdapterKeysAreCanonical:
 
         (tmp_path / "empty").mkdir()
         assert strip_compile_prefix(str(tmp_path / "empty")) == 0
+
+
+# ==========================================================================
+# #351: the repair above ran on the final save only
+# ==========================================================================
+def _fire_on_save(callback, output_dir, step, *, should_save=True, world_zero=None):
+    """Drive one ``on_save`` the way HF's CallbackHandler does.
+
+    ``args`` / ``state`` are the two attributes the callback reads, so a
+    SimpleNamespace is the whole Trainer this needs, the same shape
+    ``tests/test_hf_integration.py`` uses to drive ``HFPushCallback.on_save``.
+
+    ``world_zero`` defaults to following ``should_save``, which is what every
+    run Soup can produce today does. Pass it explicitly to drive them apart, the
+    way ``save_on_each_node`` does.
+    """
+    args = types.SimpleNamespace(output_dir=str(output_dir), should_save=should_save)
+    state = types.SimpleNamespace(
+        global_step=step,
+        is_world_process_zero=should_save if world_zero is None else world_zero,
+    )
+    control = types.SimpleNamespace()
+    callback.on_save(args, state, control)
+
+
+class TestCheckpointAdaptersAreCanonicalToo:
+    """#335's repair fires once, after the final ``save_model``. The
+    ``checkpoint-*`` directories written on the way there keep the prefix.
+
+    Both are written by the SAME ``Trainer.save_model`` (``_save_checkpoint``
+    calls it with ``output_dir=<run>/checkpoint-N``), so they come out identical
+    and only the last one was ever normalised. Measured at 70B on 8xH100
+    (``benchmarks/gate-h100-validation.md``, STEP 28): 320 canonical keys in the
+    output root, 320 prefixed ones in ``checkpoint-100``.
+
+    Resuming is the case that decides how bad this is. ``from_pretrained`` at
+    least warns. ``Trainer._load_from_checkpoint`` calls
+    ``model.load_adapter(...)`` and drops the return value, and ``load_adapter``
+    deliberately does not warn: it hands the missing keys back in the load
+    result instead, which nothing reads. The unexpected ``_orig_mod.`` keys go
+    to ``load_state_dict(strict=False)``, which discards them without a word. So
+    a resumed run continues from a re-zeroed ``lora_B`` in total silence: the
+    #335 failure shape with the last warning removed.
+    """
+
+    def test_a_checkpoint_written_under_compile_is_normalised(self, tmp_path):
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        path = _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+        _fire_on_save(build_compile_prefix_callback(), tmp_path, 100)
+
+        keys = set(load_file(str(path)))
+        assert not any(k.startswith("_orig_mod.") for k in keys), keys
+        assert all(k.startswith("base_model.model.") for k in keys), keys
+
+    def test_the_trained_values_survive_in_a_checkpoint(self, tmp_path):
+        """The standard #335's repair was held to. A rename that loses the
+        numbers is the same defect wearing a different mechanism."""
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        path = _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+        _fire_on_save(build_compile_prefix_callback(), tmp_path, 100)
+
+        loaded = load_file(str(path))
+        b = loaded["base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"]
+        assert float(b.abs().max()) == pytest.approx(0.007), "trained values lost"
+
+    def test_a_repaired_checkpoint_is_byte_identical_to_an_uncompiled_one(
+        self, tmp_path
+    ):
+        """What ``resume_from_checkpoint`` actually needs.
+
+        A real resume needs FSDP2 and several GPUs, but the thing being resumed
+        is a file, and peft matches it by name. So the assertion that carries
+        the same weight off-GPU is that the repaired checkpoint is
+        indistinguishable from what the paired non-compile run writes: same
+        keys, same values. Anything peft finds in one it finds in the other.
+        """
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        repaired = _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+        _fire_on_save(build_compile_prefix_callback(), tmp_path, 100)
+        reference = _write_adapter(tmp_path / "no-compile")
+
+        got, want = load_file(str(repaired)), load_file(str(reference))
+        assert set(got) == set(want)
+        for key, tensor in want.items():
+            assert torch.equal(got[key], tensor), key
+        assert all(float(v.abs().max()) > 0 for k, v in got.items() if "lora_B" in k)
+
+    def test_only_the_rank_that_wrote_the_file_rewrites(self, tmp_path):
+        """``save_model`` writes the adapter only where ``args.should_save`` is
+        true, but ``on_save`` is dispatched on EVERY rank. Unguarded, the 8 ranks
+        of the run this was measured on would all rewrite one file at once."""
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        path = _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+        before = set(load_file(str(path)))
+        _fire_on_save(build_compile_prefix_callback(), tmp_path, 100, should_save=False)
+        assert set(load_file(str(path))) == before
+
+    def test_a_writing_rank_that_is_not_world_zero_still_repairs(self, tmp_path):
+        """The reason the guard reads ``args.should_save`` and not
+        ``state.is_world_process_zero``.
+
+        ``TrainingArguments.should_save`` is ``local_process_index == 0`` when
+        ``save_on_each_node`` is set and ``process_index == 0`` otherwise, and
+        ``save_model`` gates the write on it. So under ``save_on_each_node`` the
+        local rank 0 of every node after the first writes a checkpoint while
+        reporting ``is_world_process_zero=False``, and a guard on world-zero
+        would leave exactly those nodes holding an unrepaired adapter. Soup sets
+        no such flag today, which is what makes this the kind of thing that goes
+        unnoticed until someone does.
+        """
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        path = _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+        _fire_on_save(
+            build_compile_prefix_callback(),
+            tmp_path,
+            100,
+            should_save=True,
+            world_zero=False,
+        )
+
+        keys = set(load_file(str(path)))
+        assert not any(k.startswith("_orig_mod.") for k in keys), keys
+
+    def test_a_checkpoint_without_an_adapter_is_not_an_error(self, tmp_path):
+        """Full fine-tuning checkpoints carry no adapter file. Mid-run is a worse
+        place to raise than the end of a run, so this must stay a no-op."""
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        (tmp_path / "checkpoint-100").mkdir()
+        _fire_on_save(build_compile_prefix_callback(), tmp_path, 100)
+
+    def test_a_rewrite_that_fails_warns_and_keeps_training(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A broken rewrite must not kill a multi-hour run, but it must not pass
+        in silence either, because a checkpoint left with the prefix is a dead
+        adapter and that is the whole bug."""
+        from soup_cli.utils import peft_wiring
+
+        _write_adapter(tmp_path / "checkpoint-100", prefix="_orig_mod.")
+
+        def boom(_output_dir):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(peft_wiring, "strip_compile_prefix", boom)
+        with caplog.at_level("WARNING"):
+            _fire_on_save(peft_wiring.build_compile_prefix_callback(), tmp_path, 100)
+
+        assert "checkpoint-100" in caplog.text, caplog.text
+
+    def test_the_callback_answers_every_trainer_event(self):
+        """#308. HF's ``CallbackHandler.call_event`` dispatches through
+        ``getattr(cb, event)`` with no ``hasattr`` guard, so a duck-typed
+        callback dies on the first ``on_epoch_begin`` rather than at wiring
+        time. Inheriting ``TrainerCallback`` is what supplies the no-op stubs."""
+        from transformers import TrainerCallback
+
+        from soup_cli.utils.peft_wiring import build_compile_prefix_callback
+
+        callback = build_compile_prefix_callback()
+        assert isinstance(callback, TrainerCallback)
+        callback.on_epoch_begin(
+            types.SimpleNamespace(), types.SimpleNamespace(), types.SimpleNamespace()
+        )
+
+    def test_it_is_wired_only_when_compile_is_on(self):
+        """CONTROL. Every ordinary run would otherwise carry a callback that
+        reopens each checkpoint for nothing."""
+        from soup_cli.utils.peft_wiring import attach_compile_prefix_callback
+
+        class FakeTrainer:
+            def __init__(self):
+                self.callbacks = []
+
+            def add_callback(self, callback):
+                self.callbacks.append(callback)
+
+        off = FakeTrainer()
+        assert attach_compile_prefix_callback(
+            off, types.SimpleNamespace(use_fsdp2_compile=False), "out"
+        ) is False
+        assert off.callbacks == []
+
+        on = FakeTrainer()
+        assert attach_compile_prefix_callback(
+            on, types.SimpleNamespace(use_fsdp2_compile=True), "out"
+        ) is True
+        assert len(on.callbacks) == 1
 
 
 # ==========================================================================
@@ -735,3 +946,75 @@ class TestLigerDetectsArchitectureFromTheConfig:
         monkeypatch.setattr(liger_mod, "check_liger_available", lambda: True)
 
         assert liger_mod.apply_liger_kernel(str(directory)) is False
+
+
+# ==========================================================================
+# #351 review: the normalisation has to reach the file before anything
+# that PUBLISHES it does
+# ==========================================================================
+class TestTheNormalisationRunsBeforeAnythingThatPublishes:
+    """``HFPushCallback.on_save`` uploads ``checkpoint-{step}`` on the same event
+    this normalisation runs on, so the order the two are dispatched in decides
+    what ``--push-as`` puts on the Hub.
+
+    ``CallbackHandler.add_callback`` appends and ``call_event`` iterates in
+    insertion order, and ``--push-as`` adds its callback to the trainer after
+    ``setup()`` has returned (``commands/train.py``). Attaching the
+    normalisation in ``setup()`` is therefore what keeps it in front: attached in
+    ``train()`` instead, it landed second, the Hub received the prefixed adapter
+    and only local disk got the repaired one. That is the same dead-adapter
+    defect on the path where it is least recoverable, since what is published is
+    the dead file.
+
+    Asserted through the real ``callback_handler`` rather than by comparing list
+    indices, because the property that matters is what a later callback SEES.
+    """
+
+    def test_a_later_added_on_save_sees_the_repaired_keys(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+        from transformers import TrainerCallback
+
+        wrapper = _sft_wrapper(tmp_path, monkeypatch, use_fsdp2_compile=True)
+        trainer = wrapper.trainer
+        seen = {}
+
+        class Spy(TrainerCallback):
+            """Stands in for ``HFPushCallback``: reads the checkpoint it is told
+            was just written, which is what an upload does."""
+
+            def on_save(self, args, state, control, **kwargs):
+                adapter = (
+                    Path(args.output_dir)
+                    / f"checkpoint-{state.global_step}"
+                    / "adapter_model.safetensors"
+                )
+                seen["keys"] = set(load_file(str(adapter)))
+
+        # Exactly what `--push-as` does, and it can only ever happen after
+        # `setup()` has run.
+        trainer.add_callback(Spy())
+
+        _write_adapter(
+            Path(trainer.args.output_dir) / "checkpoint-100", prefix="_orig_mod."
+        )
+        trainer.state.global_step = 100
+        trainer.control = trainer.callback_handler.on_save(
+            trainer.args, trainer.state, trainer.control
+        )
+
+        assert seen, "the spy's on_save never fired; the wiring changed shape"
+        assert not any(k.startswith("_orig_mod.") for k in seen["keys"]), (
+            f"a callback added after setup() saw the PREFIXED adapter, so "
+            f"--push-as would publish a dead one: {sorted(seen['keys'])}"
+        )
+
+    def test_the_callback_is_attached_by_setup_not_by_train(self, tmp_path, monkeypatch):
+        """The position itself, so a move back into ``train()`` fails here rather
+        than only in the subtler assertion above."""
+        wrapper = _sft_wrapper(tmp_path, monkeypatch, use_fsdp2_compile=True)
+        names = [
+            type(cb).__name__ for cb in wrapper.trainer.callback_handler.callbacks
+        ]
+        assert "CompilePrefixCallback" in names, names

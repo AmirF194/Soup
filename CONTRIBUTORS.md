@@ -58,6 +58,7 @@ Listed by first contribution. PR numbers link the work.
   - `backend: mlx` was never dispatched — every MLX run trained through the transformers wrapper instead, and the saved MLX "adapter" was a full fine-tune because the model was never frozen before LoRA ([#362](https://github.com/MakazhanAlpamys/Soup/pull/362))
 - **William Yang** ([@wilyan09007](https://github.com/wilyan09007))
   - `training.seed` reached the SFT wrapper and nothing else — seventeen other task wrappers trained at HF's default 42 with no error, so replicates that differed only in the seed were the same run; the seed is now applied before the adapter is drawn, not only inside `Trainer` ([#381](https://github.com/MakazhanAlpamys/Soup/pull/381))
+  - Under `use_fsdp2_compile`, every `checkpoint-*` kept `torch.compile`'s key prefix and resumed **silently** from a re-zeroed adapter — normalisation now runs as each checkpoint is written, ahead of anything that publishes it ([#380](https://github.com/MakazhanAlpamys/Soup/pull/380))
 
 ---
 

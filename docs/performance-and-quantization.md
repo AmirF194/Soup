@@ -235,6 +235,7 @@ training:
   stream_layers: true          # Enable layer streaming
   stream_source: auto          # 'auto' (same-host RAM), 'ram', 'disk' (v0.72.3)
   stream_buffers: 2            # Double-buffering; range [2, 8]
+  # stream_vram_override: 4_000_000_000   # Bytes to assume free (v0.73.x); see below
 ```
 
 ```bash
@@ -398,6 +399,8 @@ output: ./output
 - **"layer streaming needs the base to fit in RAM"** — the base is larger than free RAM. Set `stream_source: auto` to fall back to the NVMe disk tier, free RAM, or pick a smaller base.
 - **"could not page-lock the base … falling back to a PAGEABLE RAM store"** — expected on a busy machine. Training continues, more slowly. Close other applications to keep the pinned store.
 - **"layer streaming does not support model_type=…"** — the supported list is llama / qwen2 / qwen3 / mistral / gemma / gemma2 / gemma3_text / phi / phi3. Multimodal `gemma3` is excluded on purpose; use `gemma3_text`.
+- **"predicted peak … exceeds free VRAM" and you believe it is wrong** — the pre-flight deliberately over-predicts, because on Windows an under-prediction does not raise, it silently spills to host memory. Lower `batch_size` or `data.max_length` first. If you have measured your configuration and know it fits, `training.stream_vram_override: <bytes>` **replaces** the figure the check runs against. Raising it past a real limit is an OOM on Linux and a silent spill on Windows, so treat it as a claim you have verified, not a way to skip the check.
+- **The pre-flight reports the whole card on a capped or shared GPU** — `torch.cuda.mem_get_info()` is a device-level driver query and cannot see `set_per_process_memory_fraction`, a MIG slice, or another process on the same card. Set `training.stream_vram_override` to what your process may actually use; the check then refuses configurations that would exceed *that*, which is also how you rehearse a 4 GB card on a 16 GB one.
 - **Slower than you expected** — layer streaming trades time for memory. If the model already fits resident on your card, do not enable it.
 
 ### Preference losses over streaming (v0.72.4)

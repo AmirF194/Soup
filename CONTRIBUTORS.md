@@ -61,6 +61,7 @@ Listed by first contribution. PR numbers link the work.
   - Under `use_fsdp2_compile`, every `checkpoint-*` kept `torch.compile`'s key prefix and resumed **silently** from a re-zeroed adapter — normalisation now runs as each checkpoint is written, ahead of anything that publishes it ([#380](https://github.com/MakazhanAlpamys/Soup/pull/380))
 - **Amir Fathi** ([@AmirF194](https://github.com/AmirF194))
   - A streamed model's `named_parameters()` carried the wrapper's `.inner.` segment, so a name-keyed comparison against a resident model shared no names at all and a correctness gate reported `0/0` as a pass ([#384](https://github.com/MakazhanAlpamys/Soup/pull/384))
+  - `training.stream_vram_override` — the layer-streaming pre-flight measured free VRAM with a device-level driver query, so it could not see a per-process cap and there was no way to make it simulate one ([#386](https://github.com/MakazhanAlpamys/Soup/pull/386))
 
 ---
 

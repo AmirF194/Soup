@@ -293,6 +293,28 @@ pytest tests/ --cov=soup_cli --cov-report=html
 
 (Note: the test-file table above is a representative subset, not exhaustive — every `tests/test_*.py` file maps to a feature area or release.)
 
+## Claiming an Issue
+
+Comment on it saying you are taking it. GitHub only lets us set the formal
+assignee badge for repo collaborators, so the comment **is** the claim — it will
+look unassigned either way, and we treat the thread as the record.
+
+Two commitments in return:
+
+- **If a maintainer ends up doing the work instead, you get told, in the thread,
+  before or when it lands.** This has been broken once ([#313](https://github.com/MakazhanAlpamys/Soup/issues/313)):
+  a contributor was green-lit, scoped a careful protocol, and then the
+  measurement was run on borrowed hardware and the issue closed without a word
+  to them. That was a process failure on our side, and this paragraph exists
+  because of it.
+- **A claim that goes quiet is released with a comment, not silently.** We check
+  in first, and "life got in the way" needs no explanation — see
+  [#280](https://github.com/MakazhanAlpamys/Soup/issues/280) for the shape.
+
+If an issue needs hardware you do not have, say so in the claim. Several open
+issues are labelled `infra-blocked` for exactly that reason, and knowing early
+is more useful than a stalled branch.
+
 ## Making Changes
 
 ### 1. Create a Branch

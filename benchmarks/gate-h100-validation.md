@@ -91,7 +91,36 @@ appear in the order they were run, not in the order they would read best.
    minute on a synthetic 7.7 GB model. The mechanism is **aliasing, not a race**:
    a full `cuda.synchronize()` does not fix it and de-aliasing the pooled buffers
    does. Six competing explanations of the *mechanism* were tested and rejected
-   along the way. (Two other counts appear in this record and are not in conflict
+   along the way.
+
+   > **ADDED 2026-08-13 — does this reach ORDINARY QLoRA? Measured: no.** This
+   > record never said so; the word "QLoRA" did not occur in it once. The
+   > sentence "ordinary QLoRA is not affected" was about to go into a public
+   > post as an inference from the mechanism above, which is the same kind of
+   > step that version 3 of the preprint had to retract, so it was measured
+   > instead. Three arms, one process, same input and seeds, on the laptop stack
+   > (torch 2.5.1+cu121, bitsandbytes 0.49.2): a private-buffer `Linear4bit`
+   > with a trainable LoRA pair and **no** checkpointing is the reference; the
+   > same **with** gradient checkpointing is ordinary QLoRA; the third refills
+   > the packed storage with the next layer's bytes between the forward and the
+   > backward, as a pooled buffer does. Result: **0.000000e+00** on dL/dx and on
+   > both LoRA gradients, single-shot and over 10 consecutive backwards, while
+   > the control diverged by **3.77e-01** through the identical code path —
+   > against a reference gradient of 1.36e+01. The control is the load-bearing
+   > arm: without it, an exact result is indistinguishable from a harness that
+   > detects nothing. Harness:
+   > [`harness/issue331_qlora_scope.py`](harness/issue331_qlora_scope.py), ~15 s
+   > on a 4 GB card, no downloads.
+   >
+   > **Scope, stated narrowly.** This is one `Linear4bit`, not a model, and the
+   > control's refill is forced explicitly rather than arising from pool reuse,
+   > so it demonstrates the *mechanism*, not streaming's scheduling. It says
+   > nothing about any stack other than the one named above. What it does settle
+   > is the only question a reader of the post will ask: the defect needs a
+   > consumer that recycles the storage the weight points into, and a QLoRA run
+   > that allocates each weight privately does not have one.
+
+   (Two other counts appear in this record and are not in conflict
    with this one: nine hypotheses about the *trigger*, numbered `Rejected 1`-`7`
    and `Hypothesis 8`-`9` below, and seven about the still-unexplained residue.)
 5. **A model trained by streaming is as good as one trained resident.** Paired

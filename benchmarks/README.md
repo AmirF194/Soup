@@ -22,6 +22,18 @@ They are the evidence behind the preprint:
 | [`probe-v0.73.0-what-bounds-streaming.md`](probe-v0.73.0-what-bounds-streaming.md) | What the streamed step is actually bound by, and Cut Cross-Entropy on top of it | **Not** transfer-bound: 71.3% of the card's same-session GEMM ceiling, and deleting every host-to-device byte buys 1.4%. CCE triples the usable microbatch for +9.6% |
 | [`gate-h100-validation.md`](gate-h100-validation.md) |  The method on someone else's hardware: bit-exactness at real sizes, convergence quality, DeepSpeed, variance | **Forward** bit-exact to 72B; **backward** bit-exact to 14B NF4 pre-repair, re-gated after the STEP 14 fix at 32B (256/256) **and at 72B (320/320, the size where the defect was worst)**; 2.93x DeepSpeed ZeRO-3 offload in 9.7x less VRAM; and the silent wrong-gradient defect that fix repairs. **Carries three dated 2026-08-13 corrections**: it explains the H100 replication as host-to-device transfer, which the probe record above later measured and refuted. The original lines are left standing with the correction beside them |
 
+## Harnesses
+
+[`harness/`](harness/) holds the measurement scripts that can be run against a
+released Soup, so a claim in a record above can be re-measured rather than taken
+on trust. It starts small on purpose — most of this session's ~20 harnesses live
+only in a scratchpad on a machine that is gone, which is
+[#379](https://github.com/MakazhanAlpamys/Soup/issues/379).
+
+| Script | Question it answers | Cost |
+|---|---|---|
+| [`issue331_qlora_scope.py`](harness/issue331_qlora_scope.py) | Does the #331 wrong-gradient defect reach **ordinary QLoRA**? Three arms in one process, with the positive control that makes an exact result mean something. Answer: no — 0.0 against a control that diverges by 3.77e-01 | ~15 s, 4 GB card, no downloads |
+
 ## Hardware
 
 Every number in the four `gate-v0.72.*` records was measured on one machine:

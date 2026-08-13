@@ -21,7 +21,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterator, Mapping, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -721,9 +721,11 @@ def _build_streamed_layer_class():
             #
             # Serialisation-only, deliberately: the forward path is untouched,
             # so v0.72.0's bit-exactness gates remain valid. The cost is that
-            # `named_parameters()` still shows `.inner.`, i.e. loading INTO a
-            # streamed model stays unsupported (`--resume` is refused; the
-            # checkpoint/resume slot is v0.72.3).
+            # `named_parameters()` still shows `.inner.`, which is why
+            # `canonical_named_parameters()` below exists. `--resume` /
+            # `--hf-resume` load INTO a streamed model fine (v0.72.3,
+            # `train.py`): a separate load-side pre-hook redirects canonical
+            # keys at load time, mirroring this save-side delegation.
             #
             # The wrapper owns no parameters or buffers of its own — they all
             # live on `inner` — so nothing is lost by not serialising it. It
@@ -817,6 +819,39 @@ class _StreamedDecoderLayerProxy:
 
 
 StreamedDecoderLayer = _StreamedDecoderLayerProxy()
+
+
+def canonical_named_parameters(model: Any) -> Iterator[Tuple[str, Any]]:
+    """Yield ``(name, param)`` with the wrapper's ``.inner.`` segment stripped,
+    matching the spelling ``StreamedDecoderLayer.state_dict()`` already uses
+    (v0.72.1). ``named_parameters()`` on a streamed model is not canonical on
+    its own: every wrapped layer's parameters carry an extra ``.inner.``
+    segment that a resident (non-streamed) model of the same checkpoint does
+    not, so a name-keyed comparison between the two sees no overlap unless it
+    goes through this function first.
+    """
+    for name, param in model.named_parameters():
+        yield name.replace(".inner.", "."), param
+
+
+def assert_canonical_parameters_intersect(model_a: Any, model_b: Any) -> FrozenSet[str]:
+    """Raise if two models (either may be streamed) share no canonical
+    parameter name. A per-parameter comparison (gradients, weights, any other
+    property) can only walk names both sides have; if the intersection is
+    empty, a loop over it is vacuously satisfied and reports success on
+    nothing compared. Returns the intersecting name set on success so a
+    caller need not recompute it.
+    """
+    names_a = frozenset(name for name, _ in canonical_named_parameters(model_a))
+    names_b = frozenset(name for name, _ in canonical_named_parameters(model_b))
+    shared = names_a & names_b
+    if not shared:
+        raise ValueError(
+            f"no canonical parameter name is shared between the two models "
+            f"({len(names_a)} vs {len(names_b)} parameters); a comparison "
+            f"over an empty intersection is not a comparison"
+        )
+    return shared
 
 
 # ==========================================================================

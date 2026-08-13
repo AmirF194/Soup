@@ -87,6 +87,28 @@ reproducing 70+ versions of notes.
   `named_buffers()` carry the same segment and are deliberately not covered — the
   comparison that produced the false green was over parameter names.
 
+### Changed
+
+- **Retracted: "layer streaming is bound by host-to-device transfer, not by the GPU."**
+  That sentence appeared in the README, in the v0.73.0 notes below, in the H100 gate record
+  and in the preprint's abstract. It was an *inference* from the H100 replication — the same
+  configuration returning the same throughput on a card with two orders of magnitude more
+  compute — and it had never been measured. It was measured on 2026-08-11 on the original
+  laptop and is **false at the published configuration**: four interleaved ablation arms in
+  one process at a pinned clock show that removing *all* host-to-device traffic (6.864 GB per
+  step) buys **1.44%**, removing the NF4 dequantisation buys **9.80%**, and removing both
+  leaves **88.7%** of the step; the compute stream is blocked on a copy for 8.4 ms of a
+  4190 ms step; and the step runs at **71.3%** of that card's same-session, shape-matched GEMM
+  ceiling. The claim *is* true below roughly 128 tokens per step, where the fixed transfer
+  volume dominates — the published configuration is not there.
+  **No measured number anywhere changes**, and the replication result stands in a weaker form:
+  the constraint is common to both machines and is not the compute the datacenter card adds.
+  The H100's own bottleneck was never instrumented and no claim is made about it. Record:
+  `benchmarks/probe-v0.73.0-what-bounds-streaming.md`. Every occurrence in the gate record and
+  in the v0.73.0 notes below is **annotated in place rather than deleted**, because in a folder
+  whose whole premise is publishing the record as written, a silent deletion costs more
+  credibility than the error does.
+
 ## [0.73.0] - 2026-08-09
 
 **The release that came out of three days on somebody else's hardware.**
@@ -334,6 +356,13 @@ exist, and repairs four backends.
   same 3.32 GB** on an H100 — first outside evidence that the method is bound by
   host-to-device transfer, not by the GPU. (See Known Limitations for what the laptop
   figure does and does not now mean.)
+  > **Correction, 2026-08-13, left in place rather than rewritten.** The measurement
+  > stands; the explanation does not. "Bound by host-to-device transfer" was an inference,
+  > never a measurement, and a probe on 2026-08-11 refuted it at the published
+  > configuration — deleting every host-to-device byte buys 1.4% and the step runs at 71.3%
+  > of the card's same-session GEMM ceiling
+  > (`benchmarks/probe-v0.73.0-what-bounds-streaming.md`). What survives is the weaker
+  > claim: the constraint is common to both machines and is not the compute the H100 adds.
 - **Forward bit-exactness at real model sizes**, not just on toys: logits `torch.equal`
   against a resident reference of matching numerics at 0.5B, 8B, 14B, 32B and 72B. Every
   previously published bit-exactness result was on 3-layer from-config checkpoints,
@@ -416,6 +445,12 @@ cost −4.8% throughput at 32B, so treat the laptop figure as a pre-repair numbe
 someone re-measures it on an RTX 3050. An H100 cannot substitute — the whole point of the
 H100 result is that this method is transfer-bound, so its throughput does not carry across
 machines.
+
+> **Correction, 2026-08-13.** The conclusion holds, the reason given for it does not: the
+> laptop is not transfer-bound (see the correction above). An H100 still cannot substitute,
+> for a narrower reason — the repair's cost is paid in the per-layer NF4 dequantisation,
+> measured at 9.8% of the step on the laptop, and that share belongs to that card's clock,
+> GEMM ceiling and launch overhead.
 
 ## [0.72.4] - 2026-08-03
 

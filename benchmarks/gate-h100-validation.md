@@ -55,6 +55,22 @@ appear in the order they were run, not in the order they would read best.
    Laptop (v0.72.2 record) against a median 113.00 tok/s in 3.32 GB here, on an
    H100. The method is bound by host-to-device transfer, not by the GPU, and this
    is the first evidence of that from outside the original box.
+
+   > **CORRECTION 2026-08-13 — the second sentence above is wrong, and it is left
+   > standing so the correction is legible.** "Bound by host-to-device transfer"
+   > was an *inference* from the reproduction, never a measurement. It was measured
+   > on 2026-08-11 on the original laptop and refuted at the published
+   > configuration: deleting every host-to-device byte makes the step **1.44%**
+   > faster, the compute stream is blocked on a copy for **0.20%** of the step, and
+   > the step runs at **71.3%** of that card's same-session, shape-matched GEMM
+   > ceiling. The largest streaming-specific cost is the per-layer NF4
+   > dequantisation, at **9.8%**. Record:
+   > [`probe-v0.73.0-what-bounds-streaming.md`](probe-v0.73.0-what-bounds-streaming.md).
+   > **The measurement in the first sentence is unaffected** — the laptop figure
+   > does reproduce here — and so is the weaker claim it supports: whatever bounds
+   > the step is common to both machines and is not the compute this box adds. This
+   > box's own bottleneck was never instrumented and no claim is made about it. The
+   > corrected text is §5.3a of the preprint, version 3.
 3. **Against DeepSpeed ZeRO-3 CPU offload, same box, same data, same model:
    2.93x the throughput in 9.7x less peak VRAM** at matched numerics.
 4. **A silent correctness defect, found and its cause named in the library that
@@ -1086,6 +1102,28 @@ The 54.1% mean GPU utilisation on the NF4 rows says the same thing — the card 
 idle half the time waiting for weights. It also explains why bf16 streaming is
 *slower* than NF4 streaming (62.43 vs 113.00) despite being simpler arithmetic:
 NF4 moves roughly a quarter of the bytes.
+
+> **CORRECTION 2026-08-13 — the paragraph above is wrong about the mechanism, and
+> is left standing rather than rewritten.** Every number in it was measured and
+> stands: 113.00 tok/s, the 3.32 GB peak, 54.1% mean utilisation, bf16 at 62.43
+> against NF4 at 113.00. What does not stand is the explanation attached to them.
+> On 2026-08-11 the transfer account was tested directly on the original laptop
+> and refuted there — four interleaved ablation arms in one process at a pinned
+> 960 MHz: removing **all** host-to-device traffic (6.864 GB per step) buys
+> **1.44%**, removing the NF4 dequantisation buys **9.80%**, removing both leaves
+> **88.7%** of the step. The compute stream waits on a copy for 8.4 ms of a
+> 4190 ms step. Record:
+> [`probe-v0.73.0-what-bounds-streaming.md`](probe-v0.73.0-what-bounds-streaming.md).
+>
+> Two things the correction does **not** claim. It does not claim this box was
+> compute-bound for the same reason — this box's step was never instrumented, it
+> is gone, and 54.1% utilisation alongside bf16-slower-than-NF4 remains consistent
+> with the transfer term dominating *here*, where compute is two orders of
+> magnitude faster and the bytes are unchanged. And it does not touch the
+> cross-hardware claim below, which is the part that survives: the constraint is
+> common to both machines and is not the compute this card adds. The
+> bf16-versus-NF4 ordering on this box is now an observation without a tested
+> explanation.
 
 This is the strongest cross-hardware evidence in the record that the published
 laptop numbers were not an artefact of that laptop.
@@ -4883,6 +4921,16 @@ pinning result have to go with it.
    honesty: re-measure on the laptop; or state the figure as pre-repair and quote
    the 32B delta as the expected direction. Silently carrying it forward is not one
    of them.
+
+   > **CORRECTION 2026-08-13, third occurrence of the same wrong reason.** The
+   > conclusion here is right and v2 took the second option. The *reason* given for
+   > it is not: the laptop is not bound by host-to-device transfer (see the
+   > corrections at STEP 1's summary and at the H100-versus-laptop comparison, and
+   > [`probe-v0.73.0-what-bounds-streaming.md`](probe-v0.73.0-what-bounds-streaming.md)).
+   > The correct reason is narrower and still sufficient: the repair's cost is paid
+   > in the per-layer NF4 dequantisation, measured at **9.8%** of the step on the
+   > laptop, and that share is a property of that card's clock, GEMM ceiling and
+   > launch overhead — so only that card can settle it.
 
 2. **The exactness protocol's own fixtures moved — the FORWARD half of it.** The
    paper's bit-exactness checks ran at token counts that sit **inside**

@@ -84,7 +84,11 @@ nothing like the one it was made on.
 
 - **The laptop result reproduces elsewhere.** Llama-3.1-8B NF4 streamed: 119.6 tok/s in a
   3.32 GB peak on the RTX 3050, against a **median 113.00 tok/s in the same 3.32 GB** on an
-  H100. Layer streaming is bound by host-to-device transfer, not by the GPU.
+  H100 — a hundredfold jump in available FLOPs that does not show up in the number, so
+  whatever bounds the step is common to both machines and is not the GPU's compute. We first
+  published that as "bound by host-to-device transfer"; a later probe measured it and
+  [refuted it](benchmarks/probe-v0.73.0-what-bounds-streaming.md) — deleting every
+  host-to-device byte buys 1.4%.
 - **A silent wrong-gradient bug, found and fixed.** On NF4 models above ~165 MiB per layer
   (32B and up), `bitsandbytes` kept a weight reference where gradient checkpointing could
   not see it, so the forward stayed exact and the loss curve looked healthy while the
@@ -446,8 +450,13 @@ separately, because they are two claims and not one).
 and the paper roughly doubled, ~9,000 → ~19,800 words, to carry what the 8×H100 session produced:
 
 - **Replication on hardware nothing like the original**: 119.6 tok/s on the RTX 3050 against a
-  median 113.00 on an H100, at the same 3.32 GB peak. The method is bound by host-to-device
-  transfer, not by the GPU.
+  median 113.00 on an H100, at the same 3.32 GB peak — the bottleneck is common to both machines
+  and is not the GPU's compute. **Correction to v2:** it goes one step further and calls that
+  bottleneck host-to-device transfer. We measured that on 11 August and it is false at the
+  published configuration — deleting every host-to-device byte buys 1.4%, and the step runs at
+  71.3% of the card's same-session GEMM ceiling
+  ([the record](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). No measured number changes;
+  a v3 carrying the corrected text is in preparation.
 - **A silent wrong-gradient defect, found and repaired.** On NF4 above ~165 MiB per layer the
   forward stayed bit-exact and the loss curve looked healthy while the gradients were wrong. The
   cause is named in the upstream library and reported there; the repair is gated against controls

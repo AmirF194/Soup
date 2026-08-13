@@ -58,7 +58,9 @@ resident run, and reproduced independently on an H100 at 113.00 tok/s in the sam
 −4.8% at 32B; it has not been re-run on a 4 GB card since.) Opt-in (`stream_layers: true`)
 and still BETA —
 [how it works](docs/performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724) ·
-[all measurements](benchmarks/) · [paper](https://doi.org/10.5281/zenodo.21771064)
+[all measurements](benchmarks/) · [paper](https://doi.org/10.5281/zenodo.21771064) ·
+**[check it yourself on a free Colab T4](notebooks/proof-4gb.ipynb)** (caps the process to
+4 GB, then asserts a streamed model is bit-identical to a normal one)
 
 <p align="center">
   <a href="https://youtu.be/T1LCErE943E"><img src="docs/assets/layer-streaming.gif" alt="soup train pre-flight for Llama-3.1-8B on a 4 GB card: a 3.60 GB base store pinned in RAM across 32 layers and two 113 MB VRAM buffers, then a measured peak of 3.32 GB at 119.6 tok/s, stopping short of the 4 GB line"></a><br>

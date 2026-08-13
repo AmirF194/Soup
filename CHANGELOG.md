@@ -74,7 +74,7 @@ reproducing 70+ versions of notes.
   this same event and `CallbackHandler` dispatches in insertion order, so a
   normalisation attached after it would leave `--push-as` publishing the prefixed
   adapter and keeping the repaired one on local disk.
-- **A streamed model's `named_parameters()`/`named_modules()` still carried the wrapper's
+- **A streamed model's `named_parameters()` still carried the wrapper's
   `.inner.` segment, so a name-keyed comparison against a resident model of the same
   checkpoint saw no overlap (#369).** v0.72.1 made `state_dict()` canonical for
   serialisation; this issue is the first time something compared the two model kinds by
@@ -83,7 +83,9 @@ reproducing 70+ versions of notes.
   strips `.inner.` the same way `state_dict()` already does, and
   `assert_canonical_parameters_intersect()` raises instead of reporting an empty
   intersection as success. Neither the forward path nor `state_dict()` changed, so the
-  v0.72.0 bit-exactness gates remain valid unexercised.
+  v0.72.0 bit-exactness gates remain valid unexercised. `named_modules()` and
+  `named_buffers()` carry the same segment and are deliberately not covered — the
+  comparison that produced the false green was over parameter names.
 
 ## [0.73.0] - 2026-08-09
 

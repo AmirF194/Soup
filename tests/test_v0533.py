@@ -130,8 +130,13 @@ class TestGRPOFP16Routing:
             def is_available(self):
                 return True
 
-            def is_bf16_supported(self):
-                return self._bf16
+            def is_bf16_supported(self, including_emulation: bool = True):
+                # The bare call is permissive and answers True on a T4 via
+                # emulation; only the no-emulation form means bf16 hardware.
+                return self._bf16 if not including_emulation else True
+
+            def get_device_capability(self, device=None):
+                return (8, 0) if self._bf16 else (7, 5)
 
         monkeypatch.setattr(torch, "cuda", _Cuda(True))
         assert wrapper._build_precision_kwargs() == {"fp16": False, "bf16": True}
@@ -379,8 +384,11 @@ class TestReviewFixes:
             def is_available(self):
                 return True
 
-            def is_bf16_supported(self):
+            def is_bf16_supported(self, including_emulation: bool = True):
                 return True
+
+            def get_device_capability(self, device=None):
+                return (8, 0)
 
         monkeypatch.setattr(torch, "cuda", _Cuda())
         assert wrapper._build_precision_kwargs() == {"fp16": False, "bf16": True}

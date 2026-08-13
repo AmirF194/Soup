@@ -153,8 +153,13 @@ class TestResolveMixedPrecision:
             def is_available(self):
                 return True
 
-            def is_bf16_supported(self):
-                return self._bf16
+            def is_bf16_supported(self, including_emulation: bool = True):
+                # Mirrors the real signature: the bare call is permissive
+                # and says True on a T4 through emulation (#385 follow-up).
+                return self._bf16 if not including_emulation else True
+
+            def get_device_capability(self, device=None):
+                return (8, 0) if self._bf16 else (7, 5)
 
         monkeypatch.setattr(torch, "cuda", _Cuda(True))
         assert wrapper._resolve_mixed_precision(tcfg, "any") == (True, False)

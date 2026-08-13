@@ -116,11 +116,24 @@ reproducing 70+ versions of notes.
   `utils/gpu.bf16_fp16_flags`, including ASR, whose private copy was folded in. bf16 needs
   Ampere.
   **Colab's free tier is a T4 (sm_75), Kaggle is a T4 or a P100, and V100 / GTX 16xx / RTX 20xx
-  are all pre-Ampere**, so on that hardware a streamed run streamed a dtype the card cannot
-  compute in, and *any* `soup train` — streamed or not — died before step 0 with
-  transformers' *"Your setup doesn't support bf16/gpu. You need Ampere+ GPU with cuda>=11.0"*.
+  are all pre-Ampere**, so on that hardware Soup ran in a dtype the card has no units for.
   Neither could fail on the maintainer's RTX 3050, which is Ampere; this is the same shape as
   the four backends the H100 session found had never executed once.
+
+  **Two corrections to the first version of this entry, both established by finally running
+  it on a real T4 rather than reasoning about one.** (1) The claim that every task *died before
+  step 0* on transformers' *"Your setup doesn't support bf16/gpu"* was wrong: that error was
+  produced by a local stub forcing `is_bf16_supported()` to False, and transformers gates on
+  the same permissive call described next, so on the current stack it does not raise at all.
+  (2) More seriously, **the first fix was a no-op on the hardware it was written for.**
+  `torch.cuda.is_bf16_supported()` defaults to `including_emulation=True`: when its
+  compute-capability fast path fails it falls through to merely *constructing* a bf16 tensor,
+  which software emulation satisfies — so a T4 answers **True**, and asking the bare question
+  selected bf16 exactly as the hardcoded literal had. The predicate now asks
+  `is_bf16_supported(including_emulation=False)` (falling back to a capability check on older
+  torch), and `get_compute_dtype` — a second copy of the same question — was folded into it.
+  What a T4 actually *does* with emulated bf16, as opposed to what it reports, is not yet
+  measured.
   **This cannot regress a working setup**: where bf16 is supported the answer is unchanged,
   and where it is not the previous behaviour was a crash. A test SCANS every module in
   `soup_cli/trainer/` rather than parametrising over a hand-written list — the list is what

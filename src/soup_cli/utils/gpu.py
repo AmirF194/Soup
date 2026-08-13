@@ -264,7 +264,22 @@ def cuda_supports_bf16() -> bool:
     try:
         import torch
 
-        return bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+        if not torch.cuda.is_available():
+            return False
+        try:
+            # NOT the bare call. ``is_bf16_supported()`` defaults to
+            # ``including_emulation=True``, and its fast path (CUDA >= 11 AND
+            # compute capability >= 8) is only the FIRST branch: when that
+            # fails it falls through to merely constructing a bf16 tensor,
+            # which succeeds on a T4 through software emulation. So the default
+            # answers "can this device hold a bf16 value", while every caller
+            # here is asking "does this device have bf16 hardware".
+            return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+        except TypeError:
+            # torch too old for the keyword, and its bare answer is the
+            # permissive one we are trying to avoid — ask the capability.
+            major, _ = torch.cuda.get_device_capability()
+            return major >= 8
     except (ImportError, RuntimeError, AssertionError, OSError):
         # The same narrow set ``sft._resolve_mixed_precision`` already catches —
         # broad ``except Exception`` here would swallow a real CUDA error and
@@ -301,11 +316,16 @@ def get_compute_dtype():
 
     Uses bfloat16 on CUDA GPUs that support it, float16 otherwise.
     On CPU, uses float32 to avoid dtype mismatch errors.
+
+    Delegates the capability question to :func:`cuda_supports_bf16` rather than
+    calling ``is_bf16_supported()`` itself: the bare call includes software
+    EMULATION and answers True on a T4, so this function used to hand bf16 to
+    cards with no bf16 units (#385 follow-up, found on a real T4).
     """
     import torch
 
     if torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
+        if cuda_supports_bf16():
             return torch.bfloat16
         return torch.float16
     return torch.float32

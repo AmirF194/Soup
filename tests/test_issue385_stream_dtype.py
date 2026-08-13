@@ -25,19 +25,34 @@ import pytest
 
 
 class _FakeCuda:
-    """Stands in for ``torch.cuda`` so a card we do not own can be tested."""
+    """Stands in for ``torch.cuda`` so a card we do not own can be tested.
 
-    def __init__(self, available: bool, bf16: bool):
+    ``is_bf16_supported`` mirrors the real signature, because the real default
+    is ``including_emulation=True`` and a stub that ignored the keyword would
+    hide the exact bug this file exists for: a T4 answers **True** to the bare
+    call (it can hold a bf16 value through software emulation) and False to
+    ``including_emulation=False`` (it has no bf16 hardware).
+    """
+
+    def __init__(self, available: bool, bf16: bool, emulated: bool = True):
         self._available = available
         self._bf16 = bf16
+        self._emulated = emulated
         self.asked_bf16 = 0
+        self.asked_without_emulation = 0
 
     def is_available(self) -> bool:
         return self._available
 
-    def is_bf16_supported(self) -> bool:
+    def is_bf16_supported(self, including_emulation: bool = True) -> bool:
         self.asked_bf16 += 1
-        return self._bf16
+        if not including_emulation:
+            self.asked_without_emulation += 1
+            return self._bf16
+        return self._bf16 or self._emulated
+
+    def get_device_capability(self, device=None):
+        return (8, 0) if self._bf16 else (7, 5)
 
 
 @pytest.fixture()
@@ -45,8 +60,8 @@ def fake_torch(monkeypatch):
     """Patch ``torch.cuda`` in place; the resolver imports torch lazily."""
     import torch
 
-    def apply(available: bool, bf16: bool) -> _FakeCuda:
-        fake = _FakeCuda(available, bf16)
+    def apply(available: bool, bf16: bool, emulated: bool = True) -> _FakeCuda:
+        fake = _FakeCuda(available, bf16, emulated)
         monkeypatch.setattr(torch, "cuda", fake)
         return fake
 
@@ -75,6 +90,24 @@ class TestResolveStreamDtype:
         fake = fake_torch(available=True, bf16=True)
         resolve_stream_dtype("cuda")
         assert fake.asked_bf16 >= 1
+
+    def test_emulated_bf16_does_not_count_as_bf16(self, fake_torch):
+        """The defect a real T4 exposed, after the first fix had shipped.
+
+        ``torch.cuda.is_bf16_supported()`` defaults to
+        ``including_emulation=True`` and returns **True on a T4** — it falls
+        past the compute-capability fast path and merely constructs a bf16
+        tensor, which software emulation satisfies. Asking the bare question
+        therefore picks bf16 on hardware with no bf16 units, which is what the
+        first version of this fix did: a no-op on exactly the cards it was
+        written for. The question has to be asked without emulation.
+        """
+        from soup_cli.utils.layer_stream import resolve_stream_dtype
+
+        fake = fake_torch(available=True, bf16=False, emulated=True)
+        assert fake.is_bf16_supported() is True, "the stub must model the trap"
+        assert resolve_stream_dtype("cuda") == "float16"
+        assert fake.asked_without_emulation >= 1
 
     def test_cpu_stays_float32(self, fake_torch):
         """CPU streaming is a test convenience and half-precision CPU kernels

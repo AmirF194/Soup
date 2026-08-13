@@ -278,8 +278,19 @@ def bf16_fp16_flags(device: str) -> tuple[bool, bool]:
     bf16 where the card has it, fp16 where it does not, neither on CPU. Cannot
     regress a working setup: on a bf16-capable card the answer is what every
     wrapper hardcoded, and on the rest the previous answer was a crash.
+
+    A ``"cuda"`` string with no CUDA runtime behind it gets neither, rather than
+    fp16 on a card that is not there — the run cannot proceed either way, and
+    asking for mixed precision on a phantom device only obscures the real error.
     """
     if not str(device).lower().startswith("cuda"):
+        return (False, False)
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return (False, False)
+    except (ImportError, RuntimeError, AssertionError, OSError):
         return (False, False)
     supported = cuda_supports_bf16()
     return (supported, not supported)

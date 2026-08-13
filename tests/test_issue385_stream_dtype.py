@@ -197,6 +197,19 @@ class TestTrainingArgumentsPrecisionAsksTheCardToo:
         wrapper.device = "cpu"
         assert wrapper._resolve_mixed_precision(self._Tcfg(), "meta-llama/x") == (False, False)
 
+    def test_cuda_string_without_a_cuda_runtime_asks_for_neither(self, fake_torch):
+        """A CPU-only box that was handed ``device="cuda"`` must not come back
+        asking for fp16 on a card that is not there — the run fails either way,
+        and a phantom precision request only obscures the real error. This is
+        also the shape CI runs in, so it is the branch that decides whether a
+        GPU-less test box agrees with a GPU-ful one."""
+        from soup_cli.trainer.sft import SFTTrainerWrapper
+
+        fake_torch(available=False, bf16=False)
+        wrapper = SFTTrainerWrapper.__new__(SFTTrainerWrapper)
+        wrapper.device = "cuda"
+        assert wrapper._resolve_mixed_precision(self._Tcfg(), "meta-llama/x") == (False, False)
+
 
 class TestEveryTrainerAsksTheCard:
     """#387 was in TWELVE wrappers, not one. Repairing only the SFT path is

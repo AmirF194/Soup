@@ -107,8 +107,9 @@ nothing like the one it was made on.
 - **A streamed model is as good as a resident one** — paired over five training subsets and
   judged by Soup's own `soup ship`: mean difference **+0.006** against a **0.013**
   within-arm spread.
-- **Written up as preprint v2** (10 Aug), which carries all of the above and roughly doubles the
-  paper — [DOI 10.5281/zenodo.21877316](https://doi.org/10.5281/zenodo.21877316), details under
+- **Written up as a preprint** — v2 (10 Aug) carries all of the above; **v3 (13 Aug) retracts one
+  explanation v2 gave** and changes no measured number —
+  [DOI 10.5281/zenodo.21918325](https://doi.org/10.5281/zenodo.21918325), details under
   [Citing Soup](#citing-soup).
 
 The full measurement record, published as written including the rejected hypotheses and the
@@ -290,19 +291,12 @@ The full feature reference lives in [`docs/`](docs/). Start here:
 
 ## Data Formats
 
-All formats are auto-detected from JSONL, JSON, CSV, Parquet, or TXT:
-
-- **alpaca** — `{"instruction": ..., "input": ..., "output": ...}`
-- **sharegpt** — `{"conversations": [{"from": "human", "value": ...}, ...]}`
-- **chatml** — `{"messages": [{"role": "user", "content": ...}, ...]}`
-- **dpo / orpo / simpo / ipo** — `{"prompt": ..., "chosen": ..., "rejected": ...}`
-- **kto** — `{"prompt": ..., "completion": ..., "label": true}`
-- **llava / sharegpt4v** (vision), **audio**, **plaintext** (pre-training), **embedding**,
-  **prm**, **pre_tokenized**, **video**, **multimodal**
-
-Full schemas and the Axolotl/LlamaFactory-parity data pipeline (remote URIs, streaming,
-sharding, interleaving, vocab expansion, document ingestion) are in
-[`docs/data.md`](docs/data.md).
+Alpaca, ShareGPT, ChatML, preference pairs (DPO / ORPO / SimPO / IPO / KTO), vision, audio,
+ASR, plaintext, embedding, RAFT and more — all auto-detected from JSONL, JSON, CSV, Parquet or
+TXT, so in most cases you point `data.train` at a file and nothing else changes. Schemas with a
+worked example per format, plus the data pipeline (remote URIs, streaming, sharding,
+interleaving, vocab expansion, document ingestion), are in
+[`docs/data.md`](docs/data.md#data-formats).
 
 ## Common Commands
 
@@ -444,19 +438,23 @@ protocol that verifies a streamed run against a resident one (forward and backwa
 separately, because they are two claims and not one).
 
 > Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop
-> GPU* (v2). Zenodo. https://doi.org/10.5281/zenodo.21877316
+> GPU* (v3). Zenodo. https://doi.org/10.5281/zenodo.21918325
 
-**Version 2 (10 August 2026) is current.** The title and the claim are unchanged — 8B on 4 GB —
-and the paper roughly doubled, ~9,000 → ~19,800 words, to carry what the 8×H100 session produced:
+**Version 3 (13 August 2026) is current.** The title and the claim are unchanged — 8B on 4 GB —
+and no measured number has changed since v1. What v3 does is **withdraw an explanation we had
+published**, which is also the shortest way to describe what the paper is for:
 
-- **Replication on hardware nothing like the original**: 119.6 tok/s on the RTX 3050 against a
-  median 113.00 on an H100, at the same 3.32 GB peak — the bottleneck is common to both machines
-  and is not the GPU's compute. **Correction to v2:** it goes one step further and calls that
-  bottleneck host-to-device transfer. We measured that on 11 August and it is false at the
-  published configuration — deleting every host-to-device byte buys 1.4%, and the step runs at
-  71.3% of the card's same-session GEMM ceiling
-  ([the record](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). No measured number changes;
-  a v3 carrying the corrected text is in preparation.
+- **Retracted in v3: "layer streaming is bound by host-to-device transfer, not by the GPU."**
+  That was an *inference* from the H100 replication below, and it had never been measured. We
+  measured it on 11 August and it is false at the published configuration: deleting every
+  host-to-device byte buys **1.4%**, the compute stream waits on a copy for **0.20%** of the
+  step, and the step runs at **71.3%** of that card's same-session GEMM ceiling. The largest
+  streaming-specific cost is the per-layer NF4 dequantisation, at 9.8%
+  ([the record](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). Every measurement stands;
+  the replication survives in a weaker form — the constraint is common to both machines and is
+  not the GPU's compute.
+- **Replication on hardware nothing like the original** (added in v2): 119.6 tok/s on the RTX
+  3050 against a median 113.00 on an H100, at the same 3.32 GB peak.
 - **A silent wrong-gradient defect, found and repaired.** On NF4 above ~165 MiB per layer the
   forward stayed bit-exact and the loss curve looked healthy while the gradients were wrong. The
   cause is named in the upstream library and reported there; the repair is gated against controls
@@ -469,7 +467,9 @@ and the paper roughly doubled, ~9,000 → ~19,800 words, to carry what the 8×H1
 - **The limitations section rewritten**: four of v1's closed, seven new ones added.
 
 Cite the version you used. `10.5281/zenodo.21771064` is the concept DOI and always resolves to
-the latest version (v2 today); v1 remains citable at its own version DOI.
+the latest version (v3 today); v1 and v2 remain citable at their own version DOIs and are not
+edited — the retraction above is a new version precisely so that the record of what we claimed,
+and when, stays intact.
 
 The measurement records behind every number in it are in [`benchmarks/`](benchmarks/), published
 as written — including the failures, the assumptions that turned out wrong, and the numbers that
@@ -481,9 +481,9 @@ were measured and then discarded.
   author       = {Makazhan, Alpamys},
   year         = {2026},
   publisher    = {Zenodo},
-  version      = {v2},
-  doi          = {10.5281/zenodo.21877316},
-  url          = {https://doi.org/10.5281/zenodo.21877316}
+  version      = {v3},
+  doi          = {10.5281/zenodo.21918325},
+  url          = {https://doi.org/10.5281/zenodo.21918325}
 }
 ```
 

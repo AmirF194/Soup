@@ -247,6 +247,44 @@ def model_size_from_name(model_name: str) -> float:
     return 7.0  # default guess
 
 
+def cuda_supports_bf16() -> bool:
+    """Does the current CUDA device support bf16? Ampere (sm_80) and later.
+
+    A T4 (sm_75, Colab's free tier), a P100 (Kaggle), a V100, a GTX 16xx or an
+    RTX 20xx does not — and transformers does not degrade there, it refuses:
+    *"Your setup doesn't support bf16/gpu. You need Ampere+ GPU with
+    cuda>=11.0"* while building ``TrainingArguments``. Every trainer wrapper
+    used to spell this as ``bf16=self.device == "cuda"``, so every task died
+    before step 0 on that hardware (#387).
+
+    One function rather than a per-wrapper expression, and it asks the driver
+    rather than comparing a compute-capability number, so it cannot disagree
+    with :func:`get_compute_dtype` below.
+    """
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    except (ImportError, RuntimeError, AssertionError, OSError):
+        # The same narrow set ``sft._resolve_mixed_precision`` already catches —
+        # broad ``except Exception`` here would swallow a real CUDA error and
+        # silently downgrade a working card to fp16.
+        return False
+
+
+def bf16_fp16_flags(device: str) -> tuple[bool, bool]:
+    """``(bf16, fp16)`` for ``TrainingArguments`` on ``device``.
+
+    bf16 where the card has it, fp16 where it does not, neither on CPU. Cannot
+    regress a working setup: on a bf16-capable card the answer is what every
+    wrapper hardcoded, and on the rest the previous answer was a crash.
+    """
+    if not str(device).lower().startswith("cuda"):
+        return (False, False)
+    supported = cuda_supports_bf16()
+    return (supported, not supported)
+
+
 def get_compute_dtype():
     """Return the best compute dtype for the current device.
 

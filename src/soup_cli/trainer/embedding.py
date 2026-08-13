@@ -9,6 +9,7 @@ from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig, TrainingConfig
 from soup_cli.utils.gpu import (
+    bf16_fp16_flags,
     estimate_batch_size,
     model_size_from_name,
     resolve_device_map,
@@ -146,6 +147,7 @@ class EmbeddingTrainerWrapper:
         )
 
         # --- Training args ---
+        _bf16, _fp16 = bf16_fp16_flags(self.device)
         training_kwargs = {
             "output_dir": str(output_dir),
             "num_train_epochs": tcfg.epochs,
@@ -160,7 +162,8 @@ class EmbeddingTrainerWrapper:
             "logging_steps": tcfg.logging_steps,
             "save_steps": tcfg.save_steps,
             "save_total_limit": 3,
-            "bf16": self.device == "cuda",
+            "bf16": _bf16,
+            "fp16": _fp16,
             "report_to": self.report_to,
             "remove_unused_columns": False,
             "deepspeed": self.deepspeed_config,

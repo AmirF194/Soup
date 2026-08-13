@@ -34,6 +34,7 @@ from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
 from soup_cli.utils.gpu import (
+    bf16_fp16_flags,
     estimate_batch_size,
     model_size_from_name,
     resolve_device_map,
@@ -284,6 +285,7 @@ class OnlineDPOTrainerWrapper:
         )
         warmup_steps = int(total_steps * tcfg.warmup_ratio)
 
+        _bf16, _fp16 = bf16_fp16_flags(self.device)
         odpo_config = OnlineDPOConfig(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
@@ -298,7 +300,8 @@ class OnlineDPOTrainerWrapper:
             logging_steps=tcfg.logging_steps,
             save_steps=tcfg.save_steps,
             save_total_limit=3,
-            bf16=self.device == "cuda",
+            bf16=_bf16,
+            fp16=_fp16,
             report_to=self.report_to,
             **training_seed_kwargs(tcfg),
             beta=tcfg.dpo_beta,

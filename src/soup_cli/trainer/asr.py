@@ -30,6 +30,7 @@ from typing import Any
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig, TrainingConfig
+from soup_cli.utils.gpu import bf16_fp16_flags
 from soup_cli.utils.seeding import apply_training_seed, training_seed_kwargs
 
 console = Console()
@@ -323,14 +324,11 @@ class AsrTrainerWrapper:
         # Mixed precision by GPU capability — bf16=cuda was hardcoded, which
         # crashes on pre-Ampere cards (T4 / GTX 16xx) that lack bf16. Fall back
         # to fp16 there; fp32 on CPU.
-        use_bf16 = use_fp16 = False
-        if self.device == "cuda":
-            import torch
-
-            if torch.cuda.is_bf16_supported():
-                use_bf16 = True
-            else:
-                use_fp16 = True
+        #
+        # This wrapper solved it first and in place, and the other twelve kept
+        # the defect for another release (#387). The logic now lives in
+        # ``utils.gpu.bf16_fp16_flags`` so there is one answer to copy from.
+        use_bf16, use_fp16 = bf16_fp16_flags(self.device)
 
         args = Seq2SeqTrainingArguments(
             output_dir=str(output_dir),

@@ -12,6 +12,7 @@ from rich.console import Console
 from soup_cli.config.schema import SoupConfig
 from soup_cli.trainer.stream_setup import StreamingSetupMixin
 from soup_cli.utils.gpu import (
+    bf16_fp16_flags,
     estimate_batch_size,
     model_size_from_name,
     resolve_device_map,
@@ -795,10 +796,20 @@ class SFTTrainerWrapper(StreamingSetupMixin):
 
         - When ``tcfg.auto_mixed_precision`` is True: query GPU compute
           capability and call :func:`pick_mixed_precision` to decide.
-        - Otherwise: preserve legacy default (bf16 on CUDA, no fp16).
+        - Otherwise: bf16 on a CUDA card that supports it, fp16 on one that
+          does not.
+
+        The default used to be a flat ``bf16 on CUDA``, which is not a
+        preference on a pre-Ampere card but a hard stop: transformers raises
+        *"Your setup doesn't support bf16/gpu. You need Ampere+ GPU with
+        cuda>=11.0"* while building TrainingArguments, so every run on a T4 or
+        a P100 — Colab's and Kaggle's free tiers — died before step 0 whether
+        it streamed or not (found by the #385 live smoke). Asking the card
+        cannot regress a working setup: where bf16 is supported the answer is
+        unchanged, and where it is not the previous behaviour was a crash.
         """
         if not getattr(tcfg, "auto_mixed_precision", False):
-            return (self.device == "cuda", False)
+            return bf16_fp16_flags(self.device)
 
         if self.device != "cuda":
             return (False, False)

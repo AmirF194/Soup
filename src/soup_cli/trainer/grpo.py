@@ -12,6 +12,7 @@ from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig, TrainingConfig
 from soup_cli.utils.gpu import (
+    bf16_fp16_flags,
     estimate_batch_size,
     model_size_from_name,
     resolve_device_map,
@@ -211,7 +212,11 @@ class GRPOTrainerWrapper:
           regress this branch silently.
         - ``grpo_fp16=True`` (CUDA) → ``fp16=True, bf16=False`` (unsloth
           parity).
-        - Default CUDA → ``fp16=False, bf16=True`` (legacy v0.50.0 path).
+        - Default CUDA → bf16 when the card supports it, fp16 when it does
+          not. This branch used to be a flat ``bf16=True``, which transformers
+          refuses on a pre-Ampere card (T4 / P100 / V100 / GTX 16xx) — see
+          #387; ``grpo_fp16`` was the only way to run GRPO there and nothing
+          said so.
 
         ``auto_mixed_precision`` is mutually exclusive with ``grpo_fp16``
         (rejected at schema load via ``_validate_grpo_fp16_amp_exclusive``);
@@ -224,7 +229,8 @@ class GRPOTrainerWrapper:
         # access (no getattr fallback) so a typo would fail loudly.
         if self.config.training.grpo_fp16:
             return {"fp16": True, "bf16": False}
-        return {"fp16": False, "bf16": True}
+        bf16, fp16 = bf16_fp16_flags(self.device)
+        return {"fp16": fp16, "bf16": bf16}
 
     def setup(self, dataset: dict):
         """Load model, tokenizer, apply LoRA, create GRPO trainer."""

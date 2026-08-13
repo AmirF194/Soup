@@ -181,6 +181,36 @@ def dtype_bytes(name: str) -> int:
         ) from None
 
 
+def resolve_stream_dtype(device: str = "cuda") -> str:
+    """The store/compute dtype for a streamed run, chosen from the CARD.
+
+    Until v0.73.x this was the literal ``"bfloat16" if on_cuda else "float32"``
+    in ``trainer/stream_setup.py``, which is wrong on every pre-Ampere GPU:
+    Colab's free tier is a T4 (sm_75), Kaggle is a T4 or a P100, and V100 /
+    GTX 16xx / RTX 20xx all report ``is_bf16_supported() == False``. That is
+    most of the hardware this feature exists for, and it could not fail on the
+    Ampere card every published measurement was taken on (#385).
+
+    The capability question is delegated to ``utils.gpu.get_compute_dtype``
+    rather than answered again here — one question, one answer, or the two
+    drift. CPU stays float32: CPU streaming is a test convenience, and
+    half-precision CPU kernels are not uniformly available.
+
+    Correctness is unaffected by the choice. Streamed-vs-resident logits were
+    measured bit-exact (``0.000000e+00``) in float16 as well as bfloat16, in
+    both quantisations, against resident references of matching numerics.
+    """
+    if not str(device).lower().startswith("cuda"):
+        return "float32"
+
+    from soup_cli.utils.gpu import get_compute_dtype
+
+    name = str(get_compute_dtype()).removeprefix("torch.")
+    # get_compute_dtype already returns float32 when no CUDA runtime is present,
+    # so a "cuda" string on a CPU-only box does not claim a GPU dtype.
+    return name if name in SUPPORTED_STREAM_DTYPES else "float32"
+
+
 # ==========================================================================
 # architecture gate
 # ==========================================================================

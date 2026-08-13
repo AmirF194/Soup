@@ -87,6 +87,42 @@ reproducing 70+ versions of notes.
   `named_buffers()` carry the same segment and are deliberately not covered — the
   comparison that produced the false green was over parameter names.
 
+### Fixed
+
+- **bf16 was assumed on every CUDA card, so the entire free GPU tier failed (#385, #387).**
+  Fourteen places, and only the first was known: `trainer/stream_setup.py` chose the
+  layer-streaming store dtype with the literal `"bfloat16" if on_cuda else "float32"` (#385),
+  and then a live run found `SFTTrainerWrapper._resolve_mixed_precision` returning
+  `(device == "cuda", False)` as its default — and an audit found the same
+  `bf16=self.device == "cuda"` in **twelve more wrappers**: bco, classifier, distill, dpo,
+  embedding, ipo, kto, online_dpo, orpo, pretrain, reward_model, simpo (#387). So it was not
+  a streaming bug at all; **every task** died on that hardware.
+  The sharpest detail is that the codebase already knew: `trainer/asr.py` carries the comment
+  *"bf16=cuda was hardcoded, which crashes on pre-Ampere cards (T4 / GTX 16xx)"* and fixes it
+  — in that one wrapper, never propagated. All fourteen now take the answer from one place,
+  `utils/gpu.bf16_fp16_flags`, including ASR, whose private copy was folded in. bf16 needs
+  Ampere.
+  **Colab's free tier is a T4 (sm_75), Kaggle is a T4 or a P100, and V100 / GTX 16xx / RTX 20xx
+  are all pre-Ampere**, so on that hardware a streamed run streamed a dtype the card cannot
+  compute in, and *any* `soup train` — streamed or not — died before step 0 with
+  transformers' *"Your setup doesn't support bf16/gpu. You need Ampere+ GPU with cuda>=11.0"*.
+  Neither could fail on the maintainer's RTX 3050, which is Ampere; this is the same shape as
+  the four backends the H100 session found had never executed once.
+  **This cannot regress a working setup**: where bf16 is supported the answer is unchanged,
+  and where it is not the previous behaviour was a crash. A test SCANS every module in
+  `soup_cli/trainer/` rather than parametrising over a hand-written list — the list is what
+  hid the twelve — and the existing unit test for this line had to be rewritten because it
+  asserted the defect (`test_auto_flag_off_preserves_legacy` required bf16 on any CUDA device,
+  and passed in CI precisely because CI has no GPU and the old code never asked the driver).
+  Correctness of the alternative was measured before the change rather than assumed —
+  streamed-vs-resident logits are bit-exact at **0.000000e+00** in float16 as well as
+  bfloat16, in *both* quantisations, against resident references of matching numerics (an NF4
+  streamed run compared against a genuinely NF4 resident one, since comparing it against a
+  bf16 model would measure the dtype rather than the streaming), and the adapter is non-zero.
+  **Not yet verified on a pre-Ampere card**: that exactness was measured *using* fp16 on
+  Ampere, so it establishes the plumbing, not the Turing/Pascal kernels — the free-tier
+  notebook is the natural place to close that.
+
 ### Changed
 
 - **Retracted: "layer streaming is bound by host-to-device transfer, not by the GPU."**

@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
-from soup_cli.utils.gpu import resolve_device_map
+from soup_cli.utils.gpu import bf16_fp16_flags, resolve_device_map
 from soup_cli.utils.seeding import apply_training_seed, training_seed_kwargs
 
 if TYPE_CHECKING:
@@ -452,6 +452,7 @@ class DistillTrainerWrapper:
         )
         warmup_steps = int(total_steps * tcfg.warmup_ratio)
 
+        _bf16, _fp16 = bf16_fp16_flags(self.device)
         args = TrainingArguments(
             output_dir=str(output_dir),
             num_train_epochs=tcfg.epochs,
@@ -466,7 +467,8 @@ class DistillTrainerWrapper:
             logging_steps=tcfg.logging_steps,
             save_steps=tcfg.save_steps,
             save_total_limit=3,
-            bf16=self.device == "cuda",
+            bf16=_bf16,
+            fp16=_fp16,
             report_to=self.report_to,
             remove_unused_columns=False,
             deepspeed=self.deepspeed_config,

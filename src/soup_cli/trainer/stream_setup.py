@@ -151,6 +151,7 @@ class StreamingSetupMixin:
             estimate_stream_store_bytes,
             free_ram_bytes,
             render_stream_panel,
+            resolve_stream_dtype,
             stream_arch_of,
         )
         from soup_cli.utils.layer_stream_runtime import (
@@ -178,7 +179,11 @@ class StreamingSetupMixin:
         arch = stream_arch_of(model_config)
 
         on_cuda = str(self.device).startswith("cuda")
-        dtype = "bfloat16" if on_cuda else "float32"
+        # #385 — ASK THE CARD. bf16 needs Ampere, and a T4 (Colab free), a P100
+        # (Kaggle), a V100 or a GTX 16xx does not have it. Hardcoding bf16 here
+        # made the entire free tier unsupported without saying so, and could not
+        # fail on the Ampere card every published measurement came from.
+        dtype = resolve_stream_dtype(str(self.device))
 
         # v0.72.2 — NF4. The decoder linears ship as packed nibbles + per-block
         # absmax, so the RAM store is ~0.26x its bf16 size; embeddings, norms and

@@ -158,8 +158,8 @@ class StreamingSetupMixin:
             RamSource,
             build_meta_skeleton,
             build_streamed_model,
+            expandable_segments_status,
             extras_resident_bytes,
-            probe_expandable_segments,
             quantised_layer_suffixes,
         )
         from soup_cli.utils.spectrum_scan import resolve_model_weights
@@ -337,11 +337,12 @@ class StreamingSetupMixin:
             "[yellow]Layer streaming is BETA:[/] slower than resident training, "
             "but this model may not run resident on this card at all."
         )
-        if on_cuda and not probe_expandable_segments():
-            console.print(
-                "[dim]expandable_segments allocator hint is unavailable on this "
-                "platform (silently ignored on Windows) — not enabled[/]"
-            )
+        if on_cuda:
+            enabled, why_not = expandable_segments_status()
+            if not enabled:
+                console.print(
+                    f"[dim]expandable_segments allocator hint not enabled: {why_not}[/]"
+                )
 
         target_modules = tcfg.lora.target_modules
         if target_modules == "auto":

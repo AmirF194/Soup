@@ -961,24 +961,48 @@ def measure_gemm_tflops(
     return GemmCeiling(tflops=best, sm_clock_mhz=sm_clock_mhz(), size=size)
 
 
-def probe_expandable_segments() -> bool:
-    """Attempt ``expandable_segments:True`` (plan P7) and report whether it took.
+def expandable_segments_status() -> tuple[bool, str]:
+    """``(enabled, why_not)`` for the ``expandable_segments:True`` hint.
 
-    Windows silently ignores it — torch warns "expandable_segments not
-    supported on this platform" and carries on. Never claim it is active when
-    it is not.
+    Split out from :func:`probe_expandable_segments` because the caller used to
+    print "unavailable on this platform (silently ignored on Windows)" for every
+    False — and on a Colab T4, i.e. Linux, that sentence is simply untrue. There
+    the hint fails for a different reason: the allocator reads
+    ``PYTORCH_CUDA_ALLOC_CONF`` when the CUDA context is created, so once
+    anything has touched CUDA it is too late to set it. Reporting the wrong
+    cause is worse than reporting none, and this panel is the most-read output
+    the feature has.
     """
     if sys.platform.startswith("win"):
-        return False
+        return (False, "Windows ignores it — torch warns and carries on")
     try:
         import torch
     except ImportError:
-        return False
+        return (False, "torch is not importable")
     if not torch.cuda.is_available():
-        return False
-    if not torch.cuda.is_initialized():
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    return "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        return (False, "no CUDA device")
+    if torch.cuda.is_initialized():
+        already = "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if already:
+            return (True, "")
+        return (
+            False,
+            "CUDA was already initialised before Soup could set it — the "
+            "allocator reads PYTORCH_CUDA_ALLOC_CONF once, at context creation",
+        )
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return (True, "")
+    return (False, "PYTORCH_CUDA_ALLOC_CONF is set to something else")
+
+
+def probe_expandable_segments() -> bool:
+    """Attempt ``expandable_segments:True`` (plan P7) and report whether it took.
+
+    Never claim it is active when it is not; :func:`expandable_segments_status`
+    carries the reason.
+    """
+    return expandable_segments_status()[0]
 
 
 # ==========================================================================

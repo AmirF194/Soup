@@ -43,8 +43,18 @@ in-scope issues:
 - secret leakage in logs, crash bundles, or generated artifacts;
 - sandbox escape in the RLVR code-execution reward path.
 
-Out of scope: vulnerabilities in third-party model weights or datasets you
-choose to load, and issues that require an already-compromised host.
+Out of scope:
+
+- vulnerabilities in third-party model weights or datasets you choose to load;
+- issues that require an already-compromised host;
+- DNS and email configuration of `trysoup.dev` — a missing or permissive
+  DMARC / SPF / DKIM record, and anything else established by a public DNS
+  query. These are worth fixing and we do fix them, but they are not findings
+  in Soup and they are not eligible for anything.
+
+**There is no bug bounty and no monetary reward.** We credit reporters by name
+in the release notes, which is the whole of what we offer. Reports that open
+with a request for payment get this paragraph as the reply.
 
 ## Disclosure
 

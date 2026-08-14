@@ -183,6 +183,7 @@ soup push --model ./out --repo you/m --card <registry-id>  Upload that registry-
 soup ci init [--data d.jsonl --suite s.yaml --evidence ev.json] [--config soup.yaml] [--branch main --python 3.11] [--force]  Write .github/workflows/soup-gate.yml: data validate -> expect -> ship gate on every PR (v0.71.35); --config binds the gate to a committed config so it refuses stale evidence (v0.71.39)
 soup mcp serve                                MCP server over stdio (drive Soup from Claude Code / Cursor / Cline; requires [mcp] extra) (v0.71.28)
 soup mcp serve --allow-mutating               Also expose plan-only train_start / export tools (never execute) (v0.71.28)
+soup mcp serve --allow-execute                Implies --allow-mutating; reserves the future execution gate (still never executes) (v0.71.28)
 soup shrink --model <id|path> --drop-ratio 0.25 --calib c.jsonl -o shrunk  Depth-prune least-important layer block + SHIP/DON'T-SHIP ppl verdict (exit 0/2/1) (v0.71.29)
 soup shrink ... --drop-layers N --heal h.jsonl --heal-steps 200 --device cpu  Drop N layers + distill-heal (fuse LoRA back to one dense model)
 soup shrink ... --tolerance 0.10 --plan-only [--attach-to-registry <id>]  Ppl-regression tolerance / print importance table only / registry attach
@@ -346,6 +347,10 @@ The server exposes 14 read-only tools — `advise`, `data_inspect`,
 mutating tools (`train_start`, `export`) are gated behind `--allow-mutating`
 (`"args": ["mcp", "serve", "--allow-mutating"]`); even then they only render the
 exact command that would run — they never execute training or export.
+
+`--allow-execute` implies `--allow-mutating` and is threaded through the server
+as a separate future execution gate, but it does not enable execution yet:
+these tools remain plan-only in this release.
 
 **Security:** stdio only (no network listener); every path argument stays under
 the working directory and rejects symlinks; tool output is control-char

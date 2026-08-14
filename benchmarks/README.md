@@ -20,6 +20,7 @@ They are the evidence behind the preprint:
 | [`gate-v0.72.3-breadth.md`](gate-v0.72.3-breadth.md) | Nine architectures, batching, accumulation, resume, disk tier | Peak-VRAM predictor at 0.85% worst-case error; accumulation is per-token I/O-neutral |
 | [`gate-v0.72.4-preference-losses.md`](gate-v0.72.4-preference-losses.md) | DPO / ORPO / SimPO / KTO over the streaming engine | DPO's reference model costs no extra weights — 0.914x the SFT peak, against +730.44 MB for a real second instance |
 | [`probe-v0.73.0-what-bounds-streaming.md`](probe-v0.73.0-what-bounds-streaming.md) | What the streamed step is actually bound by, and Cut Cross-Entropy on top of it | **Not** transfer-bound: 71.3% of the card's same-session GEMM ceiling, and deleting every host-to-device byte buys 1.4%. CCE triples the usable microbatch for +9.6% |
+| [`run-t4-colab-free-tier.md`](run-t4-colab-free-tier.md) | Not a gate — one completed run on hardware the maintainer does not own | An 8B NF4 streamed run finishes on a free-tier Colab **T4 (sm_75, Turing)** inside a 4.00 GB process cap, peak **2.91 GB** against a predicted 3.02 (the estimator over-predicts by 3.8%, the safe direction). **No throughput is quoted** — a capped card is not a benchmark — and gradient exactness on Turing is *not* shown |
 | [`gate-h100-validation.md`](gate-h100-validation.md) |  The method on someone else's hardware: bit-exactness at real sizes, convergence quality, DeepSpeed, variance | **Forward** bit-exact to 72B; **backward** bit-exact to 14B NF4 pre-repair, re-gated after the STEP 14 fix at 32B (256/256) **and at 72B (320/320, the size where the defect was worst)**; 2.93x DeepSpeed ZeRO-3 offload in 9.7x less VRAM; and the silent wrong-gradient defect that fix repairs. **Carries three dated 2026-08-13 corrections**: it explains the H100 replication as host-to-device transfer, which the probe record above later measured and refuted. The original lines are left standing with the correction beside them |
 
 ## Harnesses
@@ -47,6 +48,12 @@ Every number in the four `gate-v0.72.*` records was measured on one machine:
 stack. It is the first record from hardware other than the laptop, and the first
 able to hold a *resident* reference for an 8B–72B model — which is what turns
 "bit-exact on a 3-layer toy" into "bit-exact on real models".
+
+`run-t4-colab-free-tier.md` is the second exception and a much weaker one: a free
+Colab **Tesla T4 (sm_75, Turing)**, one run, no repeats, no captured
+correctness comparison, on a session that cannot be returned to. It is filed here
+because it is the only evidence that the streaming path executes at all on a
+pre-Ampere card, not because it gates anything.
 
 Windows/WDDM matters for reading these: it spills into shared host memory rather
 than raising `CUDA out of memory`, so a run completing is not evidence that its

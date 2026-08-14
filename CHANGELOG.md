@@ -186,6 +186,40 @@ reproducing 70+ versions of notes.
   whose whole premise is publishing the record as written, a silent deletion costs more
   credibility than the error does.
 
+### Validation (measured, not changed)
+
+- **Layer streaming completed a run on hardware the maintainer does not own: a free-tier
+  Colab Tesla T4 (sm_75, Turing), via [`notebooks/proof-4gb.ipynb`](notebooks/proof-4gb.ipynb).**
+  Every streaming number this project has published came from one RTX 3050 Laptop or one
+  borrowed 8×H100, and the pre-Ampere fix above (#385, #387) had been verified *using* fp16
+  on an Ampere card, which establishes the plumbing and not the Turing kernels. This closes
+  that specific gap and nothing wider. `NousResearch/Meta-Llama-3.1-8B-Instruct`, NF4,
+  `stream_layers: true`, `stream_buffers: 2`, batch 1, `max_length: 256`, LoRA r=8/α=16,
+  fp16 (a T4 has no bf16 units): 7 steps, exit 0, adapter written with **128 tensors, 128 of
+  them non-zero**, and a **measured peak of 2.91 GB** against the pre-flight's predicted
+  ~3.02 GB — an over-prediction of **3.8%**, which is the direction the estimator was fitted
+  to err in (v0.72.3 fitted it to never under-predict) and is the whole reason it is allowed
+  to stop a run. The card has 15.6 GB, so the run was constrained artificially with
+  `torch.cuda.set_per_process_memory_fraction` to **4.00 GB**, and the cap was shown to bite
+  rather than assumed: a deliberate 4.29 GiB allocation was refused. That artificial cap is
+  also the reason **no throughput figure is quoted from this run, here or in the notebook** —
+  a capped card is not a benchmark, and the panel's own forecast (31–46 tok/s from 2.20 TFLOPS
+  measured at 1185 MHz) is a compute bound, not a measurement of what the run did.
+  Two things the run did **not** establish, stated because the temptation is to let the exit
+  code cover them. **Backward/gradient exactness at 8B on Turing is not shown** — a non-zero
+  adapter proves gradients flowed, not that they were right, and the streamed-vs-resident
+  comparison in the notebook's section 4 produced **no captured output**, so it is recorded as
+  unrun rather than as a pass. And the loss moving 4.5266 → 4.0674 over 7 steps, non-monotonically
+  (4.5266, 4.2388, 3.7485, 4.6930, 4.1940, 4.1127, 4.0674), is reported because it is what the
+  run printed; over seven steps it is not evidence of learning.
+  One observation worth carrying forward: the pre-flight panel reported **free VRAM 15.10 GB**,
+  i.e. it read the device and not the per-process cap the run was actually held to, so the fit
+  decision was taken against a number 3.8× larger than the budget in force. The run fit on its
+  own merits (2.91 GB against 4.00 GB), so nothing was protected by luck — but on that hardware
+  the pre-flight is not what would have caught an over-budget config, which is exactly the case
+  `training.stream_vram_override` (#347, above) exists for. Record:
+  `benchmarks/run-t4-colab-free-tier.md`.
+
 ## [0.73.0] - 2026-08-09
 
 **The release that came out of three days on somebody else's hardware.**

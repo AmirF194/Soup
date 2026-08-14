@@ -12,23 +12,6 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
-### Fixed
-
-- **The MLX `adapter_config.json` shipped `target_modules` unresolved, so a default
-  MLX adapter loaded as a silent no-op (#392).** `_apply_lora` resolved
-  `target_modules: auto` into a local variable and trained the resolved modules; the
-  writer serialised the raw config value, so the shipped file carried
-  `{"keys": ["auto"]}`. On load, `linear_to_lora_layers` matches no module against that
-  and `load_weights(strict=False)` drops every LoRA tensor without a word — generation
-  with the adapter is bit-identical to the base model. `"auto"` is the schema default,
-  so this was every MLX run that did not name its modules by hand, and the file exists
-  precisely to promise the output dir loads with
-  `mlx_lm.load(..., adapter_path=...)`. Both callers now go through one
-  `resolve_mlx_target_keys()`, because two copies of "which modules did we train?" is
-  how they drifted. Reported with a root cause and a control by
-  [@armanbot-jpg](https://github.com/armanbot-jpg): hand-editing `keys` in the saved
-  file makes the very same `adapters.safetensors` produce the tuned behaviour.
-
 ## [0.73.1] - 2026-08-14
 
 ### Added
@@ -80,6 +63,21 @@ reproducing 70+ versions of notes.
   it.
 
 ### Fixed
+
+- **The MLX `adapter_config.json` shipped `target_modules` unresolved, so a default
+  MLX adapter loaded as a silent no-op (#392).** `_apply_lora` resolved
+  `target_modules: auto` into a local variable and trained the resolved modules; the
+  writer serialised the raw config value, so the shipped file carried
+  `{"keys": ["auto"]}`. On load, `linear_to_lora_layers` matches no module against that
+  and `load_weights(strict=False)` drops every LoRA tensor without a word — generation
+  with the adapter is bit-identical to the base model. `"auto"` is the schema default,
+  so this was every MLX run that did not name its modules by hand, and the file exists
+  precisely to promise the output dir loads with
+  `mlx_lm.load(..., adapter_path=...)`. Both callers now go through one
+  `resolve_mlx_target_keys()`, because two copies of "which modules did we train?" is
+  how they drifted. Reported with a root cause and a control by
+  [@armanbot-jpg](https://github.com/armanbot-jpg): hand-editing `keys` in the saved
+  file makes the very same `adapters.safetensors` produce the tuned behaviour.
 
 - **`training.batch_size` accepted 0 and negative values.** `Union[int, Literal["auto"]]`
   carried no lower bound, so `batch_size: -4` loaded and then meant whatever each

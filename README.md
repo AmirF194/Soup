@@ -466,7 +466,8 @@ published**, which is also the shortest way to describe what the paper is for:
 - **Trained-model quality, measured for the first time**, and indistinguishable from a resident run.
 - **A comparison against DeepSpeed** — including the result that does not flatter us: eight cards
   of ZeRO-3 are slower than one card training resident.
-- **The limitations section rewritten**: four of v1's closed, seven new ones added.
+- **The limitations section rewritten**: of v1's ten items, one closed and four more narrowed,
+  and seven new ones added.
 
 Cite the version you used. `10.5281/zenodo.21771064` is the concept DOI and always resolves to
 the latest version (v3 today); v1 and v2 remain citable at their own version DOIs and are not

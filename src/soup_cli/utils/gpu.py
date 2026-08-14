@@ -251,11 +251,19 @@ def cuda_supports_bf16() -> bool:
     """Does the current CUDA device support bf16? Ampere (sm_80) and later.
 
     A T4 (sm_75, Colab's free tier), a P100 (Kaggle), a V100, a GTX 16xx or an
-    RTX 20xx does not — and transformers does not degrade there, it refuses:
-    *"Your setup doesn't support bf16/gpu. You need Ampere+ GPU with
-    cuda>=11.0"* while building ``TrainingArguments``. Every trainer wrapper
-    used to spell this as ``bf16=self.device == "cuda"``, so every task died
-    before step 0 on that hardware (#387).
+    RTX 20xx does not. Every trainer wrapper used to spell this as
+    ``bf16=self.device == "cuda"``, so all fourteen of them asked for a dtype
+    the card has no units for (#385, #387).
+
+    This docstring used to say that transformers refuses outright on that
+    hardware, quoting *"Your setup doesn't support bf16/gpu. You need Ampere+
+    GPU with cuda>=11.0"*, and that every task therefore died before step 0.
+    **That was wrong and is retracted in the CHANGELOG**: the error had been
+    produced by a local stub forcing ``is_bf16_supported()`` to False, while
+    transformers gates on the same permissive call described below, which a T4
+    answers True to. So on the current stack nothing raised; the run simply
+    proceeded in an emulated dtype. Established by running it on a real T4
+    rather than by reasoning about one.
 
     One function rather than a per-wrapper expression, and it asks the driver
     rather than comparing a compute-capability number, so it cannot disagree

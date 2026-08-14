@@ -117,6 +117,17 @@ reproducing 70+ versions of notes.
 
 ### Fixed
 
+- **A hosted notebook's preinstalled `torchao` made `get_peft_model` raise, and it read as a
+  Soup bug (#389).** `peft`'s `is_torchao_available()` does not return False on a version it
+  considers too old, it **raises `ImportError`** — nine frames inside `get_peft_model`, with
+  nothing near the top of the traceback naming `torchao`. Colab preinstalls `torchao` 0.10.0
+  against a `peft` that demands newer, so the first `soup train` on a free notebook died in a
+  place unrelated to anything the user had configured. Now mapped in `utils/errors.py` to the
+  cause and the one-line fix (`pip uninstall -y torchao`), with the part worth saying out
+  loud: Soup does not need `torchao` at all unless `training.quantization_aware` is set.
+  Found by running `notebooks/proof-4gb.ipynb` on a real free-tier session, which is the same
+  place #385's first repair was caught being a no-op.
+
 - **bf16 was assumed on every CUDA card, so the entire free GPU tier failed (#385, #387).**
   Fourteen places, and only the first was known: `trainer/stream_setup.py` chose the
   layer-streaming store dtype with the literal `"bfloat16" if on_cuda else "float32"` (#385),

@@ -12,6 +12,63 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.73.1] - 2026-08-14
+
+### Added
+
+- **`training.stream_vram_probe` decides the layer-streaming VRAM pre-flight on a
+  MEASUREMENT instead of the fitted formula (#349).** The pre-flight predicts peak
+  VRAM from a formula fitted to 10 real runs, and its documented contract is that it
+  never under-predicts. Measured through the real `soup train` on an RTX 3050 Laptop
+  (4 GB, Windows, torch 2.5.1) with SmolLM2-135M streamed in bf16 at batch 1, that
+  contract holds at short sequence and then fails:
+
+  | seq | predicted | real peak | ratio |
+  |---|---|---|---|
+  | 4352 | 3.282 GB | 3.036 GB | 1.081x — over-predicts, safe |
+  | 5120 | 3.844 GB | 4.118 GB | **0.934x — under-predicts** |
+  | 6144 | 4.590 GB | 5.830 GB | **0.787x — under by 21%** |
+
+  Under-prediction is the direction that does not announce itself: an OOM on Linux,
+  and on Windows/WDDM a silent spill to host memory. The existing grid could not
+  have caught it — all ten of its rows are at seq 256 or 512, so it varies batch and
+  says nothing about sequence length, and `test_never_under_predicts` has been
+  narrowed to state that scope rather than imply a global guarantee.
+
+  With the flag on, one real forward+backward runs at the configured shape after the
+  streamed model is built and its peak decides; the prediction is printed beside it
+  so a divergence is visible. Measured cost: **1.0-5.3 s** (SmolLM2-135M at 1x1024
+  and 2x2048; Llama-3.1-8B NF4 at 1x512), against a training run of minutes to hours.
+  Off by default — it costs a step, and it can refuse a run the formula accepts.
+
+  Scope is deliberately narrow. **`task: sft` only**: the probe runs a plain causal-LM
+  step, which *is* the SFT step but is not a preference loss, so its agreement with one
+  is not established. Measured at a single matching shape it is conservative there too
+  (6.02 GB against a real DPO step's 5.30 GB, +13.5%) — but one point is not a
+  validation, and a sign flip would mean a gate waving through over-budget runs. It also **cannot overrule a
+  prediction more than 4x over budget**: the largest disagreement ever measured is 21%,
+  so beyond a small multiple the config is simply too big and is refused by arithmetic
+  without touching the GPU. The gate reads `max_memory_allocated`, not
+  `max_memory_reserved` — reserved runs 1.08-1.41x allocated and overshoots what has to
+  fit, and gating on it would refuse this feature's own flagship configuration
+  (Llama-3.1-8B NF4, 3.70 GB reserved against 3.45 GB free, which runs).
+
+  Two readings were tried during this work and **withdrawn as unsupported**, recorded
+  because the tempting inference was wrong twice in one investigation: that preference
+  losses are over-budgeted ~8.8x (it is 1.15x at the budgeted shape — the earlier figure
+  came from rows that realised 142 of a budgeted 2048 tokens), and that the over-budget
+  runs were silently spilling (`num_alloc_retries` was 0 on every shape measured). The
+  mechanism behind the long-sequence divergence is likewise **not claimed**: `seq**2`
+  from the attention score matrix is the obvious candidate and the numbers do not settle
+  it.
+
+### Fixed
+
+- **`training.batch_size` accepted 0 and negative values.** `Union[int, Literal["auto"]]`
+  carried no lower bound, so `batch_size: -4` loaded and then meant whatever each
+  trainer's arithmetic did with it — including the streaming VRAM pre-flight, which
+  multiplies by it. Now rejected at config load. Surfaced by the #349 security review.
+
 ### Fixed
 
 - **Layer streaming's VRAM pre-flight now actually calls its own calibration hook (#348).**
@@ -2640,5 +2697,6 @@ what a fine-tune forgets and leaks.
   `SECURITY.md` (~220 KB). `SECURITY.md` is now a concise security policy; the
   detailed hardening notes remain in git history and the GitHub Releases notes.
 
-[Unreleased]: https://github.com/MakazhanAlpamys/Soup/compare/v0.71.0...HEAD
+[Unreleased]: https://github.com/MakazhanAlpamys/Soup/compare/v0.73.1...HEAD
+[0.73.1]: https://github.com/MakazhanAlpamys/Soup/compare/v0.73.0...v0.73.1
 [0.71.0]: https://github.com/MakazhanAlpamys/Soup/compare/v0.70.0...v0.71.0

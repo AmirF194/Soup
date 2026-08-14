@@ -46,11 +46,18 @@ def test_torchao_version_error_is_mapped_to_actionable_fix():
 def test_torchao_version_error_mapping_does_not_import_torchao_or_peft():
     """The mapping is a pure string match — it must not import torchao/peft
     to decide, since the whole point is deciding without triggering the
-    version probe that raised in the first place."""
+    version probe that raised in the first place.
+
+    Asserted as "imports NOTHING NEW", not as "peft is absent from
+    sys.modules". The first version of this test asserted absence and passed
+    when the file was run alone, then failed the moment the full suite ran it
+    after anything that imports peft — which is most of this repo. What the
+    mapping must not do is trigger the import itself; whether some earlier test
+    already did is none of its business.
+    """
     import sys
 
-    assert "torchao" not in sys.modules
-    assert "peft" not in sys.modules
+    before = set(sys.modules)
 
     buf = StringIO()
     test_console = Console(file=buf, stderr=False)
@@ -58,8 +65,9 @@ def test_torchao_version_error_mapping_does_not_import_torchao_or_peft():
         exc = ImportError(_REAL_PEFT_TORCHAO_MESSAGE)
         format_friendly_error(exc, verbose=False)
 
-    assert "torchao" not in sys.modules
-    assert "peft" not in sys.modules
+    newly_imported = set(sys.modules) - before
+    offenders = {m for m in newly_imported if m.split(".")[0] in {"torchao", "peft"}}
+    assert not offenders, f"the mapping imported {offenders} to decide"
 
 
 def test_unrelated_import_error_is_not_rewritten_as_torchao():

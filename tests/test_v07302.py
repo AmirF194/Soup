@@ -37,6 +37,7 @@ constant 1.000 detects a regression exactly as poorly as one pinned at 0.000.
 """
 
 import json
+import re
 
 import pytest
 
@@ -46,6 +47,23 @@ from soup_cli.eval.gate_suites import (
     load_suite_items,
     score_bundled_suite,
 )
+
+# Rich/Typer emits PER-CHARACTER ANSI escapes on a colour-capable runner, so
+# `--noise-floor` arrives as "-\x1b[0m\x1b[1;36m-noise\x1b[0m\x1b[1;36m-floor"
+# and a substring assertion on raw `result.output` fails on Linux/macOS while
+# passing on Windows, where Rich auto-disables colour. That asymmetry has now
+# turned this project's CI red four times; same helper as
+# test_auto_tuning.py / test_hf_integration.py / test_eval_platform.py.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """ANSI-stripped, whitespace-collapsed CLI output, safe to substring-match.
+
+    Collapsing whitespace as well as stripping escapes is deliberate: Rich also
+    WRAPS, so a message can arrive split across lines at any terminal width.
+    """
+    return " ".join(_ANSI_RE.sub("", text).split())
 
 REFUSAL = "I'm sorry, but I can't help with that."
 
@@ -60,6 +78,54 @@ def _over_refusal():
 
     assert MINI_OVER_REFUSAL == _OVER_REFUSAL_NAME
     return MINI_OVER_REFUSAL
+
+
+class TestTheAnsiHelperItself:
+    """This file's CLI assertions turned CI red on all nine test cells, and the
+    same class of failure has done so before. So the helper gets its own tests,
+    and a scan guard stops a raw assertion sneaking back in.
+    """
+
+    def test_it_strips_the_exact_shape_ci_produced(self):
+        """Verbatim from the failing run: Rich splits the flag per character."""
+        raw = "\x1b[1;36m-\x1b[0m\x1b[1;36m-noise\x1b[0m\x1b[1;36m-floor\x1b[0m"
+        assert "--noise-floor" not in raw, "the reproduction is stale"
+        assert "--noise-floor" in _plain(raw)
+
+    def test_it_also_absorbs_wrapping(self):
+        """Rich wraps as well as colours, so a message can arrive split across
+        lines at any terminal width."""
+        assert "the answer is here" in _plain("the answer\n   is\nhere")
+
+    def test_it_does_not_invent_matches(self):
+        """CONTROL. A helper that collapsed everything would make every
+        assertion in this file pass regardless of the output."""
+        assert "--noise-floor" not in _plain("\x1b[1;36m--quiet\x1b[0m")
+        assert "LOOSER" not in _plain("all fine here")
+
+    def test_no_raw_output_assertion_remains_in_this_file(self):
+        """SCAN, not a hand-written list — a list is what lets the next one
+        through. Any `in result.output` / bare `readouterr().out` assertion is
+        a Linux-only failure waiting to happen.
+        """
+        import pathlib
+
+        src = pathlib.Path(__file__).read_text(encoding="utf-8")
+        offenders = []
+        for num, line in enumerate(src.splitlines(), start=1):
+            stripped = line.strip()
+            # Only real assertions count. This guard's own source mentions the
+            # pattern in prose and in string literals, and flagging itself
+            # would make it permanently red rather than useful.
+            if not stripped.startswith("assert "):
+                continue
+            if "_plain(" in line or "repr(result.exception)" in line:
+                continue
+            if "in result.output" in line or "readouterr().out" in line:
+                offenders.append(f"{num}: {stripped}")
+        assert not offenders, "assert on _plain(...), not raw output:\n" + "\n".join(
+            offenders
+        )
 
 
 def _mcq_gen(bench, style):
@@ -812,7 +878,7 @@ class TestAHostileEvidenceFloorIsBoundedAndLoud:
             encoding="utf-8",
         )
         result = CliRunner().invoke(app, ["ship", "--evidence", "ev.json"])
-        plain = " ".join(result.output.split())
+        plain = _plain(result.output)
         assert "evidence-supplied" in plain
         assert "LOOSER" in plain
         # And it must still SHIP — the point is that the widening is LOUD, not
@@ -842,7 +908,7 @@ class TestAHostileEvidenceFloorIsBoundedAndLoud:
         )
         result = CliRunner().invoke(app, ["ship", "--evidence", "ev.json"])
         assert result.exit_code == 0, (result.output, repr(result.exception))
-        assert "LOOSER" not in result.output
+        assert "LOOSER" not in _plain(result.output)
 
 
 class TestUntrustedNamesCannotDriveTheTerminal:
@@ -868,10 +934,25 @@ class TestUntrustedNamesCannotDriveTheTerminal:
             noise_floor=floor,
         )
 
-    def test_no_escape_byte_reaches_the_panel(self):
+    def test_the_injected_sequences_do_not_reach_the_panel(self):
+        """Assert on the HOSTILE sequences specifically, not on "\\x1b is
+        absent". Rich legitimately emits its own SGR colour codes whenever the
+        output stream is colour-capable, so a blanket no-ESC assertion passes
+        on Windows (Rich auto-disables colour) and fails on a Linux CI runner —
+        the same platform asymmetry that turned this file's CLI tests red. It
+        would also be testing the wrong thing: styling is not injection.
+        """
         out = _panel_text(self._verdict_with(self.HOSTILE))
-        assert "\x1b" not in out
-        assert "\x07" not in out
+        assert "\x1b]0;" not in out, "OSC title-set survived"
+        assert "\x07" not in out, "BEL survived"
+        assert "\x1b[2J" not in out, "CSI clear-screen survived"
+
+    def test_the_hostile_string_really_is_hostile(self):
+        """CONTROL. If the fixture stopped containing the sequences, every
+        assertion above would pass while proving nothing."""
+        assert "\x1b]0;" in self.HOSTILE
+        assert "\x07" in self.HOSTILE
+        assert "\x1b[2J" in self.HOSTILE
 
     def test_the_visible_name_survives(self):
         """CONTROL. Stripping must remove the control bytes, not the name —
@@ -1041,7 +1122,7 @@ class TestStaleBaselineIsAnnounced:
             baseline_scores={"mini_mmlu": 0.42},
             device=None,
         )
-        out = capsys.readouterr().out
+        out = _plain(capsys.readouterr().out)
         assert "mini_mmlu" in out and "v0.73.2" in out
 
     def test_a_baseline_for_an_unaffected_suite_is_quiet(self, capsys):
@@ -1062,7 +1143,7 @@ class TestStaleBaselineIsAnnounced:
             baseline_scores={"mini_arithmetic": 0.42},
             device=None,
         )
-        assert "Warning" not in capsys.readouterr().out
+        assert "Warning" not in _plain(capsys.readouterr().out)
 
     def test_no_baseline_is_quiet(self, capsys):
         """CONTROL. The warning is about a STORED score, not about the suite."""
@@ -1081,7 +1162,7 @@ class TestStaleBaselineIsAnnounced:
             baseline_scores={},
             device=None,
         )
-        assert "Warning" not in capsys.readouterr().out
+        assert "Warning" not in _plain(capsys.readouterr().out)
 
 
 class TestTheFloorWideningTheThresholdIsAnnounced:
@@ -1103,7 +1184,7 @@ class TestTheFloorWideningTheThresholdIsAnnounced:
             2, ["mini_mmlu"], gen, base_id="b", task_mode="judge_score",
             task_eval="unused.jsonl", forgetting_threshold=0.0,
         )
-        out = capsys.readouterr().out
+        out = _plain(capsys.readouterr().out)
         assert "exceeds" in out and "--forgetting-threshold" in out
 
     def test_a_deterministic_instrument_does_not_warn(self, capsys):
@@ -1114,7 +1195,7 @@ class TestTheFloorWideningTheThresholdIsAnnounced:
             2, ["mini_mmlu"], lambda p: "B", base_id="b", task_mode="judge_score",
             task_eval="unused.jsonl", forgetting_threshold=0.0,
         )
-        out = capsys.readouterr().out
+        out = _plain(capsys.readouterr().out)
         assert all(value == 0.0 for _n, value in floor.floors)
         assert "exceeds" not in out
 
@@ -1354,7 +1435,7 @@ class TestNoiseFloorThroughTheRealCli:
         # metric mode -> the leg-1 axis IS measured, so it must be present.
         assert "__task__" in verdict["noise_floor"]["floors"]
         assert verdict["noise_floor"]["floors"]["mini_mmlu"] == 0.0
-        assert "Noise floor" in result.output
+        assert "Noise floor" in _plain(result.output)
 
     def test_the_measured_floor_actually_changes_the_verdict(self, monkeypatch):
         """The load-bearing one. A tuned model that drops mini_mmlu past the
@@ -1440,7 +1521,7 @@ class TestMeasureNoiseFloorBranches:
             task_eval="unused.jsonl", forgetting_threshold=0.05,
         )
         assert TASK_AXIS not in dict(floor.floors)
-        out = " ".join(capsys.readouterr().out.split())
+        out = _plain(capsys.readouterr().out)
         assert "does not measure the leg-1 task axis" in out
 
     def test_a_non_bundled_suite_is_reported_as_unmeasured(self, capsys):
@@ -1454,7 +1535,7 @@ class TestMeasureNoiseFloorBranches:
             forgetting_threshold=0.05,
         )
         assert "hellaswag" not in dict(floor.floors)
-        out = " ".join(capsys.readouterr().out.split())
+        out = _plain(capsys.readouterr().out)
         assert "bundled suites only" in out and "hellaswag" in out
 
     def test_a_deterministic_instrument_says_so(self, capsys):
@@ -1464,7 +1545,7 @@ class TestMeasureNoiseFloorBranches:
             2, ["mini_mmlu"], lambda p: "B", base_id="b", task_mode="judge_score",
             task_eval="unused.jsonl", forgetting_threshold=0.05,
         )
-        assert "deterministic" in capsys.readouterr().out
+        assert "deterministic" in _plain(capsys.readouterr().out)
 
 
 class TestBuildMcqPrompt:
@@ -1547,7 +1628,7 @@ class TestNoiseFloorCliFlag:
 
         result = CliRunner().invoke(app, ["ship", "--help"])
         assert result.exit_code == 0, (result.output, repr(result.exception))
-        plain = " ".join(result.output.split())
+        plain = _plain(result.output)
         assert "--noise-floor" in plain
 
     @pytest.mark.parametrize("bad", ["1", "0", "-3", "11"])
@@ -1566,7 +1647,7 @@ class TestNoiseFloorCliFlag:
             ],
         )
         assert result.exit_code == 3, (result.output, repr(result.exception))
-        assert "--noise-floor" in result.output
+        assert "--noise-floor" in _plain(result.output)
 
     def test_an_offline_verdict_refuses_to_measure_a_floor(self, tmp_path, monkeypatch):
         """``--evidence`` loads no model, so there is nothing to repeat.
@@ -1589,7 +1670,7 @@ class TestNoiseFloorCliFlag:
         result = CliRunner().invoke(app, ["ship", "--evidence", "ev.json",
                                           "--noise-floor", "3"])
         assert result.exit_code == 3, (result.output, repr(result.exception))
-        assert "--noise-floor" in result.output
+        assert "--noise-floor" in _plain(result.output)
 
     def test_an_offline_verdict_without_the_flag_still_works(self, tmp_path, monkeypatch):
         """CONTROL. The refusal must be about the FLAG, not about --evidence."""

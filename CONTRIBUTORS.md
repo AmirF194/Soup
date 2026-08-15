@@ -68,6 +68,7 @@ Listed by first contribution. PR numbers link the work.
   - The VRAM pre-flight never called its own calibration hook, so the guard against a stack whose loss path under-budgets by 12.5% sat inert with no caller ([#390](https://github.com/MakazhanAlpamys/Soup/pull/390))
 - **Ben Younes** ([@ousamabenyounes](https://github.com/ousamabenyounes))
   - `MitigationLogWriter` dropped every record in silence once its parent directory vanished mid-run — the controller kept acting while its evidence stopped growing ([#398](https://github.com/MakazhanAlpamys/Soup/pull/398))
+  - `soup draft distill --steps N` delivered only ~N/4.44 optimiser steps — `val_split` and `gradient_accumulation_steps` both divide the budget, and the epoch arithmetic ignored them ([#399](https://github.com/MakazhanAlpamys/Soup/pull/399))
 
 ---
 

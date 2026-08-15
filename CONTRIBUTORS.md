@@ -66,6 +66,8 @@ Listed by first contribution. PR numbers link the work.
   - A streamed model's `named_parameters()` carried the wrapper's `.inner.` segment, so a name-keyed comparison against a resident model shared no names at all and a correctness gate reported `0/0` as a pass ([#384](https://github.com/MakazhanAlpamys/Soup/pull/384))
   - `training.stream_vram_override` — the layer-streaming pre-flight measured free VRAM with a device-level driver query, so it could not see a per-process cap and there was no way to make it simulate one ([#386](https://github.com/MakazhanAlpamys/Soup/pull/386))
   - The VRAM pre-flight never called its own calibration hook, so the guard against a stack whose loss path under-budgets by 12.5% sat inert with no caller ([#390](https://github.com/MakazhanAlpamys/Soup/pull/390))
+- **Ben Younes** ([@ousamabenyounes](https://github.com/ousamabenyounes))
+  - `MitigationLogWriter` dropped every record in silence once its parent directory vanished mid-run — the controller kept acting while its evidence stopped growing ([#398](https://github.com/MakazhanAlpamys/Soup/pull/398))
 
 ---
 

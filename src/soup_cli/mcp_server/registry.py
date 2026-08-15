@@ -15,11 +15,18 @@ import csv
 import json
 import os
 import shlex
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
-from soup_cli.utils.paths import enforce_under_cwd_and_no_symlink
+from soup_cli.mcp_server.execution import (
+    ExecutionError,
+    ExecutionManager,
+    ProtectedFile,
+    digest_file,
+)
+from soup_cli.utils.paths import enforce_under_cwd_and_no_symlink, is_under_cwd
 
 if TYPE_CHECKING:
     from soup_cli.config.schema import SoupConfig
@@ -64,6 +71,7 @@ class ToolSpec:
     input_schema: dict
     handler: Callable[[dict], dict]
     mutating: bool = False
+    annotations: dict | None = None
 
 
 def _sanitize(obj: Any) -> Any:
@@ -595,20 +603,84 @@ _MUTATING_NOTE = (
 )
 
 
-def tool_train_start(args: dict) -> dict:
+def _collect_external_protected_inputs(cfg: SoupConfig) -> list[ProtectedFile]:
+    """Collect and digest external paths (datasets, models) referenced by cfg."""
+    protected: list[ProtectedFile] = []
+    candidate_paths: list[tuple[str, str | None]] = [
+        ("data.train", getattr(cfg.data, "train", None)),
+        ("data.eval", getattr(cfg.data, "eval", None)),
+        ("data.replay", getattr(cfg.data, "replay", None)),
+        ("data.image_dir", getattr(cfg.data, "image_dir", None)),
+        ("data.audio_dir", getattr(cfg.data, "audio_dir", None)),
+        ("base", getattr(cfg, "base", None)),
+        ("training.adapter", getattr(cfg.training, "adapter", None)),
+    ]
+    if getattr(cfg.training, "eval_gate", None) and cfg.training.eval_gate.enabled:
+        candidate_paths.append(("training.eval_gate.suite", cfg.training.eval_gate.suite))
+
+    for field, path in candidate_paths:
+        if isinstance(path, str) and path and is_under_cwd(path) and os.path.exists(path):
+            protected.append(digest_file(path, field))
+    return protected
+
+
+def tool_train_start(args: dict, execution: ExecutionManager | None = None) -> dict:
     """`soup train` (plan-only) — validate a soup.yaml + render the command."""
     config = _require_str(args, "config")
-    cfg = _load_config_under_cwd(config)
+    text = _read_text_under_cwd(config, "config")
+    try:
+        from soup_cli.config.loader import load_config_from_string
+
+        cfg = load_config_from_string(text)
+    except ValueError as exc:
+        raise McpToolError(f"invalid config ({type(exc).__name__})") from exc
+
+    if execution is not None:
+        try:
+            run_id = execution.allocate_run_id()
+            snapshot_path = execution.snapshot_config(run_id, text)
+            protected_list = [digest_file(snapshot_path, "config snapshot")]
+            protected_list.extend(_collect_external_protected_inputs(cfg))
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from exc
+
+        argv = [
+            sys.executable,
+            "-m",
+            "soup_cli.cli",
+            "train",
+            "--config",
+            snapshot_path,
+            "--yes",
+        ]
+        display_cmd = f"soup train --config {shlex.quote(snapshot_path)} --yes"
+        token = execution.issue(
+            kind="train",
+            argv=argv,
+            display_command=display_cmd,
+            protected_files=tuple(protected_list),
+            run_id=run_id,
+        )
+        return {
+            "config_valid": True,
+            "task": cfg.task,
+            "base": cfg.base,
+            "would_run": display_cmd,
+            "note": _MUTATING_NOTE,
+            "confirmation_token": token,
+        }
+
+    config_real = os.path.realpath(config)
     return {
         "config_valid": True,
         "task": cfg.task,
         "base": cfg.base,
-        "would_run": f"soup train --config {shlex.quote(config)}",
+        "would_run": f"soup train --config {shlex.quote(config_real)} --yes",
         "note": _MUTATING_NOTE,
     }
 
 
-def tool_export(args: dict) -> dict:
+def tool_export(args: dict, execution: ExecutionManager | None = None) -> dict:
     """`soup export` (plan-only) — validate format + render the command."""
     from soup_cli.commands.export import SUPPORTED_FORMATS
 
@@ -617,10 +689,57 @@ def tool_export(args: dict) -> dict:
     if fmt not in SUPPORTED_FORMATS:
         raise McpToolError("unsupported export format (see 'soup export --help')")
     output = _opt_str(args, "output")
+    try:
+        enforce_under_cwd_and_no_symlink(model, "model")
+        if output:
+            enforce_under_cwd_and_no_symlink(output, "output")
+    except (OSError, ValueError) as exc:
+        raise McpToolError("model/output must stay under the working directory") from exc
     cmd = f"soup export --model {shlex.quote(model)} --format {fmt}"
     if output:
         cmd += f" --output {shlex.quote(output)}"
-    return {"format": fmt, "would_run": cmd, "note": _MUTATING_NOTE}
+    out = {"format": fmt, "would_run": cmd, "note": _MUTATING_NOTE}
+    if execution is not None:
+        model_real = os.path.realpath(model)
+        if not os.path.exists(model_real):
+            raise McpToolError(f"model path {model!r} does not exist for execution")
+        output_real = os.path.realpath(output) if output else None
+        argv = [
+            sys.executable,
+            "-m",
+            "soup_cli.cli",
+            "export",
+            "--model",
+            model_real,
+            "--format",
+            fmt,
+        ]
+        if output_real:
+            argv.extend(["--output", output_real])
+        try:
+            protected = (digest_file(model_real, "model"),)
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from exc
+        run_id = execution.allocate_run_id()
+        out["confirmation_token"] = execution.issue(
+            kind="export",
+            argv=argv,
+            display_command=cmd,
+            protected_files=protected,
+            run_id=run_id,
+        )
+    return out
+
+
+def _execute_handler(execution: ExecutionManager, kind: str) -> Callable[[dict], dict]:
+    def _handler(args: dict) -> dict:
+        if set(args) != {"confirmation_token"}:
+            raise McpToolError("execution requires only 'confirmation_token'")
+        try:
+            return execution.execute(token=args.get("confirmation_token"), kind=kind)
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from None
+    return _handler
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +1023,9 @@ def _refuse_execute(name: str) -> Callable[[dict], dict]:
     return _handler
 
 
-def _mutating_specs(*, allow_mutating: bool, allow_execute: bool = False) -> list[ToolSpec]:
+def _mutating_specs(
+    *, allow_mutating: bool, allow_execute: bool = False, execution: ExecutionManager | None
+) -> list[ToolSpec]:
     """The plan-only mutating tools.
 
     Always LISTED (so clients can discover them), but their handler refuses
@@ -927,7 +1048,7 @@ def _mutating_specs(*, allow_mutating: bool, allow_execute: bool = False) -> lis
                 "required": ["config"],
                 "additionalProperties": False,
             },
-            tool_train_start,
+            lambda args: tool_train_start(args, execution if allow_execute else None),
         ),
         (
             "export",
@@ -943,10 +1064,10 @@ def _mutating_specs(*, allow_mutating: bool, allow_execute: bool = False) -> lis
                 "required": ["model", "format"],
                 "additionalProperties": False,
             },
-            tool_export,
+            lambda args: tool_export(args, execution if allow_execute else None),
         ),
     ]
-    return [
+    specs = [
         ToolSpec(
             name=name,
             title=title,
@@ -957,9 +1078,36 @@ def _mutating_specs(*, allow_mutating: bool, allow_execute: bool = False) -> lis
         )
         for name, title, description, schema, real in entries
     ]
+    for name, title, description, kind in (
+        ("train_execute", "Execute training", "Execute a confirmed training plan.", "train"),
+        ("export_execute", "Execute export", "Execute a confirmed export plan.", "export"),
+    ):
+        specs.append(
+            ToolSpec(
+                name=name,
+                title=title,
+                description=description,
+                input_schema={
+                    "type": "object",
+                    "properties": {"confirmation_token": {"type": "string"}},
+                    "required": ["confirmation_token"],
+                    "additionalProperties": False,
+                },
+                handler=(
+                    _execute_handler(execution, kind)
+                    if allow_execute and execution is not None
+                    else _refuse_execute(name)
+                ),
+                mutating=True,
+                annotations={"readOnlyHint": False, "destructiveHint": True},
+            )
+        )
+    return specs
 
 
-def build_registry(*, allow_mutating: bool, allow_execute: bool = False) -> list[ToolSpec]:
+def build_registry(
+    *, allow_mutating: bool, allow_execute: bool = False, execution: ExecutionManager | None = None
+) -> list[ToolSpec]:
     """Assemble the MCP tool table.
 
     The read-only tools are always present and executable. The mutating tools
@@ -968,7 +1116,10 @@ def build_registry(*, allow_mutating: bool, allow_execute: bool = False) -> list
     execution tools, and implies ``allow_mutating`` for the existing tools.
     """
     allow_mutating = allow_mutating or allow_execute
+    if allow_execute and execution is None:
+        execution = ExecutionManager()
     return _readonly_specs() + _mutating_specs(
         allow_mutating=allow_mutating,
         allow_execute=allow_execute,
+        execution=execution,
     )

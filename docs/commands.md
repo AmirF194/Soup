@@ -184,7 +184,7 @@ soup push --model ./out --repo you/m --card <registry-id>  Upload that registry-
 soup ci init [--data d.jsonl --suite s.yaml --evidence ev.json] [--config soup.yaml] [--branch main --python 3.11] [--force]  Write .github/workflows/soup-gate.yml: data validate -> expect -> ship gate on every PR (v0.71.35); --config binds the gate to a committed config so it refuses stale evidence (v0.71.39)
 soup mcp serve                                MCP server over stdio (drive Soup from Claude Code / Cursor / Cline; requires [mcp] extra) (v0.71.28)
 soup mcp serve --allow-mutating               Also expose plan-only train_start / export tools (never execute) (v0.71.28)
-soup mcp serve --allow-execute                Implies --allow-mutating; reserves the future execution gate (still never executes) (v0.71.28)
+soup mcp serve --allow-execute                Implies --allow-mutating; enables train_execute / export_execute via server confirmation tokens
 soup shrink --model <id|path> --drop-ratio 0.25 --calib c.jsonl -o shrunk  Depth-prune least-important layer block + SHIP/DON'T-SHIP ppl verdict (exit 0/2/1) (v0.71.29)
 soup shrink ... --drop-layers N --heal h.jsonl --heal-steps 200 --device cpu  Drop N layers + distill-heal (fuse LoRA back to one dense model)
 soup shrink ... --tolerance 0.10 --plan-only [--attach-to-registry <id>]  Ppl-regression tolerance / print importance table only / registry attach
@@ -346,13 +346,13 @@ The server exposes 14 read-only tools — `advise`, `data_inspect`,
 `runs_list`, `runs_show`, `registry_list`, `registry_show`, `profile`,
 `diagnose_evidence`, `ship_evidence` — each returning JSON. Two **plan-only**
 mutating tools (`train_start`, `export`) are gated behind `--allow-mutating`
-(`"args": ["mcp", "serve", "--allow-mutating"]`); even then they only render the
-exact command that would run — they never execute training or export.
+(`"args": ["mcp", "serve", "--allow-mutating"]`); when `--allow-mutating` alone is active, they only render the exact command that would run — they never execute training or export.
 
-`--allow-execute` implies `--allow-mutating` and is threaded through the server
-as a separate future execution gate, but it does not enable execution yet:
-these tools remain plan-only in this release.
+`--allow-execute` implies `--allow-mutating` and enables full background subprocess execution via two execution tools (`train_execute` and `export_execute`). Execution requires a server-issued one-time confirmation token returned during the planning phase (`train_start` or `export`). The token state is kept in-memory with a 5-minute TTL and is consumed before subprocess invocation.
 
-**Security:** stdio only (no network listener); every path argument stays under
-the working directory and rejects symlinks; tool output is control-char
-sanitized; error messages never leak filesystem paths.
+**Execution Security & Boundaries:**
+- **Flag Safety:** `--allow-execute` is default-off and dangerous. `--allow-mutating` alone can NEVER trigger subprocess execution.
+- **One-Time Confirmation Tokens:** Authorization requires a server-issued random token. Client confirmation is UX-only; security relies entirely on the server-side token state.
+- **Subprocess Isolation:** Execution runs the Soup CLI as an isolated subprocess (`shell=False`, `stdin=DEVNULL`, `cwd` pinned to server startup directory). Child stdout/stderr is redirected to `.soup/mcp-runs/<run_id>.log` to avoid corrupting the MCP JSON-RPC stdio stream.
+- **Concurrency & Disconnects:** Enforces 1 active execution per stdio server process. Launches run in background (fire-and-forget). Disconnecting the MCP client does not terminate an already-running subprocess.
+- **Config Snapshotting & Input Revalidation:** At plan time (`train_start`), the validated config is snapshotted to `.soup/mcp-runs/<run_id>/config.yaml`, and execution uses this snapshot rather than the original mutable config path. External protected inputs (such as datasets and model/checkpoint directories or files) are not frozen in the snapshot; instead, their content digests (computed via SHA-256 for regular files, or deterministic recursive content hashing over sorted relative file paths for directory trees, bounded by file-count and total-byte safety limits) are recorded at plan time and revalidated immediately before spawn. Modifying an external protected input between plan and execute invalidates the token. Modifying the original config path after planning has no effect because execution strictly uses the snapshotted config. Snapshotting freezes only the configuration itself, not external filesystem assets.

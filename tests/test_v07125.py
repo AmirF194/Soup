@@ -622,13 +622,22 @@ class TestShipCliEvidence:
 # CLI — live path with injected fake generators (no GPU / no model load)
 # ---------------------------------------------------------------------------
 
-from soup_cli.eval.forgetting import MINI_BENCHMARKS  # noqa: E402
+from soup_cli.eval.forgetting import MINI_BENCHMARKS, build_mcq_prompt  # noqa: E402
 
 
 def _gold_answer(prompt: str) -> str:
+    """The correct answer for a mini-benchmark prompt, or "" if unrecognised.
+
+    Keyed on ``build_mcq_prompt`` rather than the raw ``question`` because
+    v0.73.2 (#357) appends an "answer with the option letter" cue to MCQ items
+    before they reach the model. Keying on the bare question silently returned
+    "" for every MCQ item — a fake "model" that answers nothing, which made a
+    regression test pass for the wrong reason. Using the same builder the
+    detector uses is what keeps the two from drifting again.
+    """
     for bench in MINI_BENCHMARKS.values():
         for item in bench:
-            if item["question"] == prompt:
+            if build_mcq_prompt(item["question"], item["answer"]) == prompt:
                 return item["answer"]
     return ""
 

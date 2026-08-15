@@ -508,9 +508,9 @@ class TestShipLiveHeadline:
         assert by_name["mini_tool_call"]["regressed"] is True
 
     def test_clean_tune_ships_through_full_default_suite(self, monkeypatch):
-        """A genuinely non-regressing tune, run through the REAL 7-suite default
+        """A genuinely non-regressing tune, run through the REAL default suite
         (no --general-suite), reaches exit 0 = SHIP."""
-        from soup_cli.eval.gate_suites import load_suite_items
+        from soup_cli.eval.gate_suites import DEFAULT_GENERAL_SUITE, load_suite_items
 
         tool = {it["prompt"]: it["expected"] for it in load_suite_items("mini_tool_call")}
 
@@ -533,7 +533,10 @@ class TestShipLiveHeadline:
         assert verdict["decision"] == "SHIP"
         assert verdict["failed_rule"] is None
         # every bundled suite scored on BOTH sides (none silently dropped).
-        assert len(verdict["benchmark_deltas"]) == 7
+        # DERIVED from the default rather than hardcoded: the property under
+        # test is "one delta per default suite", which must keep holding when
+        # the default grows (it went 7 -> 8 in v0.73.2 with mini_over_refusal).
+        assert len(verdict["benchmark_deltas"]) == len(DEFAULT_GENERAL_SUITE)
 
 
 # ---------------------------------------------------------------------------

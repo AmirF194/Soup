@@ -355,7 +355,7 @@ soup ship --evidence evidence.json --output verdict.json
 }
 ```
 
-Leg-2 defaults to the **bundled offline suite** (v0.71.38) — seven hand-authored suites shipped
+Leg-2 defaults to the **bundled offline suite** (v0.71.38; 8 suites as of v0.73.2) — hand-authored suites shipped
 in the wheel and scored by the pure scorers Soup already ships (no lm-eval, no network,
 CPU-instant):
 
@@ -365,18 +365,93 @@ CPU-instant):
 | `mini_tool_call` | function-calling still works (right tool named) | `tool_call_name_match` |
 | `mini_format_json` | JSON validity (a structured object, not a bare scalar) | container-only JSON check |
 | `mini_safety` | refusal-rate on harmful prompts (under-refusal = regression) | refusal heuristic |
+| `mini_over_refusal` | benign prompts are NOT refused (over-refusal = regression) | refusal heuristic (inverse) |
 
 Each suite is >20 items so a single-item flip (1/N < 0.05) trips the default threshold instead
 of being rounded away. The scorer is answer-**extraction** — a spurious substring inside a word
 (`"B"` in "**B**erlin") no longer scores, which is a **breaking** change from the v0.25.0
 substring scorer (an existing run's verdict can flip; recompute any committed `--baseline`).
-`--general-suite <names>` with any non-bundled name routes through the lm-eval harness. Pairwise
-judge win-rate (`--task-mode pairwise`) shipped in v0.71.31.
+`mini_safety` and `mini_over_refusal` form a dual gate: under-refusal regresses safety, over-refusal
+regresses utility (neither axis can be gamed alone). `--general-suite <names>` with any non-bundled
+name routes through the lm-eval harness. Pairwise judge win-rate (`--task-mode pairwise`) shipped
+in v0.71.31.
 
 Exit codes (v0.71.38): **0 = SHIP · 2 = DON'T SHIP · 3 = usage/flag error · 1 = runtime error**
 — usage errors moved off `2` so CI can tell a config typo from a caught regression. The engine
 lives in `soup_cli.utils.ship_verdict` (`decide_ship` is a pure function — the whole truth table
 is CPU-testable); the bundled suites live in `soup_cli.eval.gate_suites`.
+
+### Noise Floor (v0.73.2)
+
+Greedy decoding is not deterministic on GPU. Measured on an H100, the same model with no adapter
+over five runs spread **0.015–0.020** — against a default threshold of 0.05, with four of six paired
+deltas in that session sitting *inside* the spread. `soup ship` was comparing against 0.05 without
+ever telling you what its own instrument could resolve.
+
+`--noise-floor N` re-runs the **base** model N times (N in `[2, 10]`), takes each axis's `max − min`
+across the repeats, prints it beside the verdict, and gates every axis at
+`max(--forgetting-threshold, that axis's floor)`. Leg 1's win must clear the task axis's floor too.
+
+```bash
+soup ship --base <m> --adapter ./out --task-eval tasks.jsonl --noise-floor 2
+```
+
+Real output (SmolLM2-135M pair, CPU, `--general-suite mini_mmlu`):
+
+```
+noise floor: base repeat 1/2
+noise floor: base repeat 2/2
+noise floor: every axis repeated exactly — this instrument was deterministic over these runs.
+
+ Leg 2 general suite (threshold 5.00%)
+ ┌───────────┬────────┬────────┬─────────┬───────────┐
+ │ Benchmark │   Base │  Tuned │       Δ │ Verdict   │
+ ├───────────┼────────┼────────┼─────────┼───────────┤
+ │ mini_mmlu │ 0.2692 │ 0.1154 │ -0.1538 │ REGRESSED │
+ └───────────┴────────┴────────┴─────────┴───────────┘
+
+ Noise floor
+ ┌────────────┬────────┐
+ │ Axis       │  Floor │
+ ├────────────┼────────┤
+ │ leg 1 task │ 0.0000 │
+ │ mini_mmlu  │ 0.0000 │
+ └────────────┴────────┘
+ Measured over 2 base repeats. Each axis is gated at max(threshold, its floor).
+```
+
+On CPU the floor is 0.0000 — greedy decode is deterministic there, and a 0.0 floor correctly
+suppresses nothing (the regression above is still caught). Expect a non-zero floor on GPU.
+
+**The `max` matters in both directions.** A floor *above* your threshold widens the gate to what is
+actually measurable; a floor *below* it must never tighten the gate behind your back. If a floor
+exceeds `--forgetting-threshold`, the run says so by name — that axis is now gated looser than you
+asked.
+
+**Scope and cost.** The leg-1 floor is measured in `--task-mode metric` **only**: in the judge modes
+a repeat would fold the judge's own sampling noise into a number presented as decode noise, so the
+run warns and leaves leg 1 at a 0.0 floor instead. Costs N extra base passes. Rejected with
+`--evidence` (there is nothing to re-run) — though a floor *recorded in* an evidence file is still
+applied.
+
+**Caveat, carried from the measurement that motivated it:** n=3, one model, one dataset. The floor
+**sizes** the effect; it does **not** calibrate a threshold, and nothing establishes what N is
+enough.
+
+The evidence JSON schema gained an optional `noise_floor` block, so a verdict decided against a
+floor replays identically offline. The leg-1 axis is keyed `__task__`:
+
+```json
+{
+  "task": {"mode": "metric", "base": 0.3333, "tuned": 0.3333},
+  "benchmarks": {"mini_mmlu": {"base": 0.2692, "tuned": 0.1154}},
+  "noise_floor": {"runs": 2, "floors": {"__task__": 0.0, "mini_mmlu": 0.0}}
+}
+```
+
+A malformed `noise_floor` block is **refused, not dropped** — a silently discarded floor would
+replay as a different verdict. Values are bounded to `[0, 1]` and the mapping is capped, because an
+evidence file is untrusted input and a floor widens the gate.
 
 ### Closing the evidence loop (v0.71.39)
 
@@ -407,6 +482,20 @@ soup ship --evidence ship_evidence.json --config soup.yaml --push owner/repo#42
 
 `soup ci init --config soup.yaml` binds the generated workflow's ship step to the committed
 config, so the whole loop runs in CI (see [commands.md](commands.md)).
+
+**Baseline scale change (v0.73.2).** Three suites' scorers changed. The MCQ extractor now reads a
+`\boxed{C}` option letter (a boxed *value* like `\boxed{4}` is still not an option letter), and MCQ
+prompts now ask for the letter — both halves are needed, and they affect `mini_mmlu` and
+`mini_common_sense`. `mini_tool_call` now tolerates a call missing its outer `{"function": ...}`
+envelope. Measured on an **unchanged** model the shifts are large: `mini_mmlu` 0.423 → 0.731 and
+`mini_tool_call` 0.225 → 1.000, far bigger than the 0.05 gate.
+
+A `--baseline` supplies the base score from a *file* and skips the live base run, so a snapshot
+taken before v0.73.2 would be diffed against a freshly-scored tuned model on a different scale —
+big enough to mask a real regression or manufacture an improvement. `soup ship` now warns by name
+when this happens. Recompute the baseline, or drop those names from it to force a live base run.
+`mini_instruction` and `mini_arithmetic` are unaffected: neither carries a single-letter answer, so
+the prompt cue and the option-letter extractor never touch them.
 
 
 ## NLG Evaluation Metrics (BLEU + ROUGE)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Tuple
 
 MiniBenchmark = list[dict[str, str]]
 
@@ -41,6 +41,13 @@ _CUE_RE = re.compile(
 )
 # Parenthesised choice marker: "(B)" or "B)".
 _PAREN_RE = re.compile(r"(?<![A-Za-z0-9])\(?([A-Ja-j])\)(?![A-Za-z0-9])")
+# LaTeX ``\boxed{C}`` — how a reasoning-tuned model states its final answer.
+# Mirrors ``trainer/rewards._extract_answer``'s boxed regex, but this is an
+# OPTION-LETTER tier and deliberately narrower: it fires only when the box holds
+# a single A–J letter. ``\boxed{4}`` is the model answering with a VALUE, and
+# reading that as "option 4" would be a wrong credit rather than a repair — the
+# prompt is what has to change there (see ``_MCQ_ANSWER_CUE``). #357.
+_BOXED_LETTER_RE = re.compile(r"\\boxed\{\s*([A-Ja-j])\s*\}")
 # Bare standalone UPPERCASE letter that TERMINATES a clause — i.e. followed by
 # end-of-string or sentence punctuation, not by more words. Requiring upper-case
 # skips the lower-case article "a"/"an", and the terminating look-ahead skips a
@@ -49,31 +56,74 @@ _PAREN_RE = re.compile(r"(?<![A-Za-z0-9])\(?([A-Ja-j])\)(?![A-Za-z0-9])")
 _BARE_UPPER_RE = re.compile(r"(?<![A-Za-z0-9])([A-J])(?=[.,;:!?]|\s*$)")
 
 
+# Appended to a multiple-choice question before it reaches the model (#357).
+#
+# The other half of the boxed-answer defect, and the half the extractor CANNOT
+# fix. Measured on Meta-Llama-3.1-8B-Instruct over the shipped ``mini_mmlu``:
+# of 15 failures, 8 boxed the right LETTER (the extractor's half) and **6 boxed
+# a VALUE** — "\\boxed{4}" for "What is 2 + 2? (A) 3 (B) 4 (C) 5" — because
+# nothing in the prompt ever asked for a letter. Teaching the extractor to read
+# a boxed value as an option would credit the wrong thing; asking for the letter
+# is the honest repair. Neither change alone closes the issue: the extractor
+# alone is worth +8 items, the prompt alone **0**, together 0.423 -> 0.731.
+#
+# It is appended only to items whose ANSWER is an option letter, so the
+# free-text suites (``mini_instruction``, ``mini_arithmetic``) are untouched.
+# Base and tuned models receive the identical prompt, so every existing delta
+# stays comparable — only the absolute level moves.
+_MCQ_ANSWER_CUE = "\nAnswer with the option letter only."
+
+
 def _is_mcq_letter(answer: str) -> bool:
     """True when ``answer`` is a single MCQ option letter (A–J)."""
     return len(answer) == 1 and answer.upper() in _MCQ_OPTIONS
 
 
+def build_mcq_prompt(question: str, answer: str) -> str:
+    """The prompt actually sent to the model for one mini-benchmark item.
+
+    Adds ``_MCQ_ANSWER_CUE`` for multiple-choice items and returns ``question``
+    unchanged for free-text ones. Public so a caller that builds its own
+    generator loop asks the model the same thing the scorer expects (#357).
+    """
+    if not isinstance(question, str):
+        raise TypeError("question must be a string")
+    if isinstance(answer, str) and _is_mcq_letter(answer.strip()):
+        return question + _MCQ_ANSWER_CUE
+    return question
+
+
 def extract_mcq_letter(output: str) -> Optional[str]:
     """Pull the model's chosen MCQ option letter (A–J) from ``output``.
 
-    Priority: an explicit ``answer/option/...`` cue, then a parenthesised
-    ``(B)``/``B)`` marker, then a bare clause-terminating uppercase letter. The
-    cue and paren tiers take the LAST match (a model echoes the option list
-    before deciding, so its real choice is at the end); the bare tier takes the
-    FIRST match (a model answering without a cue leads with the letter, e.g.
-    "C. I think ..."). A bare letter only counts when it terminates a clause, so
-    a prose opener ("A cat sat ...") is not read as choosing option A. Returns
-    ``None`` when no option letter is present (e.g. a free-text answer like
-    "Berlin").
+    Three "explicit commitment" forms are considered together — a LaTeX
+    ``\\boxed{C}``, an ``answer/option/...`` cue, and a parenthesised
+    ``(B)``/``B)`` marker — and the LAST one to appear anywhere in the output
+    wins. Position, not form, decides: a model that boxes a scratch answer and
+    then self-corrects ("...\\boxed{A}... on reflection, the answer is (B)")
+    chose B, while one that echoes the option list and then boxes its decision
+    ("(A) x (B) y. Answer: \\boxed{A}") chose A. Ranking the boxed FORM above
+    the others would get the first of those backwards.
+
+    Only if none of the three appears does the bare tier apply: a
+    clause-terminating uppercase letter, taking the FIRST match (a model
+    answering without a cue leads with the letter, e.g. "C. I think ..."). A
+    bare letter only counts when it terminates a clause, so a prose opener
+    ("A cat sat ...") is not read as choosing option A.
+
+    Returns ``None`` when no option letter is present (e.g. a free-text answer
+    like "Berlin", or a boxed VALUE like ``\\boxed{4}``).
     """
     if not isinstance(output, str) or not output:
         return None
     output = output[:_MAX_SCORE_OUTPUT]
-    for regex in (_CUE_RE, _PAREN_RE):
-        matches = regex.findall(output)
-        if matches:
-            return matches[-1].upper()
+    latest: Optional[Tuple[int, str]] = None
+    for regex in (_BOXED_LETTER_RE, _CUE_RE, _PAREN_RE):
+        for match in regex.finditer(output):
+            if latest is None or match.end() > latest[0]:
+                latest = (match.end(), match.group(1))
+    if latest is not None:
+        return latest[1].upper()
     bare = _BARE_UPPER_RE.findall(output)
     if bare:
         return bare[0].upper()
@@ -313,7 +363,9 @@ class ForgettingDetector:
     def _evaluate(self) -> float:
         correct = 0
         for item in self.benchmark:
-            output = self.generate_fn(item["question"])
+            output = self.generate_fn(
+                build_mcq_prompt(item["question"], item.get("answer", ""))
+            )
             if not isinstance(output, str):
                 continue
             if score_answer(output, item["answer"]):

@@ -56,13 +56,21 @@ if TYPE_CHECKING:  # pydantic models — import for typing only (no eager cost)
 from soup_cli.utils.ship_verdict import (
     DECISION_SHIP,
     DEFAULT_FORGETTING_THRESHOLD,
+    MAX_NOISE_FLOOR_RUNS,
+    MIN_NOISE_FLOOR_RUNS,
     SUPPORTED_TASK_MODES,
+    TASK_AXIS,
     TASK_MODES,
+    NoiseFloor,
     ShipVerdict,
     TaskWin,
     build_task_win,
     compute_benchmark_deltas,
+    compute_noise_floor,
     decide_ship,
+    floor_exceeds_threshold,
+    for_terminal,
+    noise_floor_from_evidence,
     render_ship_panel,
     verdict_to_dict,
     verdict_to_evidence,
@@ -123,6 +131,25 @@ def _validate_threshold_flag(value: float) -> float:
     if not (0.0 <= fvalue <= 1.0):
         _fail("--forgetting-threshold must be in [0.0, 1.0]", _EXIT_USAGE)
     return fvalue
+
+
+def _validate_noise_floor_flag(value: Optional[int]) -> Optional[int]:
+    """``--noise-floor N`` — repeats of the BASE run, or ``None`` when unset.
+
+    Bounded below because a floor is a spread and one sample has none, and
+    above because every repeat is a full pass over the base model.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        _fail("--noise-floor must be an integer", _EXIT_USAGE)
+    if not (MIN_NOISE_FLOOR_RUNS <= value <= MAX_NOISE_FLOOR_RUNS):
+        _fail(
+            f"--noise-floor must be in "
+            f"[{MIN_NOISE_FLOOR_RUNS}, {MAX_NOISE_FLOOR_RUNS}]; got {value}",
+            _EXIT_USAGE,
+        )
+    return value
 
 
 def _validate_task_mode_flag(task_mode: str) -> None:
@@ -361,8 +388,18 @@ def _verdict_from_evidence(payload: dict, *, forgetting_threshold: float) -> Shi
         )
     if "base" not in task or "tuned" not in task:
         _fail("evidence.task needs both 'base' and 'tuned' scores", _EXIT_RUNTIME)
+    # A floor recorded by --emit-evidence must be honoured on read, or the same
+    # scores replay to a DIFFERENT decision than the run that produced them.
     try:
-        task_win = build_task_win(mode, task["base"], task["tuned"])
+        stored_floor = noise_floor_from_evidence(payload.get("noise_floor"))
+    except (TypeError, ValueError) as exc:
+        _fail(f"invalid evidence.noise_floor: {exc}", _EXIT_RUNTIME)
+    _warn_if_floor_widens(stored_floor, forgetting_threshold, source="evidence-supplied")
+
+    try:
+        task_win = build_task_win(
+            mode, task["base"], task["tuned"], noise_floor=stored_floor
+        )
     except (TypeError, ValueError) as exc:
         _fail(f"invalid evidence.task: {exc}", _EXIT_RUNTIME)
 
@@ -379,9 +416,17 @@ def _verdict_from_evidence(payload: dict, *, forgetting_threshold: float) -> Shi
 
     try:
         deltas = compute_benchmark_deltas(
-            base_scores, tuned_scores, forgetting_threshold=forgetting_threshold
+            base_scores,
+            tuned_scores,
+            forgetting_threshold=forgetting_threshold,
+            noise_floor=stored_floor,
         )
-        return decide_ship(task_win, deltas, forgetting_threshold=forgetting_threshold)
+        return decide_ship(
+            task_win,
+            deltas,
+            forgetting_threshold=forgetting_threshold,
+            noise_floor=stored_floor,
+        )
     except (TypeError, ValueError) as exc:
         _fail(f"invalid evidence.benchmarks: {exc}", _EXIT_RUNTIME)
 
@@ -595,10 +640,33 @@ def _leg2_scores(
     lm-eval override. ``baseline_scores`` supplies base scores directly
     (skipping the base run) for any name it covers.
     """
-    from soup_cli.eval.gate_suites import is_bundled_suite, score_bundled_suite
+    from soup_cli.eval.gate_suites import (
+        SCORER_CHANGED_IN_V0_73_2,
+        is_bundled_suite,
+        score_bundled_suite,
+    )
 
     bundled_names = [n for n in suite_names if is_bundled_suite(n)]
     other_names = [n for n in suite_names if not is_bundled_suite(n)]
+
+    # A --baseline / registry:// entry supplies the BASE score from a file and
+    # skips the live base run, so a snapshot taken before v0.73.2 is compared
+    # against a freshly-scored tuned model on a DIFFERENT scale. Measured on an
+    # unchanged model: mini_mmlu 0.423 -> 0.731, mini_tool_call 0.225 -> 1.000.
+    # That is far larger than the 0.05 gate, so it must be said out loud.
+    stale = sorted(
+        name
+        for name in bundled_names
+        if name in baseline_scores and name in SCORER_CHANGED_IN_V0_73_2
+    )
+    if stale:
+        console.print(
+            "[yellow]Warning:[/] --baseline supplies stored scores for "
+            f"{escape(', '.join(stale))}, whose scorer CHANGED in v0.73.2 "
+            "(#357 / #346). If that baseline was captured on an earlier "
+            "release the two sides are on different scales — re-measure the "
+            "baseline, or drop these names from it to force a live base run."
+        )
 
     base_map: Dict[str, object] = {}
     tuned_map: Dict[str, object] = {}
@@ -630,6 +698,102 @@ def _leg2_scores(
     return base_map, tuned_map
 
 
+def _measure_noise_floor(
+    runs: int,
+    suite_names: List[str],
+    base_gen: Callable[[str], str],
+    *,
+    base_id: str,
+    task_mode: str,
+    task_eval: str,
+    forgetting_threshold: float,
+) -> NoiseFloor:
+    """Re-run the BASE model ``runs`` times and return the measured spread.
+
+    Greedy decoding is not deterministic on GPU: measured on an H100, the same
+    model with no adapter over five runs spread **0.015 strict / 0.020
+    format-blind**, against a gate threshold of 0.05. Four of six paired deltas
+    in that session sat inside the floor, so the gate was calling differences
+    it could not resolve.
+
+    Coverage is deliberately partial and says so. Leg-2 axes are always
+    measured. The leg-1 task axis is measured **only in ``metric`` mode** — the
+    one leg-1 path that is offline and judge-free. In ``judge_score`` /
+    ``pairwise`` the repeats would fold the judge's own sampling noise into a
+    number presented as decode noise, which is publishing an inference as a
+    mechanism; the caller is warned instead and leg 1 keeps a 0.0 floor.
+
+    A ``--baseline`` file is deliberately NOT consulted here even though the
+    verdict path uses one: a stored number is not a repeat of this instrument,
+    and folding it in would report a spread that was never measured.
+    """
+    from soup_cli.eval.gate_suites import is_bundled_suite, score_bundled_suite
+
+    bundled = [name for name in suite_names if is_bundled_suite(name)]
+    skipped = [name for name in suite_names if not is_bundled_suite(name)]
+    if skipped:
+        console.print(
+            "[yellow]Warning:[/] --noise-floor measures bundled suites only; "
+            f"no floor for {escape(', '.join(sorted(skipped)))}"
+        )
+    measure_task = task_mode == "metric"
+    if not measure_task:
+        console.print(
+            f"[yellow]Warning:[/] --noise-floor does not measure the leg-1 task "
+            f"axis in --task-mode {escape(task_mode)} (a judge-backed repeat "
+            "would report the judge's sampling noise as decode noise); leg 1 "
+            "keeps a 0.0 floor."
+        )
+
+    samples: List[Dict[str, float]] = []
+    for index in range(runs):
+        console.print(f"[dim]noise floor: base repeat {index + 1}/{runs}[/]")
+        run: Dict[str, float] = {}
+        for name in bundled:
+            run[name] = score_bundled_suite(name, base_gen)
+        if measure_task:
+            from soup_cli.eval.custom import load_eval_tasks, run_eval
+
+            tasks = load_eval_tasks(task_eval)
+            if not tasks:
+                raise ValueError(f"task-eval file {task_eval!r} has no tasks")
+            run[TASK_AXIS] = run_eval(
+                base_id, tasks, generate_fn=base_gen
+            ).accuracy
+        samples.append(run)
+
+    floor = compute_noise_floor(samples)
+    if floor.floors and all(value == 0.0 for _name, value in floor.floors):
+        console.print(
+            "[dim]noise floor: every axis repeated exactly — this instrument "
+            "was deterministic over these runs.[/]"
+        )
+    _warn_if_floor_widens(floor, forgetting_threshold, source="measured")
+    return floor
+
+
+def _warn_if_floor_widens(
+    floor: Optional[NoiseFloor], threshold: float, *, source: str
+) -> None:
+    """Announce any axis whose floor loosens the gate past ``threshold``.
+
+    Shared by the live path and the ``--evidence`` reader on purpose: an
+    evidence-supplied floor widens the gate exactly as much as a measured one,
+    and an evidence file is untrusted input, so the quieter of the two paths is
+    the one an attacker would choose.
+    """
+    widened = floor_exceeds_threshold(floor, threshold)
+    if not widened:
+        return
+    detail = ", ".join(f"{for_terminal(name)} {value:.4f}" for name, value in widened)
+    console.print(
+        f"[yellow]Warning:[/] the {escape(source)} noise floor exceeds "
+        f"--forgetting-threshold ({threshold:.4f}) on: {escape(detail)}. "
+        "Those axes are gated at their floor, so the gate is LOOSER there "
+        "than you asked."
+    )
+
+
 def _parse_suite(general_suite: Optional[str]) -> List[str]:
     from soup_cli.eval.gate_suites import DEFAULT_GENERAL_SUITE
 
@@ -651,6 +815,7 @@ def _verdict_live(
     baseline_spec: Optional[str],
     device: Optional[str],
     forgetting_threshold: float,
+    noise_floor_runs: Optional[int] = None,
 ) -> ShipVerdict:
     """Run a live verdict — validate flags (exit 2), then evaluate (exit 1)."""
     if not base:
@@ -693,9 +858,25 @@ def _verdict_live(
         except (ValueError, FileNotFoundError, OSError) as exc:
             _fail(f"--baseline: {exc}", _EXIT_USAGE)
 
+    # Already validated by ``ship()``; re-checked because ``_verdict_live`` is
+    # also reachable from tests / the SDK, and an unbounded repeat count here
+    # would be an unbounded number of full model passes.
+    noise_floor_runs = _validate_noise_floor_flag(noise_floor_runs)
+
     tuned_id = tuned if tuned else base
     try:
         base_gen, tuned_gen = _resolve_generators(base, tuned, adapter, device)
+        measured_floor: Optional[NoiseFloor] = None
+        if noise_floor_runs is not None:
+            measured_floor = _measure_noise_floor(
+                noise_floor_runs,
+                suite_names,
+                base_gen,
+                base_id=base,
+                task_mode=task_mode,
+                task_eval=task_eval,
+                forgetting_threshold=forgetting_threshold,
+            )
         if task_mode == "judge_score":
             if not judge_model:
                 _fail("--task-mode judge_score needs --judge-model <url>", _EXIT_USAGE)
@@ -719,9 +900,17 @@ def _verdict_live(
             device=device,
         )
         deltas = compute_benchmark_deltas(
-            base_scores, tuned_scores, forgetting_threshold=forgetting_threshold
+            base_scores,
+            tuned_scores,
+            forgetting_threshold=forgetting_threshold,
+            noise_floor=measured_floor,
         )
-        return decide_ship(task_win, deltas, forgetting_threshold=forgetting_threshold)
+        return decide_ship(
+            task_win,
+            deltas,
+            forgetting_threshold=forgetting_threshold,
+            noise_floor=measured_floor,
+        )
     except typer.Exit:
         # typer.Exit subclasses RuntimeError — re-raise so in-try _fail() usage
         # errors (exit 3) keep their code instead of being re-coded as exit 1.
@@ -822,6 +1011,17 @@ def ship(
         "--task-mode",
         help="Leg-1 mode: metric | judge_score | pairwise (judge win-rate).",
     ),
+    noise_floor: Optional[int] = typer.Option(
+        None,
+        "--noise-floor",
+        help=(
+            f"Re-run the BASE model N times ({MIN_NOISE_FLOOR_RUNS}-"
+            f"{MAX_NOISE_FLOOR_RUNS}) to measure what this instrument can "
+            "resolve, print it beside the verdict, and refuse to call any "
+            "delta smaller than the measured floor significant. Costs N extra "
+            "base passes. Leg-1 floor is measured in --task-mode metric only."
+        ),
+    ),
     judge_model: Optional[str] = typer.Option(
         None,
         "--judge-model",
@@ -898,6 +1098,7 @@ def ship(
 
     _validate_task_mode_flag(task_mode)
     threshold = _validate_threshold_flag(forgetting_threshold)
+    noise_floor = _validate_noise_floor_flag(noise_floor)
 
     # Fail a mistyped --push target FAST (usage error) — before computing the
     # verdict — so a typo can't waste a live run; the actual POST later is
@@ -916,6 +1117,16 @@ def ship(
     config_sha = _config_sha_of(soup_config) if soup_config is not None else None
 
     if evidence:
+        # An offline verdict loads no model, so there is nothing to repeat. A
+        # floor already recorded IN the evidence is still honoured on read —
+        # this rejects only the request to MEASURE one that cannot be measured.
+        if noise_floor is not None:
+            _fail(
+                "--noise-floor measures repeats of a live base model and has "
+                "nothing to run under --evidence; a floor recorded in the "
+                "evidence file is applied automatically",
+                _EXIT_USAGE,
+            )
         try:
             payload = _load_evidence(evidence)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -941,6 +1152,7 @@ def ship(
             baseline_spec=baseline,
             device=device,
             forgetting_threshold=threshold,
+            noise_floor_runs=noise_floor,
         )
     else:
         _fail(

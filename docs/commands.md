@@ -173,11 +173,12 @@ soup ship --base <m> --adapter <lora> --task-eval t.jsonl  SHIP / DON'T-SHIP ver
 soup ship --evidence ev.json [--output v.json]  Decide offline from pre-computed scores (no model load)
 soup ship ... --task-mode judge_score --judge-model ollama://llama3.1  Leg-1 via LLM-as-a-judge
 soup ship ... --task-mode pairwise --judge-model ollama://llama3.1  Leg-1 via swap-debiased judge win-rate (base=0.5) (v0.71.31)
-soup ship ...  # leg-2 default = 7 bundled offline suites (MCQ/arithmetic + tool_call/format_json/safety, extraction scorer, ~40 items each) (v0.71.38)
+soup ship ...  # leg-2 default = 8 bundled offline suites (MCQ/arithmetic/over_refusal + tool_call/format_json/safety, extraction scorer, ~40 items each) (v0.71.38; +mini_over_refusal v0.73.2)
 soup ship ... --general-suite mmlu,gsm8k --baseline base.json  lm-eval leg-2 override + recorded base scores
 soup ship ... --emit-evidence ev.json  Re-serialise the scores as replayable --evidence input (output-is-input, #312) (v0.71.39)
 soup ship ... --config soup.yaml  Read eval.ship gate defaults; --evidence GATES on provenance, --emit-evidence STAMPS it (v0.71.39)
 soup ship ... --push owner/repo#N  Post the verdict as a GitHub PR comment (best-effort; never flips the exit code) (v0.71.39)
+soup ship ... --noise-floor N [--task-mode metric]  Re-run base model N times; per-axis floor = max-min spread; gate at max(threshold, floor); leg-1 metric-only (v0.73.2)
 soup card <registry-id> -o MODELCARD.md       HF model card from a registry entry: training config, evals, hashes, lineage, artifacts (v0.71.35)
 soup push --model ./out --repo you/m --card <registry-id>  Upload that registry-driven card as the README (HF only) (v0.71.35)
 soup ci init [--data d.jsonl --suite s.yaml --evidence ev.json] [--config soup.yaml] [--branch main --python 3.11] [--force]  Write .github/workflows/soup-gate.yml: data validate -> expect -> ship gate on every PR (v0.71.35); --config binds the gate to a committed config so it refuses stale evidence (v0.71.39)

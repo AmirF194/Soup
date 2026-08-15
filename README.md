@@ -79,33 +79,33 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
-**v0.73.1 — the free GPU tier, and a formula caught under-predicting.** A patch release
-carrying everything that landed since v0.73.0, headed by a fix that made Soup unusable on
-the cards most people actually have.
+**v0.73.2 — the release gate stops lying in both directions.** `soup ship` answers one
+question: did this model get better, or did I break it? Two of its suites were ranking by
+the wrong thing, and one whole failure direction had no detector at all.
 
-- **bf16 was assumed on every CUDA card, in fourteen places.** Anything pre-Ampere — T4,
-  P100, V100, GTX 16xx, i.e. the entire free tier on Colab and Kaggle — failed on **every**
-  task, not just streaming. The trap worth knowing: `torch.cuda.is_bf16_supported()`
-  defaults to `including_emulation=True`, so a T4 answers **True** and the first attempt at
-  this fix was a no-op on the exact hardware it was written for.
-- **New: `training.stream_vram_probe`** decides the layer-streaming VRAM check by
-  *measuring* one real step instead of predicting it. Measured on a 4 GB RTX 3050, the
-  prediction formula **under-predicts at long sequence** — 0.934x the real peak at seq 5120
-  and **0.787x at seq 6144** — which is the direction that does not announce itself (an OOM
-  on Linux, a silent spill to host memory on Windows). The grid it was fitted on only ever
-  varied *batch size*, at seq 256 and 512, so it had no evidence there at all.
-- **Under `use_fsdp2_compile`, every `checkpoint-*` still loaded as a dead adapter.** The
-  final save was repaired in v0.73.0; the periodic checkpoints were not, so `--resume` and
-  `load_best_model_at_end` silently continued from a re-zeroed `lora_B`. Measured at 70B:
-  320 canonical keys in the output root, 320 prefixed ones in `checkpoint-100`.
-- **`backend: mlx` never dispatched to the MLX trainer**, and `training.seed` reached the
-  SFT wrapper and nothing else — so a seeded `task: grpo` run trained at 42 and replicates
-  that differed only in their seed were the same run.
-- **Three published claims retracted** where the evidence did not support them, including
-  "bound by host-to-device transfer". No measured number changed.
+- **A suite scored 0.225 for a model that got it right 40/40.** `mini_tool_call` was
+  ranking *brace hygiene*: the model emitted one closing brace short, so the parse fell
+  back to the inner object and the scorer rejected it for lacking the outer key. And
+  `mini_mmlu` scored Llama-3.1-8B at **0.423 — below a 0.5B** — because the extractor did
+  not know `\boxed{C}` and the prompt never asked for a letter. Both fixed; 0.423 → 0.731.
+- **New: a benign-prompt axis.** Leg 2 flagged a *drop* in refusal rate and had no reverse,
+  so a tune that refuses everything read as a monotone safety improvement. Two models with
+  byte-identical scores on all seven shipped suites, one of which refuses every benign
+  request, were indistinguishable to the gate. `mini_over_refusal` is its mirror; paired
+  with the safety suite, neither can be gamed alone.
+- **New: `soup ship --noise-floor N`** re-runs the base model N times and refuses to call
+  any delta smaller than the measured spread significant. Greedy decoding is not
+  deterministic on GPU — same model, no adapter, five runs spread **0.015–0.020** against a
+  0.05 threshold, and four of six paired deltas in that session sat inside the floor. It
+  **sizes** the effect; it does not calibrate a threshold, and the release says so.
+- **A caller error was indistinguishable from a regression.** A non-callable generator
+  scored `0.0` on three suites and raised on the others — and in leg 2 a 0.0 reads as
+  "failed every item", i.e. it failed in the direction that looks like a finding.
+- Also: `soup data split --stratify-semantic` (#388) and `soup mcp serve --allow-execute`
+  (#391), both from outside contributors.
 
-The measurement record for the VRAM work, published as written — including the **three
-readings withdrawn during it**, two of which briefly looked like the headline result — is
+The measurement record for the previous release's VRAM work, published as written —
+including the **three readings withdrawn during it** — is
 [`benchmarks/gate-v0.73.1-measured-vram-fit.md`](benchmarks/gate-v0.73.1-measured-vram-fit.md).
 
 ```yaml

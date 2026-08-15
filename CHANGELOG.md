@@ -12,27 +12,146 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+## [0.73.2] - 2026-08-15
+
+`soup ship`'s leg 2 is the project's differentiator, and it was lying in both
+directions: two of its suites ranked by the wrong thing, one whole failure
+direction had no detector at all, and a caller error was indistinguishable from
+a regression. Every item below was reproduced on the dev box against the
+shipped v0.73.1 code before a line was changed.
+
 ### Added
 
-- **Semantic Stratified Splitting for `soup data split` command.** Adds `--stratify-semantic` and `--num-clusters` options to automatically partition dataset splits proportionally across semantic groups using TF-IDF + K-Means clustering. Includes validation checks, ValueError safety, a 50,000-row cap, and a warnings module.
+- **`soup ship --noise-floor N` — measure what the instrument can resolve
+  before calling a delta significant.** Greedy decoding is not deterministic on
+  GPU: measured on an H100, the same model with no adapter over five runs spread
+  **0.015 strict / 0.020 format-blind**, and `soup ship` compared against a 0.05
+  threshold without ever telling the operator what its own instrument could
+  resolve — four of six paired deltas in that session sat inside the floor. With
+  the flag, the BASE model is re-run N times (2–10), the per-axis floor is
+  `max − min` across the repeats, it is printed beside the verdict, and every
+  axis is then gated at `max(threshold, floor)`. Leg 1 must clear the task
+  axis's floor too. The `max` is load-bearing in both directions: a floor above
+  the threshold widens the gate to what is actually measurable, and a floor
+  below it must never tighten the gate behind the operator's back. Opt-in, so no
+  existing run changes; costs N extra base passes. **The leg-1 floor is measured
+  in `--task-mode metric` only** — in the judge modes a repeat would fold the
+  judge's own sampling noise into a number presented as decode noise, so the run
+  warns and leaves leg 1 at a 0.0 floor instead. Carried caveat, because it
+  bounds the claim: n=3, one model, one dataset. It **sizes** the effect; it does
+  not calibrate a threshold.
+- **A benign-prompt axis, `mini_over_refusal`, joins the default leg-2 suite
+  (7 → 8) (#317).** Leg 2 flagged a *drop* in `mini_safety` and had no reverse,
+  so a tune that refuses everything registered as a monotone safety improvement
+  with no ceiling on how useless the model became. Reproduced as
+  *indistinguishability*, which is the actual claim: two models with
+  byte-identical scores on all seven shipped suites and the same SHIP verdict,
+  one of which refuses every benign request. The new suite is 40 hand-authored,
+  original benign-but-scary-sounding requests (defensive security, first aid,
+  sysadmin verbs like "kill"/"terminate", fiction with dark themes) scored as
+  *fraction NOT refused*, so the existing regression rule catches over-refusal
+  with no change to the verdict engine. Paired with `mini_safety` neither axis
+  can be gamed alone. Same caveat as above: 40 prompts and one greedy pass size a
+  gap, they do not calibrate a threshold.
+- **Semantic Stratified Splitting for `soup data split` (#388).**
+  `--stratify-semantic` and `--num-clusters` partition splits proportionally
+  across semantic groups (TF-IDF + K-Means) so a whole topic cannot land
+  entirely in one split. `scikit-learn` is a declared member of the `[data]`
+  extra and a missing import refuses with the install command rather than
+  silently falling back. 50k-row cap, an explicit error for a pure-stop-word
+  corpus, and a warning when `--num-clusters` is passed without the flag.
+  Contributed by [@Deadpool2000](https://github.com/Deadpool2000).
+- **`soup mcp serve --allow-execute` (#391).** A stronger opt-in than
+  `--allow-mutating`, which it implies, plus the `_refuse_execute` handler the
+  execution tools will use. `train_start` and `export` stay **plan-only** —
+  nothing in this slice executes anything, and the help text says so in the
+  present tense. `build_registry(allow_mutating=True)` still returns the same 16
+  tools. Contributed by [@darshvit20](https://github.com/darshvit20).
 
 ### Fixed
 
+- **`extract_mcq_letter` did not know `\boxed{C}`, and the MCQ prompt never
+  asked for a letter (#357).** Meta-Llama-3.1-8B-Instruct scored **0.423 on
+  `mini_mmlu` — below a 0.5B** — while scoring 1.000 on two other MCQ suites. Of
+  15 failures, 8 boxed the right letter and 6 boxed a *value* because nothing in
+  the prompt asked for a letter. Reproduced here at the extreme: a stub that
+  answers every item CORRECTLY in the boxed-letter style scored **0.000** on
+  `mini_mmlu` and `mini_common_sense`. Both halves are needed — the extractor
+  alone is worth +8 items, the prompt alone **0**, together 0.423 → 0.731 and the
+  inversion disappears. The new tier fires **only** when the box holds a single
+  A–J letter: reading `\boxed{4}` as "option 4" would be a wrong credit, not a
+  repair. Among the boxed / cue / paren forms, **position decides, not form** —
+  a model that boxes a scratch answer and then self-corrects chose the
+  correction.
+- **`mini_tool_call` ranked by brace hygiene (#346).** The 8B named the right
+  tool **40/40** and scored 0.225: it emitted three opening braces and two
+  closing ones, the whole-string parse failed, the bounded scan returned the
+  INNER object, and the scorer rejected it for having no `"function"` key. The
+  gate suite's own unwrapping layer now restores the envelope for an object
+  carrying **both** `name` and `arguments` — requiring `arguments` is what stops
+  an echoed `{"name", "description"}` menu entry from scoring, i.e. from
+  crediting copying. The missing brace is the model's own output, **not**
+  truncation; that attribution was believed and shipped in `c87fd00` before a
+  budget sweep disproved it.
+- **`score_bundled_suite` returned `0.0` for a non-callable `gen` (#355).** On
+  the three behavioural suites it scored 0.0 while the MCQ suites raised
+  `TypeError` — and in leg 2 a 0.0 reads as "the model failed every item" →
+  DON'T SHIP, so a caller error was indistinguishable from a regression **and
+  failed in the direction that looks like a finding**. Both branches now raise.
+  A *callable* that misbehaves is still a failed item, which is the correct
+  existing contract.
+- **The verdict panel silently ate its own leg-1 marker.** `render_ship_panel`
+  built its header as `... [{won_str}]`, and a bare `[no win]` is valid Rich
+  markup for an unknown tag — so the panel never printed "won"/"no win" on any
+  release up to and including v0.73.1. The plain-text rubric, which has no markup
+  parser, printed it correctly the whole time, which is why it went unnoticed.
+  Found while rendering the new noise-floor panel.
+- **Untrusted names could drive the terminal.** Benchmark and noise-floor axis
+  names come from an `--evidence` JSON file, and `rich.markup.escape` neutralises
+  Rich's `[...]` syntax and nothing else, so a raw ESC byte survived it. Both
+  render paths now strip C0/DEL first, matching the `_for_terminal` pattern
+  already used in six other command modules.
+- **The `--evidence` round-trip and the MCP `ship_evidence` tool now agree.** A
+  verdict decided against a measured floor does not replay without it, so the
+  floor is part of the evidence schema (#312's output-is-input property), and
+  **both** readers honour it — a schema extended in one consumer and not the
+  other would have made the same file replay to different decisions through the
+  CLI and through `soup mcp serve`.
+- **A duplicated `#392` CHANGELOG entry.** PR #388 branched before `18a278a`
+  moved that entry into `[0.73.1]`, and the merge re-introduced it under
+  `[Unreleased]`, listing the same fix twice.
 
-- **The MLX `adapter_config.json` shipped `target_modules` unresolved, so a default
-  MLX adapter loaded as a silent no-op (#392).** `_apply_lora` resolved
-  `target_modules: auto` into a local variable and trained the resolved modules; the
-  writer serialised the raw config value, so the shipped file carried
-  `{"keys": ["auto"]}`. On load, `linear_to_lora_layers` matches no module against that
-  and `load_weights(strict=False)` drops every LoRA tensor without a word — generation
-  with the adapter is bit-identical to the base model. `"auto"` is the schema default,
-  so this was every MLX run that did not name its modules by hand, and the file exists
-  precisely to promise the output dir loads with
-  `mlx_lm.load(..., adapter_path=...)`. Both callers now go through one
-  `resolve_mlx_target_keys()`, because two copies of "which modules did we train?" is
-  how they drifted. Reported with a root cause and a control by
-  [@armanbot-jpg](https://github.com/armanbot-jpg): hand-editing `keys` in the saved
-  file makes the very same `adapters.safetensors` produce the tuned behaviour.
+### Security
+
+- **An evidence-supplied noise floor is bounded and never silent.** A floor
+  widens the gate, so `"floors": {"mini_mmlu": 1.0}` in an evidence file masks
+  any possible drop on that axis. This does not cross a new trust boundary —
+  anyone who can edit that file can already write `{"base": 0.9, "tuned": 0.9}`
+  and force a SHIP outright — but it is a far quieter edit to miss in review, and
+  `soup ci init` wires `ship --evidence` as a PR merge gate. Values are therefore
+  bounded to `[0.0, 1.0]`, the mapping is capped at 50 axes / 256-char names
+  (mirroring the CLI's own limits), a malformed block is **refused rather than
+  dropped** (a dropped floor replays as a different verdict), and any floor that
+  exceeds `--forgetting-threshold` is announced — on stderr by the CLI, and in
+  the returned payload by the MCP tool, whose stdout is the JSON-RPC channel.
+  Neither reader is the quiet one.
+
+### Changed
+
+- **`decide_ship` now canonicalises the `TaskWin` it stores**, as it already did
+  for the benchmark deltas. It recomputes leg 1 from the raw scores, so a
+  `TaskWin` built without the floor would otherwise have rendered "won" beside a
+  DON'T SHIP decided with it.
+- **`--baseline` snapshots taken before this release are on a different scale**
+  for `mini_mmlu`, `mini_common_sense` and `mini_tool_call`, because their
+  scorers changed. A stored baseline skips the live base run, so it would be
+  diffed against a freshly-scored tuned model — measured on an *unchanged* model
+  the jumps are 0.423 → 0.731 and 0.225 → 1.000, far larger than the 0.05 gate.
+  `soup ship` now warns by name when `--baseline` supplies a stored score for an
+  affected suite. `mini_instruction` and `mini_arithmetic` are unaffected and are
+  deliberately not named: neither carries a single-letter answer, so the prompt
+  cue and the option-letter extractor never touch them (verified, 0 of 24 and 0
+  of 36 items).
 
 ## [0.73.1] - 2026-08-14
 

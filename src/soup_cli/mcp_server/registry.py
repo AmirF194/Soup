@@ -508,6 +508,8 @@ def tool_ship_evidence(args: dict) -> dict:
         build_task_win,
         compute_benchmark_deltas,
         decide_ship,
+        floor_exceeds_threshold,
+        noise_floor_from_evidence,
         verdict_to_dict,
     )
 
@@ -529,8 +531,19 @@ def tool_ship_evidence(args: dict) -> dict:
         raise McpToolError("evidence.task.mode must be 'metric' or 'judge_score'")
     if "base" not in task or "tuned" not in task:
         raise McpToolError("evidence.task needs both 'base' and 'tuned'")
+    # v0.73.2 — the evidence schema gained an optional `noise_floor` block, and
+    # this reader must honour it exactly as `commands/ship.py` does. Dropping it
+    # here would make the SAME evidence file replay to a DIFFERENT verdict
+    # through the MCP tool than through the CLI.
     try:
-        task_win = build_task_win(mode, task["base"], task["tuned"])
+        stored_floor = noise_floor_from_evidence(payload.get("noise_floor"))
+    except (TypeError, ValueError) as exc:
+        raise McpToolError(f"invalid evidence.noise_floor ({type(exc).__name__})") from exc
+
+    try:
+        task_win = build_task_win(
+            mode, task["base"], task["tuned"], noise_floor=stored_floor
+        )
     except (TypeError, ValueError) as exc:
         raise McpToolError(f"invalid evidence.task ({type(exc).__name__})") from exc
 
@@ -545,11 +558,30 @@ def tool_ship_evidence(args: dict) -> dict:
         base_scores[str(name)] = entry["base"]
         tuned_scores[str(name)] = entry["tuned"]
     try:
-        deltas = compute_benchmark_deltas(base_scores, tuned_scores, forgetting_threshold=threshold)
-        verdict = decide_ship(task_win, deltas, forgetting_threshold=threshold)
+        deltas = compute_benchmark_deltas(
+            base_scores,
+            tuned_scores,
+            forgetting_threshold=threshold,
+            noise_floor=stored_floor,
+        )
+        verdict = decide_ship(
+            task_win, deltas, forgetting_threshold=threshold, noise_floor=stored_floor
+        )
     except (TypeError, ValueError) as exc:
         raise McpToolError(f"invalid evidence.benchmarks ({type(exc).__name__})") from exc
-    return verdict_to_dict(verdict)
+    payload_out = verdict_to_dict(verdict)
+    # An evidence-supplied floor WIDENS the gate, and the CLI announces that on
+    # stderr. This transport cannot: stdout is the JSON-RPC channel and the
+    # server redirects prints away from it. So the warning rides in the RESULT,
+    # which is the MCP-native equivalent — the point is that neither reader is
+    # the quiet one an attacker would pick.
+    widened = floor_exceeds_threshold(stored_floor, threshold)
+    payload_out["warnings"] = [
+        f"noise floor {value:.4f} on {name!r} exceeds forgetting_threshold "
+        f"{threshold:.4f}; that axis is gated LOOSER than requested"
+        for name, value in widened
+    ]
+    return payload_out
 
 
 # ---------------------------------------------------------------------------

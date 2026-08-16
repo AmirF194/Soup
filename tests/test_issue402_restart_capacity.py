@@ -93,7 +93,16 @@ def test_live_persisted_run_detects_only_live_pids(tmp_path, monkeypatch):
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         conn = ExperimentTracker()._get_conn()
-        conn.execute("UPDATE runs SET pid = ? WHERE run_id = ?", (child.pid, _PRIOR_RUN))
+        # `status` is restored alongside `pid`, and that is not defensive
+        # tidiness: the assertion above reads the row through the tracker, and
+        # #401's reconcile-on-read has by then rewritten it from 'running' to
+        # 'terminated' precisely because the pid was dead. Updating only `pid`
+        # would leave a terminated row that `_live_persisted_run` correctly
+        # ignores, and the test would assert against the wrong state.
+        conn.execute(
+            "UPDATE runs SET pid = ?, status = 'running' WHERE run_id = ?",
+            (child.pid, _PRIOR_RUN),
+        )
         conn.commit()
         assert manager._live_persisted_run() == _PRIOR_RUN
     finally:

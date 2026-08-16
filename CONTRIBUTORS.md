@@ -71,6 +71,7 @@ Listed by first contribution. PR numbers link the work.
   - `MitigationLogWriter` dropped every record in silence once its parent directory vanished mid-run — the controller kept acting while its evidence stopped growing ([#398](https://github.com/MakazhanAlpamys/Soup/pull/398))
   - `soup draft distill --steps N` delivered only ~N/4.44 optimiser steps — `val_split` and `gradient_accumulation_steps` both divide the budget, and the epoch arithmetic ignored them ([#399](https://github.com/MakazhanAlpamys/Soup/pull/399))
   - The `soup ship` MCQ scorer read `oxed {A}` as no-answer — LaTeX permits a space before the brace and models emit it, and the cue tier cannot rescue it ([#396](https://github.com/MakazhanAlpamys/Soup/pull/396))
+  - `--noise-floor` shipped without a config surface, so it was the one `soup ship` gate-policy flag that could not be committed to `soup.yaml`; the bounds import from `ship_verdict` so the schema and the CLI validator cannot disagree ([#410](https://github.com/MakazhanAlpamys/Soup/pull/410))
 
 ---
 

@@ -74,6 +74,7 @@ Listed by first contribution. PR numbers link the work.
   - `--noise-floor` shipped without a config surface, so it was the one `soup ship` gate-policy flag that could not be committed to `soup.yaml`; the bounds import from `ship_verdict` so the schema and the CLI validator cannot disagree ([#410](https://github.com/MakazhanAlpamys/Soup/pull/410))
   - A dead MCP watcher left its run at `running` in the tracker forever — reconciled on read, with a Windows liveness branch because `os.kill(pid, 0)` there sends a console Ctrl+C rather than checking existence ([#407](https://github.com/MakazhanAlpamys/Soup/pull/407))
   - The one-active-execution cap lived in process memory, so a restarted MCP server could double-book it ([#408](https://github.com/MakazhanAlpamys/Soup/pull/408))
+  - The `soup ship` leg-1 noise floor was measured in `--task-mode metric` only, so in the judge modes a win smaller than the instrument's resolution still counted; it is now measured everywhere and **labelled**, so a decode-only floor is distinguishable from one carrying judge variance ([#419](https://github.com/MakazhanAlpamys/Soup/pull/419))
 
 ---
 

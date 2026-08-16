@@ -10,13 +10,102 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from soup_cli.utils.constants import EXPERIMENTS_DB, SOUP_DIR
+
+# Run status values this module reconciles. A watcher that never unwound (its
+# daemon thread was killed when the MCP server exited) leaves the run at
+# _STATUS_RUNNING forever. Reconcile-on-read rewrites such a row to
+# _STATUS_TERMINATED with an unknown (None) exit code so a lost outcome is never
+# mistaken for success. See issue #401.
+_STATUS_RUNNING = "running"
+_STATUS_TERMINATED = "terminated"
+
+# Windows liveness constants (see _windows_process_is_alive). GetExitCodeProcess
+# returns STILL_ACTIVE for a running process; a failed OpenProcess distinguishes
+# a missing pid (ERROR_INVALID_PARAMETER) from one we merely cannot open
+# (ERROR_ACCESS_DENIED — it exists).
+_WIN_STILL_ACTIVE = 259
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_ERROR_ACCESS_DENIED = 5
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    """Liveness check for Windows, where ``os.kill(pid, 0)`` cannot be used.
+
+    On Windows ``CTRL_C_EVENT`` is ``0``, so ``os.kill(pid, 0)`` routes signal 0
+    to ``GenerateConsoleCtrlEvent`` — it sends a console Ctrl+C to the process
+    group and never checks existence (it raises KeyboardInterrupt in-process
+    instead). Query the process directly: open a limited-information handle and
+    read its exit code — a live process reads ``STILL_ACTIVE`` (259). A failed
+    open means the pid is gone (ERROR_INVALID_PARAMETER) unless it is only
+    ERROR_ACCESS_DENIED, which means the process exists but we lack rights.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    handle = kernel32.OpenProcess(
+        _WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        return ctypes.get_last_error() == _WIN_ERROR_ACCESS_DENIED
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # opened but could not query — assume alive (conservative)
+        return exit_code.value == _WIN_STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Return True if a process with this PID currently exists.
+
+    POSIX uses signal 0 — a genuine existence/permission check that delivers no
+    signal: a PID owned by another user raises PermissionError and counts as
+    alive; only a missing process (ProcessLookupError / ESRCH) is dead. Any
+    other OSError is treated as not-alive so a corrupt record reconciles instead
+    of sticking on 'running' forever.
+
+    Windows needs a different primitive entirely: ``os.kill(pid, 0)`` there
+    sends a console Ctrl+C (``CTRL_C_EVENT == 0``) rather than checking
+    existence, so liveness goes through OpenProcess + GetExitCodeProcess (see
+    ``_windows_process_is_alive``).
+
+    Known limitation — PID reuse: a dead run whose PID has since been recycled
+    by an unrelated process reads as alive forever, so reconciliation never
+    fires for it. That is inherent to PID-liveness (a recorded process
+    start-time comparison would be needed to close it) and is out of scope for
+    issue #401.
+    """
+    if sys.platform == "win32":
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -331,13 +420,35 @@ class ExperimentTracker:
         conn.execute("UPDATE runs SET status = 'failed' WHERE run_id = ?", (run_id,))
         conn.commit()
 
+    def _reconcile_orphaned_run(self, run: dict) -> dict:
+        """Rewrite a stale 'running' row whose process is gone (issue #401).
+
+        Only MCP-spawned runs carry a pid; a run recorded without one is left
+        untouched because its liveness cannot be checked here. A dead pid is
+        persisted as _STATUS_TERMINATED with exit_code None (unknown) through
+        finish_execution, whose guard keeps a richer 'completed'/'failed'
+        terminal status intact and makes the rewrite idempotent.
+        """
+        pid = run.get("pid")
+        if (
+            run.get("status") == _STATUS_RUNNING
+            and pid is not None
+            and not _process_is_alive(pid)
+        ):
+            self.finish_execution(
+                run["run_id"], status=_STATUS_TERMINATED, exit_code=None
+            )
+            run["status"] = _STATUS_TERMINATED
+            run["exit_code"] = None
+        return run
+
     def list_runs(self, limit: int = 50) -> list[dict]:
         """Return list of runs ordered by created_at desc."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._reconcile_orphaned_run(dict(row)) for row in rows]
 
     def get_run(self, run_id: str) -> Optional[dict]:
         """Get full details of a single run. Supports prefix matching."""
@@ -365,7 +476,7 @@ class ExperimentTracker:
             elif len(rows) > 1:
                 return None  # ambiguous prefix
 
-        return dict(row) if row else None
+        return self._reconcile_orphaned_run(dict(row)) if row else None
 
     def get_metrics(self, run_id: str) -> list[dict]:
         """Get all metric rows for a run, ordered by step."""

@@ -77,6 +77,7 @@ Listed by first contribution. PR numbers link the work.
   - The `soup ship` leg-1 noise floor was measured in `--task-mode metric` only, so in the judge modes a win smaller than the instrument's resolution still counted; it is now measured everywhere and **labelled**, so a decode-only floor is distinguishable from one carrying judge variance ([#419](https://github.com/MakazhanAlpamys/Soup/pull/419))
 - **Faisal Fayaz** ([@Faisal01011](https://github.com/Faisal01011))
   - Added the `qwen3.5-4b-pretrain` recipe — and shipped it with a test pinning the literal repo id, which is the only thing that catches a *consistently* wrong id (wrong in both `RecipeMeta.model` and the inline `base:`, so the two still agree). Every catalog-wide invariant passes that mutation; this is the defect class that shipped `glm-5` pointing at `THUDM` instead of `zai-org` ([#422](https://github.com/MakazhanAlpamys/Soup/pull/422))
+  - Added the `deepseek-v4-flash-grpo` recipe, carrying the same literal-repo-id guard a second time — the consistently-wrong-id mutation stays green through every cross-field invariant and is caught only by that test ([#432](https://github.com/MakazhanAlpamys/Soup/pull/432))
 
 ---
 

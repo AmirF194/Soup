@@ -581,7 +581,9 @@ class TestDiskKindDetection:
 
         calls = []
         monkeypatch.setattr(ls, "_DISK_KIND_CACHE", {})
-        monkeypatch.setattr(ls, "_probe_disk_kind", lambda p: calls.append(p) or "nvme")
+        monkeypatch.setattr(
+            ls, "_probe_disk_kind", lambda p: calls.append(p) or ls.DiskClassification("nvme")
+        )
 
         assert ls.detect_disk_kind(".") == "nvme"
         assert ls.detect_disk_kind(".") == "nvme"
@@ -624,6 +626,282 @@ class TestDiskKindDetection:
         assert _windows_kind({"MediaType": "4", "BusType": "SATA"}) == "ssd"
         assert _windows_kind({"MediaType": "0", "BusType": "SATA"}) == "unknown"
         assert _windows_kind({"MediaType": "5", "BusType": "SATA"}) == "unknown"
+
+
+class TestDiskKindMeasuredFallback:
+    """#365 — a virtio disk reports ``rotational=1`` with no media hint, so the
+    flag alone refused a genuinely NVMe-backed cloud disk the overflow tier. When
+    the flag is unreliable, classify on a measured sequential read instead; the
+    HDD refusal (160 seeks/step, plan P11) must survive as a control."""
+
+    def test_throughput_at_or_above_the_floor_is_nvme_class(self):
+        from soup_cli.utils.layer_stream import (
+            NVME_TIER_MIN_BYTES_PER_S,
+            _classify_measured_read,
+        )
+
+        assert _classify_measured_read(NVME_TIER_MIN_BYTES_PER_S) == "nvme"
+        assert _classify_measured_read(1.5e9) == "nvme"  # the reported virtio disk
+
+    def test_slow_or_unmeasurable_stays_hdd(self):
+        from soup_cli.utils.layer_stream import (
+            NVME_TIER_MIN_BYTES_PER_S,
+            _classify_measured_read,
+        )
+
+        assert _classify_measured_read(NVME_TIER_MIN_BYTES_PER_S - 1) == "hdd"
+        assert _classify_measured_read(150e6) == "hdd"  # a real spinning disk
+        assert _classify_measured_read(None) == "hdd"  # can't tell -> refuse
+
+    @staticmethod
+    def _fake_linux(monkeypatch, *, devices, rotational, measured_bps):
+        """Simulate a Linux ``/sys/block`` layout so the real probe branch runs."""
+        import builtins
+        import io
+        import os
+        import platform
+        import sys
+
+        import pytest
+
+        # detect_disk_kind is a Linux /sys/block feature (it returns "unknown"
+        # elsewhere by design). This helper hardcodes forward-slash /sys paths,
+        # which os.path.join mangles on Windows, so the simulation is meaningful
+        # only on Linux — where the real CI cells and local runs exercise it.
+        if sys.platform != "linux":
+            pytest.skip("simulates a Linux /sys/block layout; disk-tier detection is Linux-only")
+
+        import soup_cli.utils.layer_stream as ls
+
+        real_listdir = os.listdir
+        real_open = builtins.open
+        real_exists = os.path.exists
+
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            os,
+            "listdir",
+            lambda p: list(devices) if str(p) == "/sys/block" else real_listdir(p),
+        )
+        monkeypatch.setattr(
+            os.path,
+            "exists",
+            lambda p: True if "/queue/rotational" in str(p) else real_exists(p),
+        )
+
+        def fake_open(p, *a, **k):
+            if "/queue/rotational" in str(p):
+                return io.StringIO(f"{rotational}\n")
+            return real_open(p, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(ls, "_measure_seq_read_bytes_per_s", lambda _p: measured_bps)
+        monkeypatch.setattr(ls, "_DISK_KIND_CACHE", {})
+
+    def test_virtio_fast_disk_now_earns_the_disk_tier(self, monkeypatch):
+        """Criterion 1: no NVMe device, ``rotational=1``, fast measured read."""
+        import soup_cli.utils.layer_stream as ls
+
+        self._fake_linux(monkeypatch, devices=["vda"], rotational=1, measured_bps=1.5e9)
+        assert ls.detect_disk_kind("/data") == "nvme"
+        # ...and choose_tier accepts it where the pre-fix "hdd" would have raised.
+        assert ls.choose_tier(1000, 10, ls.detect_disk_kind("/data")) == ls.TIER_DISK
+
+    def test_a_genuinely_slow_device_is_still_refused(self, monkeypatch):
+        """Criterion 2 (the control): the fix cannot be satisfied by 'always allow'."""
+        import soup_cli.utils.layer_stream as ls
+
+        self._fake_linux(monkeypatch, devices=["vda"], rotational=1, measured_bps=150e6)
+        assert ls.detect_disk_kind("/data") == "hdd"
+        with pytest.raises(ValueError, match="NVMe"):
+            ls.choose_tier(1000, 10, ls.detect_disk_kind("/data"))
+
+    def test_rotational_zero_is_authoritative_and_never_measures(self, monkeypatch):
+        """A device that declares itself solid state is trusted — no probe cost."""
+        import soup_cli.utils.layer_stream as ls
+
+        self._fake_linux(monkeypatch, devices=["sda"], rotational=0, measured_bps=None)
+        calls = []
+        monkeypatch.setattr(
+            ls, "_measure_seq_read_bytes_per_s", lambda _p: calls.append(1) or 9e9
+        )
+        assert ls.detect_disk_kind("/data") == "ssd"
+        assert calls == [], "measured probe ran on an authoritative rotational=0"
+
+    def test_measurement_is_bounded_and_best_effort(self, monkeypatch):
+        """Criterion 4: no O_DIRECT (or any failure) degrades to None -> refused,
+        never an unbounded or crashing probe."""
+        import os
+
+        import soup_cli.utils.layer_stream as ls
+
+        monkeypatch.delattr(os, "O_DIRECT", raising=False)
+        assert ls._measure_seq_read_bytes_per_s(".") is None
+
+    def test_refusal_cites_the_measured_rate(self):
+        """#411 review: a measurement-driven refusal names the rate that earned
+        it, not just the opaque ``'hdd'`` verdict. CPU-only — the rate travels
+        with the verdict in a ``DiskClassification``, so no /sys simulation is
+        needed to exercise the note (it runs on all CI cells, not just Linux)."""
+        import soup_cli.utils.layer_stream as ls
+
+        # A verdict DERIVED from a measurement carries the rate that produced it.
+        slow = ls.DiskClassification("hdd", measured_bps=150e6)
+        with pytest.raises(ValueError) as excinfo:
+            ls.choose_tier(1000, 10, slow)
+        message = str(excinfo.value)
+        assert "measured 0.15 GB/s" in message
+        assert "1.0 GB/s NVMe floor" in message
+
+    def test_override_verdict_does_not_cite_a_probe_rate(self):
+        """#411 re-review (blocker 2): the bug was a module global that let a
+        refusal cite a rate ABOVE the floor as the reason a disk fell UNDER it —
+        e.g. stream_disk_kind=hdd on a fast virtio disk. The rate now travels
+        with the verdict, and an override verdict carries none, so the refusal
+        structurally cannot cite a reading it did not produce. CPU-only."""
+        import soup_cli.utils.layer_stream as ls
+
+        # kind='hdd' from an override; measured_bps=None because the verdict is
+        # the user's, not the probe's (see resolve_disk_kind).
+        overridden = ls.DiskClassification("hdd", measured_bps=None)
+        with pytest.raises(ValueError) as excinfo:
+            ls.choose_tier(1000, 10, overridden)
+        assert "measured" not in str(excinfo.value)
+
+    def test_override_returns_a_measureless_classification(self, monkeypatch):
+        """resolve_disk_kind with an override must strip any probe rate, even
+        when detection measured a fast disk underneath (the #411 re-review repro:
+        detect 2.0 GB/s, override to hdd — the 2.0 must not survive)."""
+        import soup_cli.utils.layer_stream as ls
+
+        monkeypatch.setattr(
+            ls, "classify_disk_kind", lambda *_a, **_k: ls.DiskClassification("nvme", 2.0e9)
+        )
+        result = ls.resolve_disk_kind("/data", "hdd", notify=lambda _m: None)
+        assert result.kind == "hdd"
+        assert result.measured_bps is None
+
+    def test_the_read_is_repeated_and_the_best_sample_wins(self, monkeypatch, tmp_path):
+        """#411 review: the single-sample threshold is the weakness — repeat the
+        read and keep the fastest so a lone cold sample cannot refuse a fast disk.
+
+        The filesystem I/O is mocked so the timing is deterministic regardless of
+        whether the test host's temp dir actually supports O_DIRECT."""
+        import os
+        import tempfile
+        import time
+
+        import soup_cli.utils.layer_stream as ls
+
+        if getattr(os, "O_DIRECT", None) is None:
+            pytest.skip("O_DIRECT is Linux-only; the probe returns None elsewhere")
+
+        scratch = str(tmp_path / "scratch")
+        monkeypatch.setattr(tempfile, "mkstemp", lambda **_k: (123, scratch))
+        monkeypatch.setattr(os, "write", lambda _fd, b: len(b))
+        monkeypatch.setattr(os, "fsync", lambda _fd: None)
+        monkeypatch.setattr(os, "close", lambda _fd: None)
+        monkeypatch.setattr(os, "open", lambda _p, _flags: 456)
+        monkeypatch.setattr(os, "lseek", lambda _fd, _off, _whence: 0)
+        monkeypatch.setattr(os, "unlink", lambda _p: None)
+        readv_calls = []
+
+        def fake_readv(_fd, _bufs):
+            readv_calls.append(1)
+            return ls._MEASURE_READ_BYTES
+
+        monkeypatch.setattr(os, "readv", fake_readv)
+        # Three reads with elapsed 2s, 1s, 4s -> the 1s sample is the fastest.
+        clock = iter([0.0, 2.0, 0.0, 1.0, 0.0, 4.0])
+        monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+
+        best = ls._measure_seq_read_bytes_per_s(str(tmp_path))
+        assert len(readv_calls) == ls._MEASURE_READ_SAMPLES
+        assert best == ls._MEASURE_READ_BYTES / 1.0  # bytes / fastest elapsed (1s)
+
+    def test_probe_writes_into_the_target_volume_not_its_parent(
+        self, monkeypatch, tmp_path
+    ):
+        """The caller passes shard_dir (a directory); the scratch probe must land
+        INSIDE it, not its parent — else a mount point's throughput is measured
+        on the wrong filesystem."""
+        import os
+        import tempfile
+
+        import soup_cli.utils.layer_stream as ls
+
+        if not hasattr(os, "O_DIRECT"):
+            pytest.skip("O_DIRECT is Linux-only")
+
+        target = tmp_path / "shards"
+        target.mkdir()
+        seen = {}
+        real_mkstemp = tempfile.mkstemp
+
+        def spy_mkstemp(*a, **k):
+            seen["dir"] = k.get("dir")
+            return real_mkstemp(*a, **k)
+
+        monkeypatch.setattr(tempfile, "mkstemp", spy_mkstemp)
+        ls._measure_seq_read_bytes_per_s(str(target))  # O_DIRECT may fail on tmpfs; fine
+        assert seen.get("dir") == str(target)
+
+    def test_override_wins_and_reports_what_it_overrode(self, monkeypatch):
+        """Criterion 3: the override is used AND the notice names both values."""
+        import soup_cli.utils.layer_stream as ls
+
+        monkeypatch.setattr(ls, "detect_disk_kind", lambda *_a, **_k: "hdd")
+        notes = []
+        assert ls.resolve_disk_kind("/data", "nvme", notify=notes.append).kind == "nvme"
+        assert notes and "nvme" in notes[0] and "hdd" in notes[0]
+
+    def test_no_override_returns_the_detected_kind_silently(self, monkeypatch):
+        import soup_cli.utils.layer_stream as ls
+
+        monkeypatch.setattr(
+            ls, "classify_disk_kind", lambda *_a, **_k: ls.DiskClassification("ssd")
+        )
+        notes = []
+        assert ls.resolve_disk_kind("/data", None, notify=notes.append).kind == "ssd"
+        assert notes == []
+
+    def test_stream_disk_kind_is_a_footgun_without_stream_layers(self):
+        import yaml
+
+        from soup_cli.config.loader import load_config_from_string
+
+        with pytest.raises(ValueError, match="stream_disk_kind"):
+            load_config_from_string(
+                yaml.safe_dump(_stream_disk_kind_config(stream_layers=False))
+            )
+
+    def test_stream_disk_kind_is_accepted_while_streaming(self):
+        import yaml
+
+        from soup_cli.config.loader import load_config_from_string
+
+        cfg = load_config_from_string(
+            yaml.safe_dump(_stream_disk_kind_config(stream_layers=True))
+        )
+        assert cfg.training.stream_disk_kind == "nvme"
+
+
+def _stream_disk_kind_config(*, stream_layers):
+    return {
+        "base": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+        "task": "sft",
+        "backend": "transformers",
+        "modality": "text",
+        "data": {"train": "train.jsonl", "max_length": 64, "chat_template": "chatml"},
+        "training": {
+            "stream_layers": stream_layers,
+            "stream_disk_kind": "nvme",
+            "quantization": "none",
+            "batch_size": 1,
+            "epochs": 1,
+            "lora": {"r": 4, "alpha": 8, "target_modules": ["q_proj", "v_proj"]},
+        },
+    }
 
 
 class TestDoctorReportsTheDiskKind:
@@ -891,8 +1169,12 @@ class TestAutoTierFallback:
         # Pinned rather than probed: the real media type differs between this
         # box (NVMe) and a CI runner (often "unknown"), and an
         # environment-dependent tier would make these flaky rather than wrong.
+        # Patch classify_disk_kind (what resolve_disk_kind and detect_disk_kind
+        # both route through) so the pin reaches the streaming setup's lambda.
+        import soup_cli.utils.layer_stream as _ls
+
         monkeypatch.setattr(
-            "soup_cli.utils.layer_stream.detect_disk_kind", lambda *_a, **_k: disk_kind
+            _ls, "classify_disk_kind", lambda *_a, **_k: _ls.DiskClassification(disk_kind)
         )
         cfg = load_config_from_string(
             f"base: {weights}\ntask: sft\nbackend: transformers\nmodality: text\n"

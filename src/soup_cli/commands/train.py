@@ -15,7 +15,7 @@ from rich.panel import Panel
 from soup_cli.config.loader import load_config
 from soup_cli.data.loader import load_dataset
 from soup_cli.monitoring.display import TrainingDisplay
-from soup_cli.utils.gpu import detect_device, get_gpu_info
+from soup_cli.utils.gpu import detect_device, get_gpu_info, resolve_quantization
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only, no runtime import
     from soup_cli.utils.energy import EnergyMeasurement
@@ -98,6 +98,13 @@ def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
     # enable. The streaming path runs its own pre-flight instead (RAM-tier fit
     # + the plan panel in _setup_streaming_transformers).
     if getattr(cfg.training, "stream_layers", False):
+        return
+    # MLX uses Apple unified memory and its own runtime allocator, so the
+    # CUDA-shaped analytical VRAM predictor is skipped.  On a non-Apple host,
+    # ``backend: mlx`` still skips harmlessly: ``resolve_trainer`` fails on
+    # the ``mlx_lm`` import before training starts, so there is no silent
+    # hazard from bypassing the gate.
+    if getattr(cfg, "backend", None) == "mlx":
         return
 
     total_bytes = 0
@@ -966,17 +973,21 @@ def train(
                 ).items():
                     os.environ.setdefault(key, val)
 
-    # Detect hardware
-    device, device_name = detect_device()
-    gpu_info = get_gpu_info()
+    # Detect hardware with backend awareness
+    device, device_name = detect_device(backend=cfg.backend)
+    gpu_info = get_gpu_info(backend=cfg.backend)
 
-    # Auto-disable quantization on CPU (bitsandbytes doesn't support CPU)
-    if device == "cpu" and cfg.training.quantization in ("4bit", "8bit"):
-        console.print(
-            f"[yellow]Warning: {cfg.training.quantization} quantization is not "
-            "supported on CPU. Switching to quantization: none.[/]"
-        )
-        cfg.training.quantization = "none"
+    # Quantization guard: explicit decision per #423.  See resolve_quantization()
+    # docstring for the full rationale — MLX 4-bit uses pre-quantized mlx-community
+    # weights (not bitsandbytes NF4), CPU cannot run bitsandbytes at all.
+    resolved_quant, quant_warning = resolve_quantization(
+        device=device,
+        backend=cfg.backend,
+        quantization=cfg.training.quantization,
+    )
+    if quant_warning:
+        console.print(f"[yellow]{quant_warning}[/]")
+    cfg.training.quantization = resolved_quant
 
     # Hardware-fit preflight: refuse (unless --allow-oom-attempt) when the
     # analytical VRAM predictor says the run won't fit. Skips silently on CPU

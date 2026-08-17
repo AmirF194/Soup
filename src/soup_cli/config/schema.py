@@ -1745,13 +1745,32 @@ class TrainingConfig(BaseModel):
         ),
     )
     # Part E — LF / Axolotl parity.
-    bnb_4bit_use_double_quant: bool = Field(
-        default=False,
+    bnb_4bit_use_double_quant: Optional[bool] = Field(
+        # #321 — tri-state so an unset flag round-trips cleanly. Every 4-bit load
+        # path has always double-quantized, so `None` (unset) means "use the
+        # shipped default", which each 4-bit consumer resolves to True. A literal
+        # `default=True` here would make `model_dump()` emit the key on EVERY
+        # config, so re-validating a dumped non-4bit config (train.py replay,
+        # sweep round-trips, the 21 bundled recipes) would trip the footgun below.
+        # With `None` the footgun fires only on an explicit `true`. Only
+        # meaningful when quantization='4bit'.
+        default=None,
         description=(
             "Apply BNB 4-bit double-quantization (LF / Axolotl parity). "
-            "Only meaningful when quantization='4bit'. (v0.53.0)"
+            "Unset means the shipped default (on, to match every 4-bit load "
+            "path); set false to disable it. Only meaningful when "
+            "quantization='4bit'. (v0.53.0)"
         ),
     )
+
+    @property
+    def double_quant_on(self) -> bool:
+        """Resolve the tri-state ``bnb_4bit_use_double_quant`` for the 4-bit load
+        paths: unset (``None``) uses the shipped default (double-quantize), so
+        every consumer that builds a ``BitsAndBytesConfig`` reads a real bool and
+        stays in agreement (#321)."""
+        return self.bnb_4bit_use_double_quant is not False
+
     llm_int8: bool = Field(
         default=False,
         description=(
@@ -5376,9 +5395,15 @@ class SoupConfig(BaseModel):
     def _validate_bnb_4bit_double_quant(self) -> "SoupConfig":
         """v0.53.0 Part E — ``bnb_4bit_use_double_quant=True`` requires
         ``quantization='4bit'`` (silent-no-op footgun otherwise).
+
+        #321 — the field is tri-state (`None` = unset = shipped default). The
+        footgun fires only on an explicit ``True``: ``None`` and ``False`` carry
+        no intent to double-quantize, so a non-4bit config is not rejected — and
+        because unset serializes as ``None`` (not ``True``), a dumped-and-reloaded
+        config no longer trips this, unlike the old ``model_fields_set`` gate.
         """
         tcfg = self.training
-        if not tcfg.bnb_4bit_use_double_quant:
+        if tcfg.bnb_4bit_use_double_quant is not True:
             return self
         if tcfg.quantization != "4bit":
             raise ValueError(

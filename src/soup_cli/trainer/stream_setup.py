@@ -216,6 +216,12 @@ class StreamingSetupMixin:
         # an untied head stay at `dtype`, exactly as replace_with_bnb_linear
         # leaves them.
         quant = QUANT_NF4 if tcfg.quantization == "4bit" else QUANT_NONE
+        # #321 — the streamed skeleton and the shards must quantise with the
+        # SAME double-quant setting or the streamed-vs-resident bit-exactness
+        # claim breaks. Read the flag once here (resolving the tri-state unset to
+        # the shipped default) and thread it into both the sharder (its cache
+        # already keys on double_quant) and the skeleton.
+        double_quant = tcfg.double_quant_on
 
         weights_dir = resolve_model_weights(cfg.base)
         shard_dir = resolve_shard_dir(cfg.base)
@@ -228,7 +234,9 @@ class StreamingSetupMixin:
         early_free_ram = free_ram_bytes()
         if early_free_ram is not None:
             source_bytes = source_weight_bytes(weights_dir)
-            store_estimate = estimate_stream_store_bytes(source_bytes, dtype=dtype, quant=quant)
+            store_estimate = estimate_stream_store_bytes(
+                source_bytes, dtype=dtype, quant=quant, double_quant=double_quant
+            )
             if store_estimate >= early_free_ram * RAM_TIER_HEADROOM and tcfg.stream_source == "ram":
                 as_streamed = (
                     ""
@@ -271,6 +279,7 @@ class StreamingSetupMixin:
             arch=arch,
             quant=quant,
             quant_suffixes=quant_suffixes,
+            double_quant=double_quant,
             # Quantise on the device that will run the model: CPU and CUDA agree
             # on the packed nibbles but not on every float32 nested statistic.
             quant_device=str(self.device),
@@ -401,6 +410,7 @@ class StreamingSetupMixin:
             trust_remote_code=self._trust_remote_code,
             console=console,
             quant=quant,
+            double_quant=double_quant,
             tier=tier,
         )
         self.model = model

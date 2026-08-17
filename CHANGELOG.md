@@ -86,10 +86,6 @@ reproducing 70+ versions of notes.
   is wrong; it prints what it overrode beside what was detected. Disk detection
   may write a small scratch file next to the streamed shards to run the probe.
 
-### Fixed
-
-### Fixed
-
 - **The one-active-execution cap could double-book after a server restart (#402).**
   `ExecutionManager._active_run_id` is in-memory, so a restarted MCP server
   started with an empty slot, saw free capacity, and would launch a second
@@ -99,8 +95,6 @@ reproducing 70+ versions of notes.
   new execution across restarts, while a stale record whose process is gone
   frees the slot rather than wedging it shut. `docs/commands.md` now states the
   actual scope of the cap.
-
-### Fixed
 
 - **`soup ship --noise-floor` now measures the leg-1 task axis in the judge modes,
   so a judge-scored win smaller than the judge's own noise no longer counts (#403).**
@@ -131,6 +125,28 @@ reproducing 70+ versions of notes.
   unchanged. The config-load footgun (`=true` requires `quantization: 4bit`) fires only on an
   explicit `true`, and unset serializes as `None`, so a dumped-and-reloaded config no longer
   trips it.
+- **`soup env check` now flags an installed package that violates Soup's own
+  declared version bound (#368).** `pip install "soup-cli[serve-fast]"` (vllm)
+  into a training venv silently pushes `transformers` past the `<5.0.0` cap Soup
+  declares, producing an environment Soup's own metadata says is unsupported with
+  no warning at any point. `env check` audits installed versions against the
+  bounds read from package metadata — not a hardcoded copy, since a second copy
+  of the cap is exactly the drift this catches — and exits 3 when one is violated,
+  independent of any lock file. An `extra == "X"` requirement is Soup's bound
+  only when `[X]` was opted into, which the running environment cannot confirm,
+  so its marker is evaluated and it is skipped rather than raised as a false
+  positive — except for the ABI-relevant `TRACKED_PACKAGES` set, which since the
+  v0.71.0 deps-split lives in metadata *only* under `extra == "train"/"all"/
+  "dev"` and therefore includes the `transformers <5.0.0` case #368 was reported
+  about. A package is counted once even when its bound is restated under several
+  extras. If `packaging` is somehow unimportable the audit still degrades to a
+  clean report so `env check` keeps working, but now says so rather than
+  reporting a silent clean it never verified. The bounds audit no longer
+  short-circuits the lock diagnostic (both
+  print). `packaging` is a declared dependency now — the audit degraded to a
+  silent "clean" without it, the wrong direction for a checker.
+  `docs/serving-and-export.md` states the separate-environment guidance for
+  `[serve-fast]`.
 
 - **`kl_control` rewrote the trainer's β/kl_coef on every step, including a `hold`, so a
   non-acting run was numerically identical to `log_only` (#371).** `_run_bang_bang` called

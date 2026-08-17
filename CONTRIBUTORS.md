@@ -88,6 +88,9 @@ Listed by first contribution. PR numbers link the work.
 - **Achuth Reddy Bangaru** ([@AchuthReddy-16](https://github.com/AchuthReddy-16))
   - `soup train --no-reexec` printed a launch command with the user's own flags dropped, so following it trained without `--fsdp` while still succeeding. Rather than patch the printed copy, they deleted it and derived the hint from the argv that actually launches the run — then, asked for a guard, wrote one whose exclusion set forces a *decision* for every new `soup train` flag instead of letting silence make it ([#415](https://github.com/MakazhanAlpamys/Soup/pull/415))
 - **Harshit Sharma** ([@harshitthek](https://github.com/harshitthek))
+- **Emmanuel Ziggah** ([@blackcoderx](https://github.com/blackcoderx))
+  - On Windows a process that genuinely exits with code **259** was indistinguishable from `STILL_ACTIVE`, so it read as alive forever — defeating reconcile-on-read and able to wedge the MCP execution cap shut with no error an operator could act on. Disambiguated with `WaitForSingleObject`, and folded in the deduplication rather than fixing only the headline: two ~50-line copies of the liveness check became one shared module, with a test asserting identity so a third copy fails ([#436](https://github.com/MakazhanAlpamys/Soup/pull/436))
+- **Harshit Sharma** ([@harshitthek](https://github.com/harshitthek))
   - `detect_device()` did not know MLX, so an Apple Silicon run reported "CPU (no GPU detected)" and **silently rewrote** `quantization: 4bit` to `none`. The label was never the harm; asked for an explicit decision rather than a disappeared warning, they extracted `resolve_quantization()` with the mechanism named in its docstring — and extraction is also what made it testable, since the surrounding function is 0% covered ([#428](https://github.com/MakazhanAlpamys/Soup/pull/428))
 
 ---

@@ -81,6 +81,8 @@ Listed by first contribution. PR numbers link the work.
   - Added the `deepseek-v4-flash-grpo` recipe, carrying the same literal-repo-id guard a second time — the consistently-wrong-id mutation stays green through every cross-field invariant and is caught only by that test ([#432](https://github.com/MakazhanAlpamys/Soup/pull/432))
 - **Shutaru** ([@Shutaru](https://github.com/Shutaru))
   - Kept the Transformers SFT import off the MLX dispatch route, so `backend: mlx` cannot reach the PyTorch/TRL stack even if `sft.py` stops being import-light later — and, told the PR did not fix the defect its title claimed, retitled it to match reality rather than defending the framing, leaving [#394](https://github.com/MakazhanAlpamys/Soup/issues/394) open for the unexplained hang. The `mlx-smoke` job it adds asserts mlx is *present*, not merely that torch is absent: the earlier shape went green having executed nothing ([#431](https://github.com/MakazhanAlpamys/Soup/pull/431))
+- **Achuth Reddy Bangaru** ([@AchuthReddy-16](https://github.com/AchuthReddy-16))
+  - `soup train --no-reexec` printed a launch command with the user's own flags dropped, so following it trained without `--fsdp` while still succeeding. Rather than patch the printed copy, they deleted it and derived the hint from the argv that actually launches the run — then, asked for a guard, wrote one whose exclusion set forces a *decision* for every new `soup train` flag instead of letting silence make it ([#415](https://github.com/MakazhanAlpamys/Soup/pull/415))
 
 ---
 

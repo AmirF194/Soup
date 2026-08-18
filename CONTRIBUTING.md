@@ -122,7 +122,7 @@ src/soup_cli/
   templates/          - 21 built-in soup.yaml templates (YAML + manifest.json) with load_template loader (v0.39.0, +bco v0.40.0, +4 compliance v0.71.35)
   ui/                 - Web UI (FastAPI + HTML/JS SPA)
 
-tests/                - Test suite (360 files, 17907 tests)
+tests/                - Test suite (369 files, 18141 tests)
 examples/             - Real-world config examples and datasets
 ```
 
@@ -152,7 +152,7 @@ pytest tests/test_data.py::test_detect_alpaca_format -v
 pytest tests/ --cov=soup_cli --cov-report=html
 ```
 
-### Test Files (360 files)
+### Test Files (369 files)
 
 > A representative sample of the suite below. Run `pytest tests/ -v` for the complete list.
 

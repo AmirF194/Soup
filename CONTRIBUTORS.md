@@ -53,6 +53,7 @@ Listed by first contribution. PR numbers link the work.
   - Honor configured vocab expansion in the ORPO / SimPO / GRPO trainers ([#295](https://github.com/MakazhanAlpamys/Soup/pull/295))
   - `soup mcp serve --allow-execute` — the execution gate, kept a separate and stronger opt-in than `--allow-mutating`, with the tools still plan-only in this slice ([#391](https://github.com/MakazhanAlpamys/Soup/pull/391))
   - Gated `train_execute` / `export_execute` behind a single-use server confirmation token, with the config snapshotted at plan time and protected directories digested by content rather than by mtime ([#393](https://github.com/MakazhanAlpamys/Soup/pull/393))
+  - Corrected a contributor's handle carried in the v0.73.2 CHANGELOG — a one-line fix to somebody else's credit, which is the kind of thing that normally goes unmade ([#400](https://github.com/MakazhanAlpamys/Soup/pull/400))
 - **Ekaanksh Patil** ([@Ekaanksh-dev](https://github.com/Ekaanksh-dev))
   - Batch the PRM reward forward pass in `PRMScorer.__call__` (single `[B, T]` forward) ([#301](https://github.com/MakazhanAlpamys/Soup/pull/301))
 - **Sanjay Santhanam** ([@Sanjays2402](https://github.com/Sanjays2402))

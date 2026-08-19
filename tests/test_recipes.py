@@ -337,6 +337,49 @@ class TestIssue277Qwen35GrpoRecipe:
         )
 
 
+class TestIssue280Glm51DpoRecipe:
+    """Regression coverage for the glm-5.1-dpo recipe."""
+
+    def test_recipe_loads_with_expected_dpo_moe_shape(self) -> None:
+        from soup_cli.config.loader import load_config_from_string
+        from soup_cli.recipes.catalog import get_recipe
+
+        recipe = get_recipe("glm-5.1-dpo")
+        assert recipe is not None
+        assert recipe.model == "zai-org/GLM-5.1"
+        assert recipe.task == "dpo"
+
+        config = load_config_from_string(recipe.yaml_str)
+        assert config.base == "zai-org/GLM-5.1"
+        assert config.task == "dpo"
+        assert config.data.format == "dpo"
+        assert config.training.dpo_beta == 0.1
+        assert config.training.batch_size == 1
+        assert config.training.gradient_accumulation_steps == 16
+        assert config.training.lora.r == 32
+        assert config.training.moe_lora is True
+        assert config.training.gradient_checkpointing is True
+
+    def test_show_and_use_recipe(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        show_result = runner.invoke(app, ["recipes", "show", "glm-5.1-dpo"])
+        assert show_result.exit_code == 0
+        assert "zai-org/GLM-5.1" in show_result.output
+
+        monkeypatch.chdir(tmp_path)
+        use_result = runner.invoke(
+            app,
+            ["recipes", "use", "glm-5.1-dpo", "--yes"],
+        )
+        assert use_result.exit_code == 0
+        assert "zai-org/GLM-5.1" in (tmp_path / "soup.yaml").read_text(
+            encoding="utf-8"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Part A: v0.25.0 new model recipes (Llama 4, Qwen 3, Gemma 3, DeepSeek V3)
 # ---------------------------------------------------------------------------
@@ -384,7 +427,7 @@ class TestV025NewRecipes:
             assert cfg.base == recipe.model
             assert cfg.task == recipe.task
 
-    def test_catalog_size_is_145(self):
+    def test_catalog_size_is_146(self):
         """Total catalog size — grew with each release.
 
         v0.25.0 shipped 43 recipes (29 + 9 Part A + 2 Part B tools + 3 Part E MLX).
@@ -402,10 +445,11 @@ class TestV025NewRecipes:
         Issue #278 added 1 (qwen3.5-4b-pretrain) -> 143.
         Issue #279 added 1 (deepseek-v4-flash-grpo) -> 144.
         Issue #277 added 1 (qwen3.5-9b-grpo) -> 145.
+        Issue #280 added 1 (glm-5.1-dpo) -> 146.
         """
         from soup_cli.recipes.catalog import RECIPES
 
-        assert len(RECIPES) == 145
+        assert len(RECIPES) == 146
 
     def test_new_recipes_searchable(self):
         """Search returns the new recipes via keyword/task filter."""

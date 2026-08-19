@@ -309,7 +309,7 @@ class TestIssue456CrossPlatformPathComponentExtraction:
     r"""#456: cut_ce and liger must match architecture on the last component only.
 
     On Windows, naive rsplit("/") never splits on backslashes, so parent directory
-    names (e.g. C:\experiments\phi-2-runs\step-2000) over-matched architecture
+    names (e.g. C:\experiments\phi-3-runs\step-2000) over-matched architecture
     keywords when config resolution was unavailable. Tests use explicit synthetic
     paths rather than tmp_path to prevent runner directory names from leaking.
     """

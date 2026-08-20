@@ -3059,6 +3059,28 @@ class TrainingConfig(BaseModel):
             raise ValueError("training.stream_buffers must be an int, not bool")
         return v
 
+    stream_pin: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Force the page-locked (pinned) RAM store on or off. None (the "
+            "default) lets the box decide: it attempts a pinned store and falls "
+            "back to a pageable one — announcing the cost — when the host cannot "
+            "page-lock it. 'false' forces the pageable store, the only known "
+            "escape hatch when a pinning path is suspect (it was the sole "
+            "mitigation while #331 was live). 'true' forces the pinned store and "
+            "REFUSES the run on the RAM tier, naming the store size, if the box "
+            "cannot page-lock it, rather than silently degrading — page-locking "
+            "is worth up to 6.56x measured throughput, so a silent fallback "
+            "spends the whole margin the feature exists to provide. On the disk "
+            "tier (the base does not fit in RAM, so there is no RAM store to "
+            "page-lock) and on CPU (page-locking is a host-to-device transfer "
+            "optimization and there is no device) pinning is INAPPLICABLE rather "
+            "than unsatisfiable: 'true' is announced and the run proceeds "
+            "without it, so the key stays committable to a config shared between "
+            "a GPU box and a CPU box."
+        ),
+    )
+
     stream_vram_override: Optional[int] = Field(
         default=None,
         ge=0,
@@ -4935,12 +4957,14 @@ class SoupConfig(BaseModel):
                 or tcfg.stream_vram_override is not None
                 or tcfg.stream_vram_probe
                 or tcfg.stream_disk_kind is not None
+                or tcfg.stream_pin is not None
             ):
                 raise ValueError(
                     "training.stream_source / training.stream_buffers / "
                     "training.stream_vram_override / training.stream_vram_probe "
-                    "/ training.stream_disk_kind set but stream_layers is false; "
-                    "set stream_layers=true to stream the base layer-by-layer."
+                    "/ training.stream_disk_kind / training.stream_pin set but "
+                    "stream_layers is false; set stream_layers=true to stream the "
+                    "base layer-by-layer."
                 )
             return self
         # v0.72.4 — the four preference losses join SFT. DPO and KTO take their

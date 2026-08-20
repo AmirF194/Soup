@@ -56,6 +56,11 @@ reproducing 70+ versions of notes.
   quantization). `epochs: 1` and `max_length: 8192` are taken from the SFT
   sibling rather than the smaller qwen defaults, which suit a 754B MoE better.
 
+- **Cross-tokenizer draft support for `soup draft` and `soup serve` (#304 by @CODING-DARSH in #417).**
+  - `soup draft distill` now accepts target/draft pairs with mismatched tokenizers or vocabularies, automatically routing through `uld_strategy: wasserstein_aligned` (Universal Logit Distillation) instead of refusing the pair.
+  - `soup draft measure` supports cross-tokenizer acceptance measurement using decoded character-span alignment (`count_accepted_spans`) across different vocabularies and token boundaries. Target generation neutralizes only `repetition_penalty` with `repetition_penalty=1.0` (Refs #345) so target greedy argmax and draft raw-logit scoring are evaluated consistently; remaining generation processors (`no_repeat_ngram_size`, `encoder_repetition_penalty`, `min_new_tokens`, `bad_words_ids`, `suppress_tokens`, and `sequence_bias`) are not altered.
+  - `soup serve --speculative-decoding` supports cross-tokenizer draft serving via Transformers Universal Assisted Decoding (UAD) when supported by the installed `transformers` version, raising a clear error if unsupported.
+  - Compatible same-tokenizer pairs strictly preserve the existing native fast path.
 - **`data.interleave` is now wired into training-time dataset loading (#443 by @blackcoderx in #460).**
   `parse_interleave`/`InterleaveSpec` have been schema-validated and unit-tested since
   v0.42.0, but `load_dataset()` never called them — every multi-dataset mixture request

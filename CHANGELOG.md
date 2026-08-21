@@ -93,7 +93,7 @@ reproducing 70+ versions of notes.
 
 - Branch coverage for `lr_groups.py`'s `build_optimizer_param_groups`: the case
   where every parameter matches a configured group, so no `base` optimizer
-  group is appended (#273).
+  group is appended (#273 by @AmirF194 in #469).
 
 ### Changed
 

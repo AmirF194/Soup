@@ -116,6 +116,9 @@ Listed by first contribution. PR numbers link the work.
 - **Osheun** ([@Osheun](https://github.com/Osheun))
   - Added the `glm-5.1-dpo` recipe — and on a first PR, carried the literal-repo-id guard the house pattern calls for, in all four places, unprompted. It earned its keep immediately: the pre-existing family guard `test_no_recipe_references_thudm_glm5` does NOT fire on a consistently-wrong `THUDM/GLM-5.1`, because it matches the lowercase `glm-5` spelling — so the guard against that exact historical defect was theirs, not ours. They also updated `CONTRIBUTING.md`'s recipe count, the site a sibling recipe PR missed and that I missed on a release ([#452](https://github.com/MakazhanAlpamys/Soup/pull/452))
 
+- **Nurkhan Esenbek** ([@kok-o](https://github.com/kok-o))
+  - Picked up a six-hour-old issue about the cross-tokenizer acceptance bias and delivered both halves — the docstring caveat and the regression test. **Two rounds, and both were about what a test PROVES rather than whether it passes.** The first fixture fed a merged token INTO the kernel, where both sides decode to the same string and `count_accepted_spans` correctly returns full acceptance via its early return; the real bias is a SHORTER PROPOSAL LIST. And it used a 2-token target, where "dropped exactly one token" and "dropped half" are both 0.50 and indistinguishable — at 4 tokens they are 0.75 and 0.50, so the assertion encodes `1/n_gen` as claimed. They rebuilt it to both, and the result kills the unsafe mutation: a kernel that OVER-reports acceptance, where a draft looks better than it is, now fails by name ([#464](https://github.com/MakazhanAlpamys/Soup/pull/464))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are

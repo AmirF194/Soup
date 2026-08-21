@@ -27,6 +27,18 @@ reproducing 70+ versions of notes.
   `moe_expert_quant`, which is applied only by the resident setup path and was
   otherwise silently ignored.
 
+- **`live_eval.load_model_and_tokenizer` gains a `quantization` parameter; no live evaluation
+  path sets it yet (#367 by @AmirF194 in #461).**
+  `quantization="4bit"` builds the same nf4 `BitsAndBytesConfig` every other 4-bit load path
+  in this codebase uses (`"8bit"` and the unset default are also supported), and the four
+  internal callers this helper has (`make_generator`, `make_multi_generator`, `lora_probe`,
+  `measure_logit_agreement`) still call it with no `quantization`, so today an NF4-trained
+  adapter is still judged against a bf16 base it never saw during training. The follow-up is
+  wiring those four callers to a default derived from the run's own configuration (`soup ship
+  --config`, the registry entry, or the adapter's `adapter_config.json`), per the issue's own
+  Fix path; that plus `soup ship` reporting the numerics it judged with and a staleness gate
+  on mismatched-numerics evidence are left open (issue acceptance criteria 2 and 4).
+
 - **`training.stream_pin` makes layer-streaming pinning configurable (#366 by @ousamabenyounes in #416).**
   Page-locking the RAM store is chosen automatically by `decide_pinning`, and
   until now nothing could override it — so while #331 was live, `pin=False` was

@@ -14,6 +14,13 @@ reproducing 70+ versions of notes.
 
 ### Added
 
+- **Native Apple Silicon telemetry for `soup monitor` (#99 by @Amix29 in #481).**
+  The monitor now reads bounded plist output from macOS `powermetrics` and
+  renders GPU utilization and power in the existing Rich table. It reuses an
+  explicitly cached sudo credential through non-interactive `sudo -n`, never
+  reads a password, and gives an actionable Activity Monitor fallback when
+  permission or telemetry is unavailable. NVIDIA-only VRAM, memory-utilization,
+  and temperature fields remain unavailable rather than being guessed.
 - **`soup mcp serve` gains network transports: `--transport sse` and
   `--transport http` (#296 in #479).** v1 was stdio-only, which suits a client that
   spawns Soup as a subprocess but leaves remote and multi-client setups with

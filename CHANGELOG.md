@@ -14,6 +14,14 @@ reproducing 70+ versions of notes.
 
 ### Added
 
+- **`soup data best-of-n` can sample candidates from Ollama or vLLM providers
+  (#299 by @Faisal01011 in #466).** The existing local Transformers `--base` path stays
+  the default, while `--provider ollama|vllm --model <m> [--base-url <url>]`
+  draws each prompt's N candidates through the existing SSRF-validated raw-
+  completion seam. Provider and model are recorded in `_best_of_n` provenance;
+  Anthropic is refused by name because its Messages API has no raw-completion
+  endpoint, and local-only flags cannot be silently ignored in provider mode.
+
 - **Layer streaming now accepts Qwen3.5 MoE text checkpoints whose decoder
   layers do not expose exactly the same weight keys in every block (by
   @Shutaru in #426).** The sharder now records per-layer shard headers instead of

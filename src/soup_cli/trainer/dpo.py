@@ -75,7 +75,11 @@ class DPOTrainerWrapper(StreamingSetupMixin):
         from datasets import Dataset
         from trl import DPOConfig, DPOTrainer
 
-        from soup_cli.trainer._trl_compat import prompt_length_kwargs
+        from soup_cli.trainer._trl_compat import (
+            config_accepts,
+            enforce_preference_sequence_limit,
+            prompt_length_kwargs,
+        )
 
         # Enable Rich progress bar for HuggingFace downloads
         from soup_cli.trainer.sft import _enable_hf_transfer_progress
@@ -212,6 +216,30 @@ class DPOTrainerWrapper(StreamingSetupMixin):
             eval_dataset=eval_ds,
             processing_class=self.tokenizer,
         )
+        if not config_accepts(DPOConfig, "max_prompt_length"):
+            # TRL 0.29 removed the prompt cap and its new DPO tokenizer leaves
+            # max_length enforcement to callers. Cap the prepared token ids so
+            # text and conversational rows keep TRL's own rendering semantics.
+            cap_kwargs = {
+                "max_length": cfg.data.max_length,
+                "max_prompt_length": cfg.data.max_length // 2,
+                "truncation_mode": dpo_config.truncation_mode,
+            }
+            self.trainer.train_dataset = enforce_preference_sequence_limit(
+                self.trainer.train_dataset, **cap_kwargs
+            )
+            if self.trainer.eval_dataset is not None:
+                self.trainer.eval_dataset = enforce_preference_sequence_limit(
+                    self.trainer.eval_dataset, **cap_kwargs
+                )
+        if tcfg.stream_layers:
+            # TRL 0.29 snapshots the initial policy as a frozen ``ref`` LoRA
+            # adapter. PEFT creates that late adapter on the streamed decoder's
+            # meta skeleton, where TRL's copy_ is a no-op, so give the snapshot
+            # real adapter-sized storage before its first reference forward.
+            from soup_cli.utils.layer_stream_runtime import materialize_meta_adapter_copy
+
+            materialize_meta_adapter_copy(self.model)
 
         # #359 - the same exposure #336 fixed in sft.py: with LoRA the
         # no-decay optimizer group is empty, DeepSpeed drops it, and the LR
@@ -282,9 +310,9 @@ class DPOTrainerWrapper(StreamingSetupMixin):
         if tcfg.quantization in ("4bit", "8bit", "mxfp4"):
             self.model = prepare_model_for_kbit_training(self.model)
 
-        target_modules = tcfg.lora.target_modules
-        if target_modules == "auto":
-            target_modules = None
+        from soup_cli.utils.peft_wiring import resolve_lora_target_modules
+
+        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
 
         lora_config = LoraConfig(
             r=tcfg.lora.r,

@@ -15,8 +15,8 @@ from soup_cli.utils.gpu import (
     bf16_fp16_flags,
     estimate_batch_size,
     model_size_from_name,
+    resolve_base_load_dtype,
     resolve_device_map,
-    resolve_frozen_base_load_dtype,
 )
 from soup_cli.utils.mixed_precision import align_trainable_dtype_for_fp16
 from soup_cli.utils.seeding import apply_training_seed, training_seed_kwargs
@@ -1113,8 +1113,8 @@ class SFTTrainerWrapper(StreamingSetupMixin):
           default this issue exists to remove — the parameters an optimizer
           actually steps stay fp32 master weights rather than silently
           inheriting whatever the checkpoint happened to be stored in. This
-          half is genuinely SFT's own — the shared helper below has no
-          full-fine-tuning branch.
+          branch is centralized in ``resolve_base_load_dtype`` so SFT and
+          pretraining LISA cannot drift.
         - Frozen base (LoRA / QLoRA — the base never receives an optimizer
           step): delegate to ``resolve_frozen_base_load_dtype`` (#492, added
           for the other twelve trainers) rather than re-deriving the same
@@ -1139,11 +1139,9 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         4.46.1) — not a silent no-op, since transformers only forwards a
         kwarg into the config if the config already ``hasattr`` it.
         """
-        if is_full_finetune(tcfg):
-            import torch  # lazy — sft.py has no top-level torch import (house style)
-
-            return torch.float32
-        return resolve_frozen_base_load_dtype(self.device)
+        return resolve_base_load_dtype(
+            self.device, full_finetune=is_full_finetune(tcfg)
+        )
 
     @staticmethod
     def _as_sft_config(training_args, max_length):
@@ -1340,19 +1338,12 @@ class SFTTrainerWrapper(StreamingSetupMixin):
             )
         elif tcfg.lisa_enabled:
             # v0.71.34 #267 — LISA layerwise importance sampling. Full-FT of a
-            # rotating set of decoder layers (LoRA off). The model stays FULLY
-            # trainable here so HF's create_optimizer (built before
-            # on_train_begin) includes every decoder param in its param groups;
-            # LisaCallback then flips requires_grad each interval — frozen
-            # params get grad=None and AdamW skips them. enable_input_require_grads
-            # keeps grad-checkpointing safe.
-            if hasattr(self.model, "enable_input_require_grads"):
-                self.model.enable_input_require_grads()
-            console.print(
-                f"[green]LISA:[/] layerwise importance sampling "
-                f"({tcfg.lisa_num_layers} layer(s) every "
-                f"{tcfg.lisa_interval_steps} steps, LoRA off)"
-            )
+            # rotating set of decoder layers (LoRA off). Centralised in
+            # ``peft_wiring.apply_lisa_setup`` so this trainer and the pretrain
+            # one (#307) cannot drift — same policy as block_expansion.
+            from soup_cli.utils.peft_wiring import apply_lisa_setup
+
+            apply_lisa_setup(self.model, tcfg, console)
         elif tcfg.lora.r == 0:
             # #340 — plain full fine-tuning. Until now the `else` below applied
             # LoRA unconditionally and the only way to train without an adapter

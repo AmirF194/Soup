@@ -234,12 +234,21 @@ def _heterogeneous_meta_model():
     class _Decoder(nn.Module):
         def __init__(self):
             super().__init__()
+            self.embed_tokens = nn.Embedding(8, 4, device="meta")
             self.layers = nn.ModuleList([_Layer0(), _Layer1()])
 
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
             self.model = _Decoder()
+            self.lm_head = nn.Linear(4, 8, bias=False, device="meta")
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+        def get_input_embeddings(self):
+            return self.model.embed_tokens
+
+        def get_output_embeddings(self):
+            return self.lm_head
 
     return _Model()
 
@@ -462,6 +471,7 @@ class TestQwen35StreamingSharder:
         assert "linear_attn.in_proj_qkv.weight" in layer1
         assert "self_attn.q_proj.weight" not in layer1
         assert "model.embed_tokens.weight" in extras
+        assert index.large_keys == ()
 
     def test_sharder_refuses_canonical_key_collisions(self, tmp_path):
         from soup_cli.utils.layer_shard import shard_checkpoint

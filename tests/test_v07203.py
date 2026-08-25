@@ -52,6 +52,17 @@ MEASURED_VRAM_GRID = [
     dict(label="Qwen2.5-0.5B B8 S512", batch=8, seq=512, peak=9266992640, **_QWEN),
 ]
 
+# Accounting control for #324. This is deliberately separate from the measured
+# accuracy grid above: its peak is the first real row plus one additive
+# vocabulary slot, so it guards composition without pretending to be another
+# hardware measurement.
+_LARGE_SLOT_ACCOUNTING_ROW = {
+    **MEASURED_VRAM_GRID[0],
+    "label": "SmolLM2-135M B1 S256 + 16 MiB vocabulary-slot control",
+    "large_layer_bytes": 16 * 1024 * 1024,
+    "peak": MEASURED_VRAM_GRID[0]["peak"] + 16 * 1024 * 1024,
+}
+
 
 def _predict(row):
     from soup_cli.utils.layer_stream import estimate_stream_peak_vram
@@ -67,6 +78,7 @@ def _predict(row):
         n_layers=row["n_layers"],
         seq_len=row["seq"],
         batch_size=row["batch"],
+        large_layer_bytes=row.get("large_layer_bytes", 0),
     )
 
 
@@ -147,7 +159,9 @@ class TestPeakVramReproducesTheMeasuredGrid:
         err = abs(predicted - measured) / measured
         assert err < 0.01, f"predicted {predicted} vs measured {measured} ({err:.2%})"
 
-    @pytest.mark.parametrize("row", MEASURED_VRAM_GRID, ids=lambda r: r["label"])
+    @pytest.mark.parametrize(
+        "row", MEASURED_VRAM_GRID + [_LARGE_SLOT_ACCOUNTING_ROW], ids=lambda r: r["label"]
+    )
     def test_never_under_predicts(self, row):
         """The only safe direction for a gate that refuses configs. An estimator
         that is accurate on average but sometimes low still OOMs users.
@@ -269,6 +283,32 @@ class TestUntiedEmbeddingsAreBudgeted:
         tied = estimate_stream_peak_vram(extras_bytes=1_000_000, **kw)
         untied = estimate_stream_peak_vram(extras_bytes=2_000_000, **kw)
         assert untied - tied == 1_000_000
+
+    def test_streaming_large_layers_reclaims_exactly_one_untied_matrix(self):
+        from soup_cli.utils.layer_stream import estimate_stream_peak_vram
+
+        kw = dict(
+            layer_bytes=1000,
+            buffers=2,
+            adapter_params=0,
+            vocab_size=100,
+            hidden_size=8,
+            intermediate_size=16,
+            n_layers=2,
+            seq_len=4,
+            batch_size=1,
+        )
+        old_untied = estimate_stream_peak_vram(extras_bytes=2_000_000, **kw)
+        streamed_untied = estimate_stream_peak_vram(
+            extras_bytes=0, large_layer_bytes=1_000_000, **kw
+        )
+        old_tied = estimate_stream_peak_vram(extras_bytes=1_000_000, **kw)
+        streamed_tied = estimate_stream_peak_vram(
+            extras_bytes=0, large_layer_bytes=1_000_000, **kw
+        )
+
+        assert old_untied - streamed_untied == 1_000_000
+        assert old_tied == streamed_tied
 
     def test_published_8b_nf4_row_is_bracketed_on_the_safe_side(self):
         """Independent check — nothing in the formula was fitted to this row.
@@ -1810,10 +1850,18 @@ class TestRequirePinSurvivesEveryHop:
         import soup_cli.utils.layer_stream_runtime as rt
 
         class _FailsWhenPinned(rt.RamSource):
-            def __init__(self, shard_dir, n_layers, spec, *, pin=True):
+            def __init__(
+                self, shard_dir, n_layers, spec, *, pin=True, shard_paths=None
+            ):
                 if pin:
                     raise RuntimeError("CUDA error: cannot allocate pinned memory")
-                super().__init__(shard_dir, n_layers, spec, pin=False)
+                super().__init__(
+                    shard_dir,
+                    n_layers,
+                    spec,
+                    pin=False,
+                    shard_paths=shard_paths,
+                )
 
         monkeypatch.setattr(rt, "RamSource", _FailsWhenPinned)
 

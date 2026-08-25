@@ -280,6 +280,18 @@ class TestVramEstimate:
         three = estimate_stream_vram(layer_bytes=100, buffers=3, embed_bytes=0, workspace_bytes=0)
         assert three - two == 100
 
+    def test_large_layer_slot_is_charged_once(self):
+        from soup_cli.utils.layer_stream import estimate_stream_vram
+
+        got = estimate_stream_vram(
+            layer_bytes=100,
+            buffers=2,
+            embed_bytes=25,
+            large_layer_bytes=400,
+            workspace_bytes=0,
+        )
+        assert got == 2 * 100 + 25 + 400
+
     def test_logits_budget_includes_the_whole_loss_path(self):
         """plan P5: logits, not weights, OOM you first on a small card.
 
@@ -351,6 +363,26 @@ class TestStreamPlan:
         assert plan.store_bytes == 36 * 154 * 10**6
         # 5.5 GB store fits under a 7 GB pinned ceiling
         assert plan.pinned is True
+
+    def test_large_layers_count_in_host_store_but_only_one_device_slot(self):
+        from soup_cli.utils.layer_stream import build_stream_plan
+
+        plan = build_stream_plan(
+            arch="llama",
+            n_layers=2,
+            layer_bytes=100,
+            embed_bytes=25,
+            large_store_bytes=800,
+            large_buffer_bytes=400,
+            available_ram_bytes=10_000,
+            pinned_limit_bytes=10_000,
+            buffers=2,
+            disk_kind="nvme",
+        )
+
+        assert plan.store_bytes == 2 * 100 + 800
+        assert plan.large_store_bytes == 800
+        assert plan.buffer_bytes == 2 * 100 + 400
 
     def test_plan_falls_back_to_pageable_and_records_a_note(self):
         from soup_cli.utils.layer_stream import build_stream_plan
@@ -516,7 +548,7 @@ def _write_safetensors(path, tensors):
     return path
 
 
-def _fake_weights_dir(tmp_path, n_layers=3, split=False):
+def _fake_weights_dir(tmp_path, n_layers=3, split=False, untied=False):
     import torch
 
     torch.manual_seed(0)
@@ -530,6 +562,8 @@ def _fake_weights_dir(tmp_path, n_layers=3, split=False):
         "model.embed_tokens.weight": torch.randn(32, 8, dtype=torch.float32),
         "model.norm.weight": torch.randn(8, dtype=torch.float32),
     }
+    if untied:
+        extras["lm_head.weight"] = torch.randn(32, 8, dtype=torch.float32)
     src = tmp_path / "weights"
     src.mkdir()
     if split:
@@ -567,16 +601,47 @@ class TestShardRoundTrip:
                 short = key[len("model.layers.1.") :]
                 assert torch.equal(blob[short], tensor), short
 
-    def test_extras_are_separated_from_layers(self, tmp_path):
+    def test_tied_embedding_stays_resident_and_unaffected(self, tmp_path):
+        import torch
         from safetensors.torch import load_file
 
         from soup_cli.utils.layer_shard import extras_shard_path, shard_checkpoint
 
         src, _, extras = _fake_weights_dir(tmp_path)
         out = str(tmp_path / "shards")
-        shard_checkpoint(src, out, dtype="float32")
-        blob = load_file(extras_shard_path(out))
-        assert set(blob) == set(extras)
+        index = shard_checkpoint(src, out, dtype="float32")
+        resident = load_file(extras_shard_path(out))
+
+        assert set(resident) == {"model.embed_tokens.weight", "model.norm.weight"}
+        assert torch.equal(
+            resident["model.embed_tokens.weight"], extras["model.embed_tokens.weight"]
+        )
+        assert index.large_keys == ()
+
+    def test_untied_vocabulary_pair_is_split_from_resident_extras(self, tmp_path):
+        import torch
+        from safetensors.torch import load_file
+
+        from soup_cli.utils.layer_shard import (
+            extras_shard_path,
+            large_shard_path,
+            shard_checkpoint,
+        )
+
+        src, _, weights = _fake_weights_dir(tmp_path, untied=True)
+        out = str(tmp_path / "shards")
+        index = shard_checkpoint(src, out, dtype="float32")
+
+        resident = load_file(extras_shard_path(out))
+        embedding = load_file(large_shard_path(out, "model.embed_tokens.weight"))
+        head = load_file(large_shard_path(out, "lm_head.weight"))
+
+        assert set(resident) == {"model.norm.weight"}
+        assert torch.equal(
+            embedding["model.embed_tokens.weight"], weights["model.embed_tokens.weight"]
+        )
+        assert torch.equal(head["lm_head.weight"], weights["lm_head.weight"])
+        assert index.large_keys == ("lm_head.weight", "model.embed_tokens.weight")
 
     def test_layers_split_across_source_files_are_gathered(self, tmp_path):
         """Real checkpoints shard by size, not by layer boundary."""
@@ -1134,9 +1199,9 @@ def _mps_is_the_accelerator():
 
     transformers picks `mps` as its default device there, while this suite
     builds the streamed model on `cpu` — the two then disagree and any real
-    training step raises "found at least two devices". v0.72.0 measured CUDA
-    and CPU only; MPS is untested, so the step test is skipped rather than
-    making an unverified claim about it.
+    training step raises "found at least two devices". Most historical step
+    tests therefore stay on CPU; dedicated MPS controls exercise the hardware
+    path explicitly.
     """
     try:
         import torch
@@ -1186,7 +1251,7 @@ def _tiny_lora():
     )
 
 
-def _build_streamed_cpu(tmp_path, n_layers=2, tie=True, buffers=2):
+def _build_streamed_cpu(tmp_path, n_layers=2, tie=True, buffers=2, device="cpu"):
     from soup_cli.utils.layer_shard import shard_checkpoint
     from soup_cli.utils.layer_stream_runtime import build_streamed_model
 
@@ -1195,7 +1260,7 @@ def _build_streamed_cpu(tmp_path, n_layers=2, tie=True, buffers=2):
     index = shard_checkpoint(weights, shards, dtype="float32", arch="llama")
     model, runtime = build_streamed_model(
         model_id=weights, shard_dir=shards, index=index,
-        lora_config=_tiny_lora(), device="cpu", dtype="float32",
+        lora_config=_tiny_lora(), device=device, dtype="float32",
         buffers=buffers, pin=False, seed=3,
     )
     return model, runtime, resident, weights
@@ -1516,6 +1581,104 @@ class TestStreamedForwardParityCpu:
             want = ref(input_ids=ids).logits
         assert torch.equal(got, want), (got - want).abs().max().item()
 
+    def test_untied_large_layers_share_one_slot_and_match_resident(self, tmp_path):
+        """#324: two distinct vocabulary matrices must not mean two VRAM copies."""
+        import torch
+        from peft import get_peft_model
+
+        model, runtime, resident, _ = _build_streamed_cpu(tmp_path, tie=False)
+        ref = get_peft_model(resident, _tiny_lora())
+        _copy_lora(model, ref)
+
+        ids = torch.randint(0, 64, (1, 12))
+        with torch.no_grad():
+            got = model(input_ids=ids).logits
+            want = ref(input_ids=ids).logits
+
+        assert torch.equal(got, want), (got - want).abs().max().item()
+        matrix_bytes = 64 * 32 * 4
+        assert runtime.large_pool is not None
+        assert set(runtime.large_pool.specs) == {
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        }
+        assert runtime.large_pool.nbytes == matrix_bytes
+        assert runtime.large_pool.loads == 2
+        assert runtime.large_pool.owner == "lm_head.weight"
+
+    def test_untied_large_layers_match_resident_backward_gradients(self, tmp_path):
+        """The untied slot must preserve training numerics, not only logits."""
+        import torch
+        from peft import get_peft_model
+
+        from soup_cli.utils.layer_stream_runtime import canonical_named_parameters
+
+        model, _runtime, resident, _ = _build_streamed_cpu(tmp_path, tie=False)
+        ref = get_peft_model(resident, _tiny_lora())
+
+        generator = torch.Generator().manual_seed(17)
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.copy_(
+                        torch.randn(parameter.shape, generator=generator) * 0.02
+                    )
+        _copy_lora(model, ref)
+        model.eval()
+        ref.eval()
+        model.zero_grad(set_to_none=True)
+        ref.zero_grad(set_to_none=True)
+
+        ids = torch.randint(0, 64, (2, 12), generator=generator)
+        streamed_loss = model(input_ids=ids, labels=ids).loss
+        resident_loss = ref(input_ids=ids, labels=ids).loss
+        assert torch.equal(streamed_loss, resident_loss), (
+            streamed_loss - resident_loss
+        ).abs().item()
+
+        streamed_loss.backward()
+        resident_loss.backward()
+        streamed_grads = {
+            name: parameter.grad
+            for name, parameter in canonical_named_parameters(model)
+            if "lora_" in name and parameter.grad is not None
+        }
+        resident_grads = {
+            name: parameter.grad
+            for name, parameter in canonical_named_parameters(ref)
+            if "lora_" in name and parameter.grad is not None
+        }
+
+        assert streamed_grads and set(streamed_grads) == set(resident_grads)
+        assert any(float(gradient.abs().sum()) > 0.0 for gradient in streamed_grads.values())
+        for name, gradient in streamed_grads.items():
+            assert torch.equal(gradient, resident_grads[name]), name
+
+    def test_tied_embedding_control_uses_the_unchanged_resident_path(self, tmp_path):
+        import torch
+
+        model, runtime, _resident, _ = _build_streamed_cpu(tmp_path, tie=True)
+        model(input_ids=torch.randint(0, 64, (1, 8)))
+
+        assert runtime.large_pool is None
+        assert not model.get_input_embeddings().weight.is_meta
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
+    def test_all_aliases_of_a_tied_boundary_module_are_replaced(self):
+        import torch.nn as nn
+
+        from soup_cli.utils.layer_stream_runtime import _replace_module_references
+
+        root = nn.Module()
+        shared = nn.Linear(4, 4, bias=False)
+        replacement = nn.Identity()
+        root.input = shared
+        root.output = shared
+
+        assert _replace_module_references(root, shared, replacement) == 2
+        assert root.input is replacement
+        assert root.output is replacement
+
     def test_layer_zero_adapter_gradient_is_non_zero(self, tmp_path):
         """plan P2: a detach()/no_grad() around the base severs the graph.
         Loss still falls (upper layers learn), so only this catches it."""
@@ -1541,6 +1704,28 @@ class TestStreamedForwardParityCpu:
         ids = torch.randint(0, 64, (1, 10))
         with torch.no_grad():
             assert torch.equal(two(input_ids=ids).logits, three(input_ids=ids).logits)
+
+
+@pytest.mark.skipif(not _mps_is_the_accelerator(), reason="needs Apple Silicon MPS")
+class TestStreamedLargeLayerParityMps:
+    def test_untied_logits_match_resident(self, tmp_path):
+        """Supplementary #324 hardware control; the required CI oracle is CPU."""
+        import torch
+        from peft import get_peft_model
+
+        model, runtime, resident, _ = _build_streamed_cpu(
+            tmp_path, tie=False, device="mps"
+        )
+        ref = get_peft_model(resident.to("mps"), _tiny_lora())
+        _copy_lora(model, ref)
+        ids = torch.randint(0, 64, (1, 12), device="mps")
+
+        with torch.no_grad():
+            got = model(input_ids=ids).logits
+            want = ref(input_ids=ids).logits
+
+        assert torch.equal(got, want), (got - want).abs().max().item()
+        assert runtime.large_pool.loads == 2
 
 
 def _copy_lora(src, dst):
@@ -1999,6 +2184,35 @@ class TestPrefetchDirectionIsExplicit:
         pre.prime()  # next step's forward
         assert pre.direction == 1
 
+    def test_output_prefetch_runs_once_per_forward_not_during_backward(self):
+        from soup_cli.utils.layer_stream_runtime import StreamPrefetcher
+
+        class _Pool:
+            n = 2
+
+            def __init__(self):
+                self.owner = [None, None]
+
+            def slot_for(self, idx):
+                return idx % self.n
+
+            def load_async(self, idx, source, stream=None):
+                self.owner[self.slot_for(idx)] = idx
+
+        tails = []
+        pre = StreamPrefetcher(
+            _Pool(), source=None, n_layers=3, tail_prefetch=lambda: tails.append("head")
+        )
+        pre.prime()
+        for idx in (0, 1, 2, 2, 1, 0):
+            pre.advance(idx)
+        assert tails == ["head"]
+
+        pre.prime()
+        for idx in (0, 1, 2):
+            pre.advance(idx)
+        assert tails == ["head", "head"]
+
 
 class TestShardCacheIdentityBinding:
     """SILENT FAILURE — the shard cache is keyed by a model SLUG. If the source
@@ -2456,7 +2670,7 @@ class TestCachedIndexInvalidation:
     def _prepare(self, tmp_path):
         from soup_cli.utils.layer_shard import shard_checkpoint
 
-        src, _, _ = _fake_weights_dir(tmp_path)
+        src, _, _ = _fake_weights_dir(tmp_path, untied=True)
         out = str(tmp_path / "shards")
         shard_checkpoint(src, out, dtype="float32")
         return src, out
@@ -2477,6 +2691,15 @@ class TestCachedIndexInvalidation:
         shard_checkpoint(src, out, dtype="float32")
         assert os.path.exists(layer_shard_path(out, 1))
 
+    def test_missing_large_layer_shard_reshards(self, tmp_path):
+        from soup_cli.utils.layer_shard import large_shard_path, shard_checkpoint
+
+        src, out = self._prepare(tmp_path)
+        path = large_shard_path(out, "model.embed_tokens.weight")
+        os.unlink(path)
+        shard_checkpoint(src, out, dtype="float32")
+        assert os.path.exists(path)
+
     def test_index_with_missing_keys_reshards(self, tmp_path):
         import json as _json
 
@@ -2492,7 +2715,7 @@ class TestCachedIndexInvalidation:
 
 class TestMaterializeExtrasGuard:
     def test_incomplete_extras_shard_is_refused(self, tmp_path):
-        """A corrupt extras shard must fail loudly, not leave meta embeddings."""
+        """A corrupt extras shard must fail loudly, not leave resident weights meta."""
         from safetensors.torch import load_file, save_file
 
         from soup_cli.utils.layer_shard import extras_shard_path, shard_checkpoint
@@ -2505,7 +2728,7 @@ class TestMaterializeExtrasGuard:
 
         blob = {k: v.clone() for k, v in load_file(extras_shard_path(shards)).items()}
         gc.collect()  # Windows refuses to rewrite a still-mmapped file (err 1224)
-        blob.pop("model.embed_tokens.weight")
+        blob.pop("model.norm.weight")
         save_file(blob, extras_shard_path(shards))
 
         model = build_meta_skeleton(weights, dtype="float32")

@@ -5372,10 +5372,10 @@ class SoupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_interleave_compat(self) -> "SoupConfig":
-        """#443 — data.interleave requires data.train to be a list of local
-        file paths, and is fully parsed here rather than in the field
-        validator: num_datasets = len(data.train) is a parse-time constant
-        now that train can be list-shaped.
+        """#443 — data.interleave requires data.train to be a list, and is
+        fully parsed here rather than in the field validator:
+        num_datasets = len(data.train) is a parse-time constant now that
+        train can be list-shaped.
 
         packing / multipack concatenate rows into fixed-length blocks, so a
         per-source mixture ratio stops being meaningful at block
@@ -5383,14 +5383,30 @@ class SoupConfig(BaseModel):
         _validate_replay_compat's identical reasoning for the same
         packing/multipack conflict, one validator up.
 
-        streaming and HF-hub dataset names are follow-up work (#459,
-        blocked on #443) — v1 refuses them at parse time with a message
-        naming the limitation, rather than silently only mixing the
-        local-file subset.
+        #459 extends #443's local-files-only v1 to two more shapes, each a
+        DECIDED dispatch rather than an emergent one — every entry is
+        classified once (local file / remote URI / HF-hub name) and the
+        classes may not mix within one data.train list:
+
+        - All entries local files or remote URIs, data.streaming=true: the
+          streaming interleave path (loader._load_interleaved_streaming_datasets)
+          delegates to datasets.interleave_datasets / concatenate_datasets —
+          see that function's docstring for the strategy-name mapping. A
+          remote URI entry without streaming=true still refuses (no
+          non-streaming multi-remote-file loader exists).
+        - All entries HF-hub dataset names: the hub interleave path
+          (loader._load_interleaved_hub_datasets), always eager (never
+          streamed) in this cut — streaming N separately-shaped hub
+          datasets through their own split negotiation is a distinct,
+          larger effort this issue does not implement, so that combination
+          keeps refusing, by name.
+        - Anything else (a list mixing hub names with local/remote entries)
+          keeps refusing — there is no decided answer for how a hub split
+          and a local file's row count should reconcile.
         """
         from pathlib import Path
 
-        from soup_cli.utils.data_pipeline import is_remote_uri, parse_interleave
+        from soup_cli.utils.data_pipeline import parse_interleave
 
         data = self.data
         train_is_list = isinstance(data.train, list)
@@ -5399,7 +5415,8 @@ class SoupConfig(BaseModel):
             if not train_is_list:
                 raise ValueError(
                     "data.interleave requires data.train to be a list of "
-                    ">= 2 local file paths"
+                    ">= 2 local file paths, remote URIs, or HF-hub dataset "
+                    "names"
                 )
             # Full parse now that num_datasets is a parse-time constant —
             # validates strategy/probs shape against the actual dataset
@@ -5418,19 +5435,66 @@ class SoupConfig(BaseModel):
                     "training.multipack (bin-packing breaks the "
                     "per-source mixture ratio)"
                 )
-            if data.streaming:
-                raise ValueError(
-                    "data.interleave does not support data.streaming=true "
-                    "(follow-up: #459) — disable streaming or drop "
-                    "interleave"
-                )
-            for entry in data.train:
-                if is_remote_uri(entry) or not Path(entry).suffix:
+
+            # #459 — classify every entry, then dispatch. Kept local to this
+            # validator (rather than exported) since loader.py has its own
+            # copy for the actual load-time dispatch; the two must agree,
+            # so keep the classification RULE (suffix-in-allowlist /
+            # "://"-in-entry) the only thing either site encodes, not the
+            # classify function itself — see loader._classify_train_entry's
+            # docstring.
+            #
+            # _local_file_extensions duplicates loader.SUPPORTED_EXTENSIONS
+            # literally (not imported — that would import loader.py, which
+            # imports DataConfig from this module, an import cycle; also
+            # loader.py intentionally carries the torch-adjacent deps this
+            # module stays light of). A suffix must be one of these to
+            # count as 'local' (#468 review fix) — "any non-empty
+            # Path.suffix" previously misclassified any hub name with a
+            # version number (``teknium/OpenHermes-2.5``,
+            # ``mlfoundations/dclm-baseline-1.0``) as a local file.
+            _local_file_extensions = {".jsonl", ".json", ".csv", ".parquet", ".txt"}
+
+            def _kind(entry: str) -> str:
+                # Scheme-agnostic "://" sniff (#468 review fix), not an
+                # is_remote_uri allowlist check — mirrors loader.py's
+                # _looks_like_remote_uri. The scheme allowlist is enforced
+                # downstream, at load time, by validate_remote_uri (refuses
+                # a non-allowlisted scheme BY NAME); classifying only
+                # allowlisted schemes as 'remote' here let e.g. an
+                # https://... entry with a familiar suffix fall through to
+                # 'local' and reach hf_load unvalidated instead.
+                if "://" in entry:
+                    return "remote"
+                if Path(entry).suffix.lower() in _local_file_extensions:
+                    return "local"
+                return "hub"
+
+            kinds = {_kind(entry) for entry in data.train}
+
+            if kinds == {"hub"}:
+                if data.streaming:
                     raise ValueError(
-                        f"data.interleave only supports local file paths; "
-                        f"{entry!r} looks like a remote URI or an HF-hub "
-                        "dataset name (follow-up: #459)"
+                        "data.interleave with an all-HF-hub-dataset-name "
+                        "data.train does not support data.streaming=true — "
+                        "streaming N separately-shaped hub datasets and "
+                        "reconciling their splits is unimplemented; drop "
+                        "streaming or use local files"
                     )
+            elif kinds <= {"local", "remote"}:
+                if not data.streaming and "remote" in kinds:
+                    raise ValueError(
+                        "data.interleave list entries that are remote URIs "
+                        "require data.streaming=true (no non-streaming "
+                        "multi-remote-file loader exists) — set "
+                        "data.streaming: true or use only local file paths"
+                    )
+            else:
+                raise ValueError(
+                    "data.interleave list entries must be all local file "
+                    "paths / remote URIs, or all HF-hub dataset names — "
+                    f"not a mix (got kinds={sorted(kinds)})"
+                )
         elif train_is_list:
             raise ValueError(
                 "data.train as a list requires data.interleave to be set "

@@ -19,18 +19,21 @@ Two strategies:
 
 2. **Fallback**: Render ``messages[:i]`` vs ``messages[:i+1]`` for each turn and
    take the token delta. The delta is the new turn's tokens (prefix + content +
-   suffix). Special tokens like BOS are added by the Jinja template itself
-   (not by the tokenizer ``__call__``), so monotone-prefix templates produce
-   stable deltas. We pass ``add_special_tokens=False`` to incremental tokenize
-   calls so HF does not double-prepend BOS at the front of each render. This
-   path is necessarily looser than the preferred path — the role-prefix tokens
-   (e.g. ``<|assistant|>``) end up in the loss too. Users wanting strict
+   suffix). Leading non-trainable context is deferred until the first user turn,
+   because some native templates reject an otherwise-transient system-only
+   prefix. Special tokens like BOS are added by the Jinja template itself (not
+   by the tokenizer ``__call__``), so monotone-prefix templates produce stable
+   deltas. We pass ``add_special_tokens=False`` to incremental tokenize calls so
+   HF does not double-prepend BOS at the front of each render. This path is
+   necessarily looser than the preferred path — the role-prefix tokens (e.g.
+   ``<|assistant|>``) end up in the loss too. Users wanting strict
    assistant-content-only must pass a tokenizer with ``{% generation %}`` markers.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from difflib import SequenceMatcher
 from operator import index
 from typing import Any, Optional, Sequence
 
@@ -171,6 +174,49 @@ def _tokenize_only(tokenizer: Any, messages: Sequence[dict]) -> list[int]:
     return coerce_token_ids(out)
 
 
+def _has_user_turn(messages: Sequence[dict]) -> bool:
+    """Whether a cumulative conversation contains a user query.
+
+    Qwen3.8's native template refuses a system-only prefix. The incremental
+    fallback does not need to render leading ignored context by itself: the
+    first user render includes that context and establishes the same boundary
+    before an assistant turn is unmasked.
+    """
+    return any(message.get("role") == "user" for message in messages)
+
+
+def _unmask_render_insertions(
+    labels: list[int],
+    full_ids: Sequence[int],
+    *,
+    baseline_ids: Sequence[int],
+    rendered_ids: Sequence[int],
+) -> None:
+    """Unmask tokens introduced by one message in a renderable prefix."""
+    matcher = SequenceMatcher(a=baseline_ids, b=rendered_ids, autojunk=False)
+    for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
+        if tag not in {"insert", "replace"}:
+            continue
+        end = min(b2, len(full_ids))
+        labels[b1:end] = full_ids[b1:end]
+
+
+def _unmask_aligned_render(
+    labels: list[int],
+    full_ids: Sequence[int],
+    *,
+    selected_ids: Sequence[int],
+    rendered_ids: Sequence[int],
+) -> None:
+    """Unmask the tokens from a valid standalone turn inside a larger render."""
+    matcher = SequenceMatcher(a=selected_ids, b=rendered_ids, autojunk=False)
+    for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        end = min(b2, len(full_ids))
+        labels[b1:end] = full_ids[b1:end]
+
+
 def _truncate(
     input_ids: list[int], labels: list[int], max_length: int
 ) -> dict[str, list[int]]:
@@ -258,6 +304,11 @@ def build_assistant_only_labels(
     cumulative: list[dict] = []
     for msg in messages:
         cumulative.append(msg)
+        if msg.get("role") != "assistant" and not _has_user_turn(cumulative):
+            # Do not feed a transient system/developer-only prefix to native
+            # templates that require a user query (#540). Those tokens remain
+            # ignored and are included in the first renderable user prefix.
+            continue
         rendered = _tokenize_only(tokenizer, cumulative)
         new_len = len(rendered)
         if msg.get("role") == "assistant":
@@ -341,13 +392,54 @@ def build_per_message_train_labels(
     labels: list[int] = [IGNORE_INDEX] * len(full_ids)
     prev_len = 0
     cumulative: list[dict] = []
+    deferred: list[tuple[dict, bool]] = []
     for msg in messages:
         cumulative.append(msg)
-        rendered = _tokenize_only(tokenizer, cumulative)
-        new_len = len(rendered)
         train_flag = msg.get("train")
         if train_flag is None:
             train_flag = msg.get("role") == "assistant"
+        if not _has_user_turn(cumulative):
+            # Template validity is independent of the per-message train flag:
+            # defer every user-less prefix until it can be rendered (#540).
+            deferred.append((msg, bool(train_flag)))
+            continue
+        rendered = _tokenize_only(tokenizer, cumulative)
+        new_len = len(rendered)
+
+        if deferred:
+            # The first valid render contains both the deferred prefix and the
+            # first user turn. Recover each requested prefix span by comparing
+            # that render with the same conversation minus one deferred
+            # message. This preserves an explicit ``train: true`` without ever
+            # asking a native template to render an invalid system-only prefix.
+            for deferred_msg, deferred_train_flag in deferred:
+                if not deferred_train_flag:
+                    continue
+                without_message = [
+                    item for item in cumulative if item is not deferred_msg
+                ]
+                _unmask_render_insertions(
+                    labels,
+                    full_ids,
+                    baseline_ids=_tokenize_only(tokenizer, without_message),
+                    rendered_ids=rendered,
+                )
+
+            # A trainable first user must not accidentally absorb ignored
+            # system/developer tokens merely because the initial boundary was
+            # deferred. Align its valid standalone render back into the full
+            # prefix instead.
+            if train_flag:
+                _unmask_aligned_render(
+                    labels,
+                    full_ids,
+                    selected_ids=_tokenize_only(tokenizer, [msg]),
+                    rendered_ids=rendered,
+                )
+            deferred.clear()
+            prev_len = new_len
+            continue
+
         if train_flag:
             end = min(new_len, len(full_ids))
             labels[prev_len:end] = full_ids[prev_len:end]

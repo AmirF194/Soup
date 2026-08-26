@@ -150,6 +150,7 @@ Listed by first contribution. PR numbers link the work.
   - Kept the final real loss, learning rate, and gradient norm in the live training panel instead of replacing them with zeroes from a summary-only Trainer event ([#544](https://github.com/MakazhanAlpamys/Soup/pull/544)).
   - Recorded privacy-safe MPS accelerator, Apple chip, and unified-memory details in reproducibility receipts, pinned by an end-to-end serialized-receipt test ([#545](https://github.com/MakazhanAlpamys/Soup/pull/545)).
   - Enabled BF16 for resident MPS trainers only after a runtime capability probe and retained the necessary FP32 master-weight exception in PRM ([#564](https://github.com/MakazhanAlpamys/Soup/pull/564)).
+  - Made Best-of-N fail closed for non-finite judge scores and malformed external prompt rows before either can select or publish a training artifact ([#551](https://github.com/MakazhanAlpamys/Soup/pull/551), [#552](https://github.com/MakazhanAlpamys/Soup/pull/552)).
 
 - **Sohaib Kamash** ([@Nick-800](https://github.com/Nick-800))
   - Added seven validated Qwen2.5-Coder, Qwen2.5-Math, and DeepSeek-R1-Distill-Qwen SFT recipes; synchronized all catalog-count sites and repaired the Mistral Small model identifier. Literal repository IDs and per-recipe learning rates are now load-bearing assertions ([#536](https://github.com/MakazhanAlpamys/Soup/pull/536)).

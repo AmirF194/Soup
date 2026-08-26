@@ -1218,7 +1218,9 @@ class TestBestOfNCli:
                 "winner_idx",
                 "judge_model",
                 "scores",
+                "source_line",
             }
+            assert [row["_best_of_n"]["source_line"] for row in rows] == [1, 2]
             pairs = [json.loads(x) for x in open(dpath, encoding="utf-8") if x.strip()]
             assert pairs[0] == {"prompt": "q1", "chosen": "abcd", "rejected": "a"}
         finally:
@@ -1300,6 +1302,61 @@ class TestBestOfNCli:
             assert result.exit_code == 0, (result.output, repr(result.exception))
         finally:
             os.remove(path)
+
+    def test_prompt_loader_fails_closed_with_line_number(self, monkeypatch, tmp_path):
+        from typer.testing import CliRunner
+
+        from soup_cli.commands.data import app
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("soup_cli.eval.judge.JudgeEvaluator", lambda **kw: _ScoreJudge())
+        invalid_rows = (
+            "{not json}",
+            "[]",
+            '{"messages":[{"role":"assistant","content":"private answer"}]}',
+            '{"prompt":""}',
+            '{"prompt":"   "}',
+        )
+
+        for index, invalid_row in enumerate(invalid_rows):
+            prompts = tmp_path / f"invalid-{index}.jsonl"
+            prompts.write_text(
+                '{"prompt":"valid private prompt"}\n' + invalid_row + "\n",
+                encoding="utf-8",
+            )
+            result = CliRunner().invoke(
+                app,
+                [
+                    "best-of-n",
+                    "--base",
+                    "model",
+                    "--prompts",
+                    str(prompts),
+                    "--n",
+                    "2",
+                    "--judge",
+                    "ollama://judge",
+                    "--plan-only",
+                ],
+            )
+
+            assert result.exit_code == 2
+            assert "line 2" in result.output
+            assert "private" not in result.output
+
+    def test_blank_lines_are_ignored_but_source_lines_remain_physical(
+        self, monkeypatch, tmp_path
+    ):
+        from soup_cli.commands.data import _bon_load_prompt_records
+
+        monkeypatch.chdir(tmp_path)
+        prompts = tmp_path / "blank-lines.jsonl"
+        prompts.write_text(
+            '\n{"prompt":"first"}\n\n{"instruction":"second"}\n',
+            encoding="utf-8",
+        )
+
+        assert _bon_load_prompt_records(str(prompts)) == [("first", 2), ("second", 4)]
 
 
 # ---------------------------------------------------------------------------
@@ -1570,3 +1627,57 @@ class TestEvolveCli:
             for p in (ipath, opath):
                 if os.path.exists(p):
                     os.remove(p)
+
+    def test_malformed_seed_rows_remain_skipped(self, monkeypatch, tmp_path):
+        import json
+
+        from typer.testing import CliRunner
+
+        from soup_cli.commands.data import app
+
+        counter = {"i": 0}
+
+        def _fake_make(*args, **kwargs):
+            def _gen(prompt):
+                counter["i"] += 1
+                return f"evolved {counter['i']}"
+
+            return _gen
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("soup_cli.utils.magpie.make_magpie_generate_fn", _fake_make)
+        seeds = tmp_path / "mixed-seeds.jsonl"
+        seeds.write_text(
+            '{"prompt":"good seed one"}\n'
+            "{not valid json}\n"
+            "[]\n"
+            '{"messages":[{"role":"assistant","content":"no user seed"}]}\n'
+            '{"prompt":"   "}\n'
+            '{"instruction":"good seed two"}\n',
+            encoding="utf-8",
+        )
+        output = tmp_path / "evolved.jsonl"
+
+        result = CliRunner().invoke(
+            app,
+            [
+                "evolve",
+                "--input",
+                str(seeds),
+                "--provider",
+                "ollama",
+                "--model",
+                "m",
+                "--rounds",
+                "1",
+                "--output",
+                str(output),
+            ],
+        )
+
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        assert [row["_evolve"]["seed"] for row in rows] == [
+            "good seed one",
+            "good seed two",
+        ]

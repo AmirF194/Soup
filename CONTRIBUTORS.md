@@ -154,6 +154,9 @@ Listed by first contribution. PR numbers link the work.
   - Made Best-of-N fail closed for non-finite judge scores and malformed external prompt rows before either can select or publish a training artifact ([#551](https://github.com/MakazhanAlpamys/Soup/pull/551), [#552](https://github.com/MakazhanAlpamys/Soup/pull/552)).
   - Preserved GRPO reward metadata across data-loading paths, derived assistant-reference answers safely, and made built-in reward validation fail closed on missing or empty gold values ([#566](https://github.com/MakazhanAlpamys/Soup/pull/566)).
 
+- **Srinivasan R** ([@Srinivasan8888](https://github.com/Srinivasan8888))
+  - Corrected the MCP execution-tool refusal so it gives an actionable `--allow-execute` message instead of claiming shipped tools are unimplemented ([#574](https://github.com/MakazhanAlpamys/Soup/pull/574)).
+
 - **Sohaib Kamash** ([@Nick-800](https://github.com/Nick-800))
   - Added seven validated Qwen2.5-Coder, Qwen2.5-Math, and DeepSeek-R1-Distill-Qwen SFT recipes; synchronized all catalog-count sites and repaired the Mistral Small model identifier. Literal repository IDs and per-recipe learning rates are now load-bearing assertions ([#536](https://github.com/MakazhanAlpamys/Soup/pull/536)).
   - Added four validated DeepSeek-R1-Distill recipe entries with synchronized catalog counts, documentation, and Hub-backed model metadata tests ([#569](https://github.com/MakazhanAlpamys/Soup/pull/569)).

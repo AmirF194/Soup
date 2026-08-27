@@ -155,6 +155,7 @@ Listed by first contribution. PR numbers link the work.
   - Made Best-of-N fail closed for non-finite judge scores and malformed external prompt rows before either can select or publish a training artifact ([#551](https://github.com/MakazhanAlpamys/Soup/pull/551), [#552](https://github.com/MakazhanAlpamys/Soup/pull/552)).
   - Preserved GRPO reward metadata across data-loading paths, derived assistant-reference answers safely, and made built-in reward validation fail closed on missing or empty gold values ([#566](https://github.com/MakazhanAlpamys/Soup/pull/566)).
   - Added Qwen4-Exp text LoRA scaffolding with validated `all-linear` target resolution and an instance-local scatter compatibility path for int64-only lower-bound runtimes ([#572](https://github.com/MakazhanAlpamys/Soup/pull/572)).
+  - Made Best-of-N durable and resumable with exactly-once checkpoints and all-or-old SFT/DPO/manifest publication ([#553](https://github.com/MakazhanAlpamys/Soup/pull/553)).
 
 - **Srinivasan R** ([@Srinivasan8888](https://github.com/Srinivasan8888))
   - Corrected the MCP execution-tool refusal so it gives an actionable `--allow-execute` message instead of claiming shipped tools are unimplemented ([#574](https://github.com/MakazhanAlpamys/Soup/pull/574)).

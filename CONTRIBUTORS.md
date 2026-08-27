@@ -174,6 +174,9 @@ Listed by first contribution. PR numbers link the work.
 - **lesterppo** ([@lesterppo](https://github.com/lesterppo))
   - Reported #425 from a real Colab crash and fixed it themselves: on pre-Ampere cards (T4/P100/V100/GTX 16xx — the entire free Colab/Kaggle tier) fp16 training crashed at step 0 because peft creates LoRA adapters in the base checkpoint's bf16 dtype while the fp16 GradScaler needs fp32 gradients. The design decisions are the ones worth keeping: cast only trainable `*lora_*` params so full-FT paths (`lora.r: 0`, Spectrum, LISA) do not double trainable memory after the VRAM pre-flight has passed; call the shared helper from every trainer `train()` site rather than patching sft alone (#328's shape); and write the source-scanning test that makes a nineteenth call site a new row instead of a silent gap. They also opened #433 out of the review — the meta/non-meta peft finding someone else merged. Two weeks of silence after an accepted review, so the three mechanical items landed per the dated plan under a clearly-marked maintainer commit while everything that matters stayed theirs ([#429](https://github.com/MakazhanAlpamys/Soup/pull/429))
 
+- **Pernav Jain** ([@here-2007](https://github.com/here-2007))
+  - Replaced hard-coded eval-gate judge normalization with active-rubric min-max scaling, validation, and regression coverage ([#578](https://github.com/MakazhanAlpamys/Soup/pull/578))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are

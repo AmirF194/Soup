@@ -67,6 +67,7 @@ Listed by first contribution. PR numbers link the work.
 - **Amir Fathi** ([@AmirF194](https://github.com/AmirF194))
   - Repaired live flat-mode multipacking where the DataLoader ignored `training.batch_size` and capped each FFD bin at one sequence instead of the documented batch-sized token budget ([#562](https://github.com/MakazhanAlpamys/Soup/pull/562)).
   - Fixed transient non-finite metric handling by considering the newest logged value for each finite-state metric before artifact publication, with a regression mutation check ([#560](https://github.com/MakazhanAlpamys/Soup/pull/560)).
+  - Honored `training.quantize_reward_model` in both PPO and reward-model training loaders, with explicit flag-off regression coverage ([#586](https://github.com/MakazhanAlpamys/Soup/pull/586)).
   - A streamed model's `named_parameters()` carried the wrapper's `.inner.` segment, so a name-keyed comparison against a resident model shared no names at all and a correctness gate reported `0/0` as a pass ([#384](https://github.com/MakazhanAlpamys/Soup/pull/384))
   - `training.stream_vram_override` — the layer-streaming pre-flight measured free VRAM with a device-level driver query, so it could not see a per-process cap and there was no way to make it simulate one ([#386](https://github.com/MakazhanAlpamys/Soup/pull/386))
   - The VRAM pre-flight never called its own calibration hook, so the guard against a stack whose loss path under-budgets by 12.5% sat inert with no caller ([#390](https://github.com/MakazhanAlpamys/Soup/pull/390))

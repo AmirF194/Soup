@@ -156,10 +156,12 @@ Listed by first contribution. PR numbers link the work.
   - Preserved GRPO reward metadata across data-loading paths, derived assistant-reference answers safely, and made built-in reward validation fail closed on missing or empty gold values ([#566](https://github.com/MakazhanAlpamys/Soup/pull/566)).
   - Added Qwen4-Exp text LoRA scaffolding with validated `all-linear` target resolution and an instance-local scatter compatibility path for int64-only lower-bound runtimes ([#572](https://github.com/MakazhanAlpamys/Soup/pull/572)).
   - Made Best-of-N durable and resumable with exactly-once checkpoints and all-or-old SFT/DPO/manifest publication ([#553](https://github.com/MakazhanAlpamys/Soup/pull/553)).
+  - Added routed-expert LoRA targeting for Qwen4, with focused regression coverage over PEFT target selection ([#575](https://github.com/MakazhanAlpamys/Soup/pull/575)).
 
 - **Srinivasan R** ([@Srinivasan8888](https://github.com/Srinivasan8888))
   - Corrected the MCP execution-tool refusal so it gives an actionable `--allow-execute` message instead of claiming shipped tools are unimplemented ([#574](https://github.com/MakazhanAlpamys/Soup/pull/574)).
   - Added the `training.lisa_train_embeddings` freeze control with conservative preflight validation, parameter-count regression coverage, and user documentation ([#576](https://github.com/MakazhanAlpamys/Soup/pull/576)).
+  - Added the catalogued SmolLM3-3B SFT recipe, exact model-ID regression coverage, and user-facing documentation ([#582](https://github.com/MakazhanAlpamys/Soup/pull/582)).
 
 - **Sohaib Kamash** ([@Nick-800](https://github.com/Nick-800))
   - Added seven validated Qwen2.5-Coder, Qwen2.5-Math, and DeepSeek-R1-Distill-Qwen SFT recipes; synchronized all catalog-count sites and repaired the Mistral Small model identifier. Literal repository IDs and per-recipe learning rates are now load-bearing assertions ([#536](https://github.com/MakazhanAlpamys/Soup/pull/536)).

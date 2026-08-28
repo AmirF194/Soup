@@ -157,6 +157,7 @@ Listed by first contribution. PR numbers link the work.
   - Preserved GRPO reward metadata across data-loading paths, derived assistant-reference answers safely, and made built-in reward validation fail closed on missing or empty gold values ([#566](https://github.com/MakazhanAlpamys/Soup/pull/566)).
   - Added Qwen4-Exp text LoRA scaffolding with validated `all-linear` target resolution and an instance-local scatter compatibility path for int64-only lower-bound runtimes ([#572](https://github.com/MakazhanAlpamys/Soup/pull/572)).
   - Made Best-of-N durable and resumable with exactly-once checkpoints and all-or-old SFT/DPO/manifest publication ([#553](https://github.com/MakazhanAlpamys/Soup/pull/553)).
+  - Added offline Best-of-N materialization with atomic SFT/DPO publication, manifest validation, and sampler-boundary regression coverage ([#554](https://github.com/MakazhanAlpamys/Soup/pull/554)).
   - Added routed-expert LoRA targeting for Qwen4, with focused regression coverage over PEFT target selection ([#575](https://github.com/MakazhanAlpamys/Soup/pull/575)).
 
 - **Srinivasan R** ([@Srinivasan8888](https://github.com/Srinivasan8888))

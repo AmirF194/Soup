@@ -183,6 +183,9 @@ Listed by first contribution. PR numbers link the work.
   - Replaced hard-coded eval-gate judge normalization with active-rubric min-max scaling, validation, and regression coverage ([#578](https://github.com/MakazhanAlpamys/Soup/pull/578))
   - Routed GRPO objective variants through TRL per-token log-probability computation with runtime-contract regression coverage ([#585](https://github.com/MakazhanAlpamys/Soup/pull/585))
 
+- **Faisal Fayaz** ([@Faisal01011](https://github.com/Faisal01011))
+  - Made FSDP + BNB 4-bit QLoRA dtype-compatible by resolving quantization storage and aligning trainable PEFT parameters, with recipe, documentation, and regression coverage ([#588](https://github.com/MakazhanAlpamys/Soup/pull/588))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are

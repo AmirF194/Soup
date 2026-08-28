@@ -158,6 +158,7 @@ Listed by first contribution. PR numbers link the work.
   - Added Qwen4-Exp text LoRA scaffolding with validated `all-linear` target resolution and an instance-local scatter compatibility path for int64-only lower-bound runtimes ([#572](https://github.com/MakazhanAlpamys/Soup/pull/572)).
   - Made Best-of-N durable and resumable with exactly-once checkpoints and all-or-old SFT/DPO/manifest publication ([#553](https://github.com/MakazhanAlpamys/Soup/pull/553)).
   - Added offline Best-of-N materialization with atomic SFT/DPO publication, manifest validation, and sampler-boundary regression coverage ([#554](https://github.com/MakazhanAlpamys/Soup/pull/554)).
+  - Enabled runtime-probed MPS BF16 for local Transformers GRPO with FP32 fallback and precision-policy regression coverage ([#568](https://github.com/MakazhanAlpamys/Soup/pull/568)).
   - Added routed-expert LoRA targeting for Qwen4, with focused regression coverage over PEFT target selection ([#575](https://github.com/MakazhanAlpamys/Soup/pull/575)).
 
 - **Srinivasan R** ([@Srinivasan8888](https://github.com/Srinivasan8888))

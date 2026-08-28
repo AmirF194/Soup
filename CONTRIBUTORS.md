@@ -181,6 +181,7 @@ Listed by first contribution. PR numbers link the work.
 
 - **Pernav Jain** ([@here-2007](https://github.com/here-2007))
   - Replaced hard-coded eval-gate judge normalization with active-rubric min-max scaling, validation, and regression coverage ([#578](https://github.com/MakazhanAlpamys/Soup/pull/578))
+  - Routed GRPO objective variants through TRL per-token log-probability computation with runtime-contract regression coverage ([#585](https://github.com/MakazhanAlpamys/Soup/pull/585))
 
 ---
 

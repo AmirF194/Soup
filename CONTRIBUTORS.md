@@ -185,6 +185,9 @@ Listed by first contribution. PR numbers link the work.
   - Replaced hard-coded eval-gate judge normalization with active-rubric min-max scaling, validation, and regression coverage ([#578](https://github.com/MakazhanAlpamys/Soup/pull/578))
   - Routed GRPO objective variants through TRL per-token log-probability computation with runtime-contract regression coverage ([#585](https://github.com/MakazhanAlpamys/Soup/pull/585))
 
+- **Samarth Mukhija** ([@Samearth17](https://github.com/Samearth17))
+  - First contribution, and it answers the awkward half of #379: the repo could not reproduce its own benchmark records, because most of those harnesses only ever existed in a scratchpad on a machine that is gone. They published the upstream bitsandbytes #2034 NF4 reproducer as a standalone, download-free script and left the methodology and the existing table row untouched — a reproducibility slice that reproduces, rather than a rewrite. **Review blocked on the one thing that matters for a harness: it exited `0` whether or not the defect was present**, so it could not distinguish the mechanism it claims to demonstrate from a machine where nothing is wrong. They fixed it in both directions — an explicit `--bypass-pool` negative control, *and* an ordinary invocation that now requires the NF4 mismatch, so a removed `pool.acquire()` fails instead of passing quietly. Verified on real CUDA at merge: normal run reproduces on 6/8 layers with the bf16 control clean on 8/8; cutting `pool.acquire()` exits 1 on the merged head and exited **0** on the pre-fix commit. They also said plainly that they could not run it themselves — no GPU — instead of implying they had ([#589](https://github.com/MakazhanAlpamys/Soup/pull/589))
+
 ---
 
 Want to join this list? See [CONTRIBUTING.md](CONTRIBUTING.md) — good first issues are

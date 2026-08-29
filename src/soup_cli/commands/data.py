@@ -3038,7 +3038,7 @@ def best_of_n(
         "", "--checkpoint", help="Recovery journal (default: <output>.checkpoint.jsonl)"
     ),
     manifest: str = typer.Option(
-        "", "--manifest", help="Final consistency manifest (default: <output>.manifest.json)"
+        "", "--manifest", help="Commit manifest (default: <output>.manifest.json)"
     ),
     resume: bool = typer.Option(False, "--resume", help="Resume a matching checkpoint"),
     export_candidates: str = typer.Option(
@@ -3107,6 +3107,12 @@ def best_of_n(
         if not candidate_artifact or not judgments:
             console.print("[red]provide both --candidate-artifact and --judgments[/]")
             raise typer.Exit(2)
+        if resume or checkpoint:
+            console.print(
+                "[red]offline materialization does not support --resume or --checkpoint; "
+                "rerun with the same candidate and judgment artifacts[/]"
+            )
+            raise typer.Exit(2)
         if any(
             (
                 base,
@@ -3131,6 +3137,7 @@ def best_of_n(
         if not output and not plan_only:
             console.print("[red]--output is required unless --plan-only is set.[/]")
             raise typer.Exit(2)
+        manifest_path = manifest or (f"{output}.manifest.json" if output else "")
         try:
             paths = [candidate_artifact, judgments]
             if output:
@@ -3139,6 +3146,9 @@ def best_of_n(
             if emit_pairs:
                 enforce_under_cwd_and_no_symlink(emit_pairs, "--emit-pairs path")
                 paths.append(emit_pairs)
+            if manifest_path:
+                enforce_under_cwd_and_no_symlink(manifest_path, "--manifest path")
+                paths.append(manifest_path)
             if len({os.path.normcase(os.path.realpath(path)) for path in paths}) != len(paths):
                 raise ValueError("offline input and output paths must be distinct")
             groups, sampler_spec, candidate_sha = bon_artifact.load_candidate_artifact(
@@ -3165,23 +3175,32 @@ def best_of_n(
         )
         if plan_only:
             return
+        sft_bytes = bon_artifact.stable_jsonl(sft_rows).encode("utf-8")
+        dpo_bytes = (
+            bon_artifact.stable_jsonl(dpo_rows).encode("utf-8") if emit_pairs else b""
+        )
         try:
-            publication = [
-                (
-                    bon_artifact.stable_jsonl(sft_rows).encode("utf-8"),
-                    output,
-                    "output",
+            stale_dpo = ""
+            if not emit_pairs and os.path.lexists(manifest_path):
+                stale_dpo = bon_artifact.find_committed_sibling_dpo(
+                    manifest_path, sft_path=output
                 )
-            ]
+            manifest_bytes = bon_artifact.offline_manifest_text(
+                candidate_artifact_sha256=candidate_sha,
+                judgments_sha256=judgments_sha,
+                sft_path=output,
+                sft_bytes=sft_bytes,
+                sft_count=len(sft_rows),
+                dpo_path=emit_pairs,
+                dpo_bytes=dpo_bytes,
+                dpo_count=len(dpo_rows) if emit_pairs else 0,
+            ).encode("utf-8")
+            publication = [(sft_bytes, output, "output")]
             if emit_pairs:
-                publication.append(
-                    (
-                        bon_artifact.stable_jsonl(dpo_rows).encode("utf-8"),
-                        emit_pairs,
-                        "emit-pairs",
-                    )
-                )
-            atomic_write_bytes_group(publication)
+                publication.append((dpo_bytes, emit_pairs, "emit-pairs"))
+            publication.append((manifest_bytes, manifest_path, "manifest"))
+            removals = [(stale_dpo, "prior DPO output")] if stale_dpo else None
+            atomic_write_bytes_group(publication, removals=removals)
         except (OSError, TypeError, ValueError) as exc:
             console.print(f"[red]Failed to write output: {_escape(str(exc))}[/]")
             raise typer.Exit(1) from exc
@@ -3194,6 +3213,7 @@ def best_of_n(
                 f"\nDPO pairs:  [bold]{len(dpo_rows)}[/]\n"
                 f"Pairs out:  [bold]{_escape(os.path.relpath(emit_pairs))}[/]"
             )
+        body += f"\nManifest:   [bold]{_escape(os.path.relpath(manifest_path))}[/]"
         console.print(Panel(body, title="soup data best-of-n — offline done"))
         return
 
@@ -3345,6 +3365,7 @@ def best_of_n(
                 "temperature": temperature,
                 "max_new_tokens": max_new_tokens,
                 "device": device,
+                "revision": revision,
                 "seed": seed,
                 "trust_remote_code": trust,
                 "judge": judge,

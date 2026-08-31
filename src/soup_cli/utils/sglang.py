@@ -4,6 +4,12 @@ import json
 import logging
 from typing import Any, Optional
 
+# The OpenAI finish_reason vocabulary Soup emits, imported rather than
+# redefined: a second copy of this set is exactly the kind of duplicated source
+# of truth that #372, #392 and #424 were each caused by. utils.vllm is
+# torch-free at import time, so this does not weigh down CLI startup.
+from soup_cli.utils.vllm import _FINISH_REASONS
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +43,35 @@ def decode_sglang_response(response: Any) -> dict:
     raise ValueError(
         f"SGLang returned an unsupported response type {type(response).__name__}"
     )
+
+
+def resolve_sglang_finish_reason(meta_info: Any, max_tokens: Optional[int]) -> str:
+    """Map SGLang ``meta_info`` to an OpenAI ``finish_reason`` (#360).
+
+    Mirrors ``vllm.resolve_finish_reason``: trust the engine's own
+    ``finish_reason`` when it maps to one Soup emits, otherwise derive it from
+    the token count — a generation that spent the whole budget was truncated,
+    not naturally stopped. The pre-fix code hardcoded ``"stop"``, so a client
+    doing continue-on-length silently stopped early.
+
+    SGLang reports ``finish_reason`` as ``{"type": "stop"|"length"|"abort"}`` in
+    recent versions and as a bare string in older ones — both are accepted so a
+    dict-only read cannot silently break a previously-working sglang.
+    """
+    info = meta_info if isinstance(meta_info, dict) else {}
+    reported = info.get("finish_reason")
+    if isinstance(reported, dict):
+        reported = reported.get("type")
+    if isinstance(reported, str) and reported in _FINISH_REASONS:
+        return reported
+    completion_tokens = info.get("completion_tokens")
+    try:
+        produced = int(completion_tokens) if completion_tokens is not None else 0
+    except (TypeError, ValueError):
+        produced = 0
+    if max_tokens and produced >= int(max_tokens):
+        return "length"
+    return "stop"
 
 
 def check_sglang_available() -> bool:
@@ -121,6 +156,7 @@ def create_sglang_app(
     runtime_model_name: str,
     model_name: str,
     max_tokens_default: int = 512,
+    tokenizer=None,
 ):
     """Create a FastAPI app using SGLang runtime for inference.
 
@@ -129,6 +165,9 @@ def create_sglang_app(
         runtime_model_name: Model name used by SGLang.
         model_name: Display model name for API responses.
         max_tokens_default: Default max tokens for generation.
+        tokenizer: HF tokenizer for the served model — its chat template is
+            applied by the shared ``build_chat_prompt`` (#360). None degrades to
+            the legacy role-prefixed format, same as the vLLM backend.
 
     Returns:
         FastAPI application.
@@ -142,6 +181,10 @@ def create_sglang_app(
     from fastapi.responses import StreamingResponse
     from pydantic import BaseModel as PydanticBaseModel
     from pydantic import Field
+
+    # THE single prompt builder shared with the transformers and vLLM backends
+    # (#332), so the three cannot drift again. Was a hand-rolled third copy.
+    from soup_cli.utils.vllm import build_chat_prompt
 
     app = FastAPI(title="Soup Inference Server (SGLang)", version="1.0.0")
 
@@ -189,8 +232,9 @@ def create_sglang_app(
         max_tokens = request.max_tokens or max_tokens_default
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-        # Build prompt from messages
-        prompt = _build_prompt(request.messages)
+        # Apply the model's own chat template (legacy fallback when there is no
+        # tokenizer / template), shared with the transformers + vLLM backends.
+        prompt = build_chat_prompt(request.messages, tokenizer)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -233,7 +277,9 @@ def create_sglang_app(
                             "role": "assistant",
                             "content": response_text,
                         },
-                        "finish_reason": "stop",
+                        "finish_reason": resolve_sglang_finish_reason(
+                            response.get("meta_info"), max_tokens
+                        ),
                     }
                 ],
                 "usage": {
@@ -246,21 +292,6 @@ def create_sglang_app(
         except Exception:
             logger.exception("SGLang generation error")
             raise HTTPException(status_code=500, detail="Internal server error")
-
-    def _build_prompt(messages: list[ChatMessage]) -> str:
-        """Build a simple prompt from chat messages."""
-        parts = []
-        for msg in messages:
-            role = msg.role
-            content = msg.content
-            if role == "system":
-                parts.append(f"System: {content}")
-            elif role == "user":
-                parts.append(f"User: {content}")
-            elif role == "assistant":
-                parts.append(f"Assistant: {content}")
-        parts.append("Assistant:")
-        return "\n".join(parts)
 
     async def _stream_sglang_response(
         runtime,
@@ -277,6 +308,7 @@ def create_sglang_app(
                 runtime.generate(prompt, sampling_params=sampling_params)
             )
             response_text = response["text"]
+            meta_info = response.get("meta_info")
         except Exception:
             logger.exception("SGLang stream error")
             yield 'data: {"error": "Internal server error"}\n\n'
@@ -311,7 +343,9 @@ def create_sglang_app(
                 {
                     "index": 0,
                     "delta": {},
-                    "finish_reason": "stop",
+                    "finish_reason": resolve_sglang_finish_reason(
+                        meta_info, sampling_params.get("max_new_tokens")
+                    ),
                 }
             ],
         }

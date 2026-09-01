@@ -66,6 +66,35 @@ def _imports_net_guard(path: Path) -> bool:
     )
 
 
+def _definers(path: Path) -> list[str]:
+    """Every function in ``path`` whose name ends in the predicate suffix.
+
+    THE matcher. Both the real whole-tree scan and the regression self-tests
+    below call this, so a future edit that narrows the match (an exact-name
+    comparison, say -- the shape that let a leading-underscore duplicate
+    through before #625) fails both at once. The first version of those
+    self-tests reimplemented this walk inline, which meant they kept passing
+    on a guard that had gone blind: the same defect this repository already
+    recorded once, under BUNDLED_SCORER_FINGERPRINT.
+    """
+    return [
+        node.name
+        for node in ast.walk(_parse(path))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.endswith(_FUNC_SUFFIX)
+    ]
+
+
+def _builders(path: Path) -> list[str]:
+    """Every name assigned in ``path`` ending in the host-set suffix."""
+    return [
+        name
+        for node in ast.walk(_parse(path))
+        for name in _assigned_names(node)
+        if name.endswith(_SET_SUFFIX)
+    ]
+
+
 class TestThereIsExactlyOneDefinition:
     """Suffix match, not exact match: a duplicate is a duplicate whether or
     not it carries the private-helper leading underscore — every one of the
@@ -73,28 +102,22 @@ class TestThereIsExactlyOneDefinition:
     shape a fifth copy would actually take."""
 
     def test_the_predicate_is_defined_only_in_the_shared_module(self):
-        definers = []
-        for path in sorted(_SRC_ROOT.rglob("*.py")):
-            for node in ast.walk(_parse(path)):
-                if (
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name.endswith(_FUNC_SUFFIX)
-                ):
-                    definers.append(f"{path.relative_to(_SRC_ROOT)}::{node.name}")
+        definers = [
+            f"{path.relative_to(_SRC_ROOT)}::{name}"
+            for path in sorted(_SRC_ROOT.rglob("*.py"))
+            for name in _definers(path)
+        ]
         assert definers == [f"{_HOME.relative_to(_SRC_ROOT)}::{_FUNC_SUFFIX}"], (
             f"a function ending in {_FUNC_SUFFIX!r} must be defined only in "
             f"{_HOME.name}; found: {definers}"
         )
 
     def test_the_loopback_set_is_built_only_in_the_shared_module(self):
-        builders = []
-        for path in sorted(_SRC_ROOT.rglob("*.py")):
-            for node in ast.walk(_parse(path)):
-                builders.extend(
-                    f"{path.relative_to(_SRC_ROOT)}::{name}"
-                    for name in _assigned_names(node)
-                    if name.endswith(_SET_SUFFIX)
-                )
+        builders = [
+            f"{path.relative_to(_SRC_ROOT)}::{name}"
+            for path in sorted(_SRC_ROOT.rglob("*.py"))
+            for name in _builders(path)
+        ]
         assert builders == [f"{_HOME.relative_to(_SRC_ROOT)}::{_SET_SUFFIX}"], (
             f"a name ending in {_SET_SUFFIX!r} must be built only in "
             f"{_HOME.name}; found: {builders}"
@@ -114,31 +137,17 @@ class TestMutationsThatUsedToSurvive:
     def test_underscore_prefixed_function_is_still_caught(self, tmp_path):
         rogue = tmp_path / "rogue_predicate.py"
         rogue.write_text("def _is_private_or_link_local(host):\n    return False\n")
-        found = [
-            node.name
-            for node in ast.walk(_parse(rogue))
-            if isinstance(node, ast.FunctionDef) and node.name.endswith(_FUNC_SUFFIX)
-        ]
+        found = _definers(rogue)
         assert found == ["_is_private_or_link_local"]
 
     def test_underscore_prefixed_constant_is_still_caught(self, tmp_path):
         rogue = tmp_path / "rogue_constant.py"
         rogue.write_text('_LOOPBACK_HOSTS = frozenset({"localhost"})\n')
-        found = [
-            name
-            for node in ast.walk(_parse(rogue))
-            for name in _assigned_names(node)
-            if name.endswith(_SET_SUFFIX)
-        ]
+        found = _builders(rogue)
         assert found == ["_LOOPBACK_HOSTS"]
 
     def test_annotated_constant_is_still_caught(self, tmp_path):
         rogue = tmp_path / "rogue_annotated.py"
         rogue.write_text('LOOPBACK_HOSTS: frozenset = frozenset({"localhost"})\n')
-        found = [
-            name
-            for node in ast.walk(_parse(rogue))
-            for name in _assigned_names(node)
-            if name.endswith(_SET_SUFFIX)
-        ]
+        found = _builders(rogue)
         assert found == ["LOOPBACK_HOSTS"]

@@ -7,7 +7,6 @@ unsafe URL into the terminal.
 
 from __future__ import annotations
 
-import ipaddress
 import re
 from typing import Optional
 from urllib.parse import urlparse
@@ -30,14 +29,6 @@ def validate_token(token: str) -> str:
             "token must be 16-128 urlsafe-base64 chars (A-Z, a-z, 0-9, '_', '-')"
         )
     return token
-
-
-def _host_is_private_ip(host: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return bool(ip.is_private and not ip.is_loopback)
 
 
 def build_phone_url(

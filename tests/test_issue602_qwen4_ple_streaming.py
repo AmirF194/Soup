@@ -642,7 +642,19 @@ def test_qwen4_ram_ple_refusal_is_independent_of_base_stream_source():
         )
 
 
-def test_setup_reaches_every_qwen4_fail_closed_policy(tmp_path, monkeypatch):
+def _drive_qwen4_streaming_setup(tmp_path, monkeypatch, resolve_weights=None):
+    """Drive the real `_setup_streaming_transformers()` for a qwen4_exp base.
+
+    THE harness. Extracted by the maintainer after review so the seam test and
+    the planner-fingerprint test below share one copy: a second, drifting copy
+    of 150 lines of monkeypatching is how a seam test stops matching the seam.
+    Returns the list of fail-closed policies the setup actually reached.
+
+    `resolve_weights` replaces the `resolve_model_weights` stub. The default
+    stub ignores the `before_materialize` callback, which is where the shard-
+    cache fingerprint is computed -- so a test about that callback has to supply
+    its own and actually call it.
+    """
     import types
 
     import soup_cli.trainer.stream_setup as stream_setup
@@ -737,7 +749,8 @@ def test_setup_reaches_every_qwen4_fail_closed_policy(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "soup_cli.utils.spectrum_scan.resolve_model_weights",
-        lambda *_a, **_k: str(tmp_path / "weights"),
+        resolve_weights
+        or (lambda *_a, **_k: str(tmp_path / "weights")),
     )
     monkeypatch.setattr(
         "soup_cli.utils.layer_stream.free_ram_bytes", lambda: 1_000_000
@@ -798,8 +811,126 @@ def test_setup_reaches_every_qwen4_fail_closed_policy(tmp_path, monkeypatch):
     monkeypatch.setattr(stream_setup, "_validate_qwen4_ngram_ram_fit", _ram)
 
     _Wrapper()._setup_streaming_transformers(cfg, tcfg)
+    return reached
+
+
+def test_setup_reaches_every_qwen4_fail_closed_policy(tmp_path, monkeypatch):
+    reached = _drive_qwen4_streaming_setup(tmp_path, monkeypatch)
 
     assert reached == ["mode", "source", "disk", "ram"]
+
+
+def test_planner_fingerprints_config_json_for_qwen4_but_not_for_llama(
+    tmp_path, monkeypatch
+):
+    """The planner half of the oQ cache fingerprint, which nothing pinned.
+
+    `layer_shard` hashes `config.json` into the shard-cache fingerprint for an
+    external-mode checkpoint, and `test_qwen4_config_json_change_invalidates_oq_cache`
+    covers that side. The PLANNER computes the same fingerprint independently
+    (`stream_setup.py`, `include_config=arch == "qwen4_exp"`), and setting it to
+    a constant `False` there passed 694 streaming tests.
+
+    That is not display-only. A planner that reports a stale cache as valid
+    zeroes `shard_write_bytes`, which feeds the disk pre-flight that refuses
+    before sharding -- so the required space is under-reported, the refusal
+    never fires, and the run dies out of disk mid-shard: the exact failure the
+    pre-flight exists to prevent.
+
+    Two assertions, because either alone is weak. The first pins the call site
+    -- a constant `False` fails it. The second pins that the flag is
+    load-bearing rather than decorative: with it, editing only `config.json`
+    moves the fingerprint; without it, the fingerprint is unchanged.
+    """
+    import json
+    import types
+
+    import torch
+    from safetensors.torch import save_file
+
+    import soup_cli.utils.layer_shard as layer_shard
+    from soup_cli.utils.layer_shard import (
+        checkpoint_source_components,
+        fingerprint_source_files,
+    )
+
+    seen = []
+    real = layer_shard.checkpoint_source_components
+
+    def _recording(weights_dir, source_files, *, include_config):
+        seen.append(include_config)
+        return real(weights_dir, source_files, include_config=include_config)
+
+    monkeypatch.setattr(layer_shard, "checkpoint_source_components", _recording)
+
+    weights = tmp_path / "weights"
+    weights.mkdir(exist_ok=True)
+    blob = weights / "model.safetensors"
+    save_file(
+        {
+            "language_model.model.layers.0.proj.weight": torch.tensor(
+                [[0, 1, 2, 3]], dtype=torch.uint32
+            ),
+            "language_model.model.layers.0.proj.scales": torch.ones(
+                (1, 1), dtype=torch.bfloat16
+            ),
+            "language_model.model.layers.0.proj.biases": torch.zeros(
+                (1, 1), dtype=torch.bfloat16
+            ),
+            "language_model.model.norm.weight": torch.ones(2),
+        },
+        blob,
+    )
+    (weights / "config.json").write_text(
+        json.dumps({"quantization_config": {"bits": 4, "group_size": 32}}),
+        encoding="utf-8",
+    )
+    stat = blob.stat()
+    plan = types.SimpleNamespace(
+        weights_dir=str(weights),
+        source_bytes=stat.st_size,
+        materialized_copy_bytes=0,
+        materialize_bytes=0,
+        needs_materialization=False,
+        source_files=((str(blob), stat.st_size, int(stat.st_mtime)),),
+    )
+
+    def _resolve(_base, *, before_materialize=None):
+        if before_materialize is not None:
+            before_materialize(plan)
+        return str(weights)
+
+    _drive_qwen4_streaming_setup(tmp_path, monkeypatch, resolve_weights=_resolve)
+
+    assert seen == [True], (
+        "the planner must hash config.json for a qwen4_exp base; a constant "
+        "False here silently reuses a stale oQ shard cache. saw: " + repr(seen)
+    )
+
+    probe = tmp_path / "fingerprint_probe"
+    probe.mkdir()
+    probe_blob = probe / "model.safetensors"
+    probe_blob.write_bytes(b"weights")
+    config = probe / "config.json"
+    config.write_text(json.dumps({"a": 1}), encoding="utf-8")
+
+    def _digest(include_config):
+        stat = probe_blob.stat()
+        components = ((probe_blob.name, stat.st_size, stat.st_mtime_ns),)
+        return fingerprint_source_files(
+            checkpoint_source_components(
+                str(probe), components, include_config=include_config
+            )
+        )
+
+    before_on, before_off = _digest(True), _digest(False)
+    config.write_text(json.dumps({"a": 1}, indent=2), encoding="utf-8")
+
+    assert _digest(True) != before_on, "config.json must move the fingerprint"
+    assert _digest(False) == before_off, (
+        "without include_config the same edit is invisible -- which is "
+        "what makes the call site above load-bearing"
+    )
 
 
 def test_non_qwen_companion_suffixes_do_not_enable_oq(tmp_path):

@@ -119,6 +119,29 @@ class TestTheGuardCoversHighlightedCommands:
         )
         assert find_unsafe_highlighted_assertions(source)
 
+    def test_scanner_flags_a_non_result_variable_name(self) -> None:
+        """The widening to ``_ANY_RAW_OUTPUT_RE`` is what makes the real #477
+        offender reachable, and nothing else pins it.
+
+        ``_RAW_OUTPUT_RE`` anchors on ``result.output`` behind a word boundary,
+        which never fires inside ``show_result`` because ``_`` is a word
+        character. Every other fixture in this class names its variable
+        ``result``, so reverting the widening leaves them all green while the
+        scanner goes blind to ``show_result.output`` -- the exact spelling in
+        the assertion this issue was filed about. Added by the maintainer after
+        review rather than sent back for another round.
+        """
+        from tests.test_cli_help_assertions_are_ansi_safe import (
+            find_unsafe_highlighted_assertions,
+        )
+
+        source = (
+            "def test_x():\n"
+            "    show_result = runner.invoke(app, ['recipes', 'show', 'r'])\n"
+            "    assert 'modality: text' in show_result.output\n"
+        )
+        assert find_unsafe_highlighted_assertions(source)
+
     def test_scanner_accepts_a_normalised_assertion(self) -> None:
         from tests.test_cli_help_assertions_are_ansi_safe import (
             find_unsafe_highlighted_assertions,

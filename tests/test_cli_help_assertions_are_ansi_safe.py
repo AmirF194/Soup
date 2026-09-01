@@ -263,14 +263,24 @@ def test_help_renders():
 #: ``modality``, ``:`` and ``text`` are three tokens, so ``"modality: text"`` is
 #: not a substring of the rendered output and ``yaml.safe_load`` rejects
 #: ``\x1b``. Plain ``console.print`` output is not affected the same way -- an
-#: unstyled message is wrapped in escapes rather than split by them -- which is
-#: why only these commands are scanned and the suite's ~200 other raw-output
-#: assertions are correctly left alone.
+#: unstyled message is wrapped in escapes rather than split by them. Two
+#: mechanisms are in play here, not one: ``recipes show`` and ``migrate`` render
+#: through ``Syntax(...)`` i.e. Pygments, while ``data mix --apply`` uses plain
+#: ``console.print`` and is split by Rich's default ``ReprHighlighter`` instead.
+#: The scanner keys on the INVOCATION rather than the mechanism, which is why it
+#: covers both; the suite's ~200 other raw-output assertions are left alone.
 _HIGHLIGHTED_INVOCATIONS = (
     re.compile(r'"recipes"\s*,\s*"show"'),
     re.compile(r"'recipes'\s*,\s*'show'"),
     re.compile(r'"mix"\s*,\s*"--(apply|optimize)"'),
     re.compile(r"'mix'\s*,\s*'--(apply|optimize)'"),
+    # `soup migrate` is the third `Syntax(...)` site in `src/`
+    # (commands/migrate.py:121). Latent rather than live: no assertion on its
+    # output is multi-token today, so this flags nothing now. Added by the
+    # maintainer after review so the guard covers every highlighted command
+    # rather than the two this issue happened to surface.
+    re.compile(r'"migrate"'),
+    re.compile(r"'migrate'"),
 )
 
 _PARSES_OUTPUT = re.compile(r"(yaml\.safe_load|json\.loads)\s*\(")

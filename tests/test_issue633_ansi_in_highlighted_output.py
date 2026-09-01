@@ -24,6 +24,7 @@ neighbouring assertions in the same files kept passing.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -31,6 +32,8 @@ from typer.testing import CliRunner
 from soup_cli.cli import app
 
 from .conftest import strip_ansi
+
+_THIS_FILE = Path(__file__)
 
 _ESC = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -141,6 +144,43 @@ class TestTheGuardCoversHighlightedCommands:
             "    assert 'modality: text' in show_result.output\n"
         )
         assert find_unsafe_highlighted_assertions(source)
+
+    def test_scanner_flags_an_assertion_the_formatter_wrapped(self) -> None:
+        """ruff will eventually produce this shape, and it used to be invisible.
+
+        The scanner skipped any source line whose first character is a quote, so
+        that its own synthetic fixture strings are not flagged. A long assertion
+        wrapped by the formatter puts the literal at the start of the continuation
+        line, so the offender was skipped for the same reason the fixtures are.
+        The rule is now a span check: a MULTI-line string constant is skipped,
+        a single-line one is not. Added by the maintainer after review.
+        """
+        from tests.test_cli_help_assertions_are_ansi_safe import (
+            find_unsafe_highlighted_assertions,
+        )
+
+        source = (
+            "def test_x():\n"
+            "    result = runner.invoke(app, ['recipes', 'show', 'r'])\n"
+            "    assert (\n"
+            "        'modality: text' in result.output\n"
+            "    )\n"
+        )
+        assert find_unsafe_highlighted_assertions(source)
+
+    def test_scanner_still_ignores_its_own_fixture_blocks(self) -> None:
+        """The control: widening must not start flagging the guard's examples.
+
+        A guard that fires on correct code is one people delete, and this file is
+        full of correct code shaped exactly like the thing being detected.
+        """
+        from tests.test_cli_help_assertions_are_ansi_safe import (
+            find_unsafe_highlighted_assertions,
+        )
+
+        own_source = _THIS_FILE.read_text(encoding="utf-8")
+
+        assert find_unsafe_highlighted_assertions(own_source) == []
 
     def test_scanner_accepts_a_normalised_assertion(self) -> None:
         from tests.test_cli_help_assertions_are_ansi_safe import (

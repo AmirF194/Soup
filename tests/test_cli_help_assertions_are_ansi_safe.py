@@ -335,6 +335,56 @@ def _assert_expression(line: str) -> str:
     return line
 
 
+def _assert_statement_lines(tree: ast.AST) -> set[int]:
+    """Every line belonging to an `assert` statement, continuations included.
+
+    The scanner decides `is this an assertion?` from `stripped.startswith(
+    "assert")`, which is true of the first physical line only. Once the
+    formatter wraps a long assertion, the line that actually reads the output
+    is a continuation and was dropped one branch after the literal-skip rule.
+    Fixing only the skip rule moved the false negative rather than closing it,
+    which is why both are needed.
+    """
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        # `node.test` ONLY, never `node.msg`. Reading raw output inside a
+        # failure message is harmless and in fact good practice --
+        # `_assert_expression` already drops it on a single-line assert, and
+        # taking the whole statement span here would re-introduce exactly that
+        # false positive one line lower, on the wrapped form. Measured: it
+        # flagged `test_recipes_v031.py:468`, a correct assertion, before this
+        # was narrowed.
+        test = node.test
+        covered.update(range(test.lineno, (test.end_lineno or test.lineno) + 1))
+    return covered
+
+
+def _multiline_literal_lines(tree: ast.AST) -> set[int]:
+    """Line numbers occupied by a string constant that spans several lines.
+
+    Those are this guard's own synthetic fixtures: adjacent string literals are
+    merged by the parser into ONE `ast.Constant`, so a fixture block written as
+    several quoted lines has `end_lineno > lineno` and is skipped whole.
+
+    A real assertion the formatter wrapped -- `assert (` on one line and
+    `"modality: text" in result.output` on the next -- carries only a
+    SINGLE-line constant, so it is not skipped. The rule this replaced skipped
+    any line beginning with a quote and could not tell the two apart, which
+    made exactly the shape ruff will eventually produce invisible (#635
+    follow-up, closed by the maintainer).
+    """
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        end = node.end_lineno or node.lineno
+        if end > node.lineno:
+            covered.update(range(node.lineno, end + 1))
+    return covered
+
+
 def find_unsafe_highlighted_assertions(source: str) -> list[tuple[int, str]]:
     """Return ``(lineno, text)`` for unnormalised reads of highlighted output.
 
@@ -347,6 +397,8 @@ def find_unsafe_highlighted_assertions(source: str) -> list[tuple[int, str]]:
     except SyntaxError:  # pragma: no cover — a broken file fails its own tests
         return []
     lines = source.splitlines()
+    literal_lines = _multiline_literal_lines(tree)
+    assert_lines = _assert_statement_lines(tree)
     offenders: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -362,10 +414,12 @@ def find_unsafe_highlighted_assertions(source: str) -> list[tuple[int, str]]:
         tainted: set[str] = set()
         for offset, line in enumerate(body):
             stripped = line.strip()
-            if stripped[:1] in {'"', "'"}:
-                # A source line that *is* a string literal -- the synthetic
-                # fixtures this guard's own tests are built from. Scanning them
-                # would flag the examples written to prove the guard works.
+            if (node.lineno + offset) in literal_lines:
+                # Inside a MULTI-LINE string constant -- the synthetic fixtures
+                # this guard's own tests are built from. Scanning them would
+                # flag the examples written to prove the guard works. A
+                # single-line literal is deliberately NOT skipped, so a
+                # formatter-wrapped assertion stays visible.
                 continue
             if _looks_normalised(stripped):
                 # Record that this variable is safe, then move on.
@@ -395,9 +449,12 @@ def find_unsafe_highlighted_assertions(source: str) -> list[tuple[int, str]]:
             if _PARSES_OUTPUT.search(stripped):
                 offenders.append((node.lineno + offset, stripped[:100]))
                 continue
-            if not stripped.startswith("assert"):
+            is_assert_head = stripped.startswith("assert")
+            if not (is_assert_head or (node.lineno + offset) in assert_lines):
                 continue
-            expression = _assert_expression(stripped)
+            expression = (
+                _assert_expression(stripped) if is_assert_head else stripped
+            )
             if not (
                 _ANY_RAW_OUTPUT_RE.search(expression)
                 or any(re.search(rf"\b{re.escape(var)}\b", expression) for var in tainted)

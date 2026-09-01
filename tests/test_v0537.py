@@ -1153,6 +1153,53 @@ class TestToolEndpointsLive:
         assert result.returncode == 0
         assert "hello" in result.stdout
 
+    def test_bash_sandbox_requests_strict_namespaces_by_name(self, monkeypatch):
+        """The preexec hook must ask for STRICT namespace isolation, by keyword.
+
+        Every other test on this path asserts on an exception message raised
+        three wrappings below the call, so rewording any of those messages would
+        leave the suite green while the sandbox quietly degraded to best-effort
+        isolation. `strict_namespaces` appeared nowhere in tests/ before this.
+
+        Added by the maintainer after merge; raised twice in review and
+        deferred, which was the wrong call for a guard on an endpoint that
+        executes shell commands.
+        """
+        import sys
+
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox is not supported on Windows")
+
+        from soup_cli.trainer import rewards
+
+        captured: dict = {}
+
+        def _record_rlimit(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        class _Result:
+            launch_failed = False
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _capture_preexec(argv, preexec):
+            captured["argv"] = argv
+            preexec()
+            return _Result()
+
+        monkeypatch.setattr(rewards, "_apply_rlimit", _record_rlimit)
+        monkeypatch.setattr(rewards, "_run_sandboxed_subprocess", _capture_preexec)
+
+        rewards._run_bash_sandbox("echo hello")
+
+        assert captured["kwargs"] == {"strict_namespaces": True}, (
+            "the bash sandbox must request strict namespace isolation by "
+            f"keyword; got args={captured.get('args')} "
+            f"kwargs={captured.get('kwargs')}"
+        )
+
     def test_bash_tool_restricted_linux_fails_closed_501(self, monkeypatch):
         from fastapi.testclient import TestClient
         app = _create_test_app()

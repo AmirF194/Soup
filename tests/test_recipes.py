@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from soup_cli.cli import app
+from tests.conftest import strip_ansi
 
 runner = CliRunner()
 
@@ -568,7 +569,12 @@ class TestQwen35NineBDpoRecipe:
     ) -> None:
         show_result = runner.invoke(app, ["recipes", "show", "qwen3.5-9b-dpo"])
         assert show_result.exit_code == 0
-        assert "Qwen/Qwen3.5-9B" in show_result.output
+        # `recipes show` renders through `Syntax(...)`. This assertion passed
+        # raw only because the id happened to land inside one highlight token,
+        # and `Qwen3.5-9B` contains digits that ReprHighlighter is entitled to
+        # wrap separately. #635's scanner deliberately ignores single-token
+        # assertions, so it would not have caught the day that luck ran out.
+        assert "Qwen/Qwen3.5-9B" in strip_ansi(show_result.output)
 
         monkeypatch.chdir(tmp_path)
         use_result = runner.invoke(app, ["recipes", "use", "qwen3.5-9b-dpo", "--yes"])

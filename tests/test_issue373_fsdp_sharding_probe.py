@@ -102,13 +102,92 @@ class OptimizedModule(FakeModule):
         yield from self._orig_mod.parameters()
 
     def named_children(self):
-        yield from self._orig_mod.named_children()
+        """Yield the WRAPPER's own child, which is what real torch does.
+
+        `OptimizedModule` is an `nn.Module` whose `_modules` holds
+        `{'_orig_mod': wrapped}`, so `named_children()` returns
+        `[('_orig_mod', <wrapped>)]` -- it does NOT transparently forward the
+        wrapped module's children. The first version of this double did
+        forward them, which made the wrapper invisible below the root and left
+        the child-level `unwrap_compiled` call in `module_class_histogram`
+        unexercised: a compiled submodule would have been counted as
+        `OptimizedModule`, the exact mis-attribution this harness exists to
+        prevent. Corrected by the maintainer after review; the real torch
+        behaviour was read from the source, not assumed.
+        """
+        yield from self._children.items()
 
 
 def _sharded_rank_model(local_numel: int = 124_048_864):
     """A compiled-FSDP tree shaped like the 70B arm that failed."""
     inner = FullyShardedDataParallel(params=[FakeParameter(local_numel)])
     return OptimizedModule(inner)
+
+
+class TestTheDoubleMatchesTorchsWrapperShape:
+    """The double is only evidence if it is shaped like the thing it stands in for."""
+
+    def test_named_children_exposes_the_wrapper_not_the_wrapped_children(self) -> None:
+        inner = FullyShardedDataParallel(params=[FakeParameter(8)])
+        inner._children = {"block": FakeModule()}
+        wrapped = OptimizedModule(inner)
+
+        names = [name for name, _child in wrapped.named_children()]
+
+        assert names == ["_orig_mod"], (
+            "real OptimizedModule yields [('_orig_mod', wrapped)]; a double that "
+            "forwards the wrapped module's children makes the wrapper invisible "
+            "below the root and pins nothing about child-level unwrapping"
+        )
+
+
+class TestCompileWrappersBelowTheRootAreUnwrapped:
+    """The root is not the only place a compile wrapper can appear.
+
+    `module_class_histogram` unwraps at the root AND at every child. Only the
+    root path was covered, so the child-level call could be deleted with the
+    suite staying green -- and a tree with a compiled submodule would have
+    reported `OptimizedModule` where the 0.5B record reports
+    `FullyShardedDataParallel`, which is a wrong answer rather than a crash.
+    """
+
+    def test_a_compiled_child_is_counted_by_its_wrapped_class(self) -> None:
+        compiled_child = OptimizedModule(
+            FullyShardedDataParallel(params=[FakeParameter(4)])
+        )
+        root = FullyShardedDataParallel(params=[FakeParameter(4)])
+        root._children = {"layer_0": compiled_child}
+
+        histogram = probe.module_class_histogram(root)
+
+        assert histogram["FullyShardedDataParallel"] == 2, histogram
+        assert "OptimizedModule" not in histogram, (
+            "a compiled submodule must be reported by the class it wraps; "
+            f"got {dict(histogram)}"
+        )
+
+
+class TestAnIndivisibleTotalIsNotSharded:
+    """`total % world_size` was the other untested clause of the verdict.
+
+    Without it, a total that does not divide evenly would still be called
+    sharded whenever the truncating division happened to match -- i.e. the
+    probe would confirm an accounting that does not add up.
+    """
+
+    def test_a_total_that_does_not_divide_evenly_is_refused(self) -> None:
+        verdict = probe.sharding_verdict(local=2, total=9, world_size=4)
+
+        assert verdict.expected_local == 2
+        assert verdict.is_sharded is False, (
+            "9 parameters cannot be evenly sharded over 4 ranks; matching the "
+            "truncated quotient is not evidence that they were"
+        )
+
+    def test_an_evenly_divisible_total_at_the_same_local_count_is_sharded(self) -> None:
+        verdict = probe.sharding_verdict(local=2, total=8, world_size=4)
+
+        assert verdict.is_sharded is True
 
 
 class TestTheRecordedFailureIsReproduced:

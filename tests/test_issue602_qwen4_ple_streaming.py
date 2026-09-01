@@ -1032,6 +1032,7 @@ def test_external_tensor_bytes_reports_oq_packed_storage():
 
 
 def test_qwen4_oq_torch_floor_matches_project_and_doctor():
+    import re
     from pathlib import Path
 
     from soup_cli.commands.doctor import DEPS
@@ -1039,8 +1040,25 @@ def test_qwen4_oq_torch_floor_matches_project_and_doctor():
     root = Path(__file__).parents[1]
     project = (root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert '"torch>=2.3.0"' in project
-    assert next(item for item in DEPS if item[0] == "torch")[2] == "2.3.0"
+    # Parse the `train` extra's own list rather than scanning the whole file.
+    # A substring test is satisfied by the string appearing anywhere --
+    # a comment, another extra, or a docstring -- so it would keep passing
+    # after the floor had been moved or removed from the place that matters.
+    # `tomllib` is 3.11+ and this repo supports 3.10, so this is a bounded
+    # regex over one block rather than a TOML parse.
+    block = re.search(r"^train = \[(.*?)^\]", project, re.S | re.M)
+    assert block is not None, "pyproject.toml has no `train` extra"
+    entries = re.findall(r'"([^"]+)"', block.group(1))
+    torch_entries = [e for e in entries if e.split(">")[0].strip() == "torch"]
+
+    assert torch_entries == ["torch>=2.3.0"], (
+        "the `train` extra must declare exactly one torch floor, and it must be "
+        f"2.3.0 -- Qwen4/oQ needs uint32 support; found {torch_entries}"
+    )
+    assert next(item for item in DEPS if item[0] == "torch")[2] == "2.3.0", (
+        "`soup doctor` carries its own copy of the floor and it has drifted "
+        "from pyproject.toml (see #636)"
+    )
 
 
 def test_qwen4_gate_record_and_changelog_are_discoverable_and_credited():

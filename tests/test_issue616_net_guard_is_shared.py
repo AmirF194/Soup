@@ -66,6 +66,17 @@ def _imports_net_guard(path: Path) -> bool:
     )
 
 
+def _normalised(name: str) -> str:
+    """Underscore- and case-insensitive form of an identifier.
+
+    `_LOOPBACK_HOSTS`, `LOOPBACK_HOSTS` and `_LOOPBACKHOSTS` are the same
+    constant wearing three spellings, and a suffix match on the literal name
+    caught only the first two. Dropping one underscore is not a disguise
+    anyone adopts on purpose -- it is what a rename produces.
+    """
+    return name.replace("_", "").upper()
+
+
 def _definers(path: Path) -> list[str]:
     """Every function in ``path`` whose name ends in the predicate suffix.
 
@@ -77,12 +88,20 @@ def _definers(path: Path) -> list[str]:
     on a guard that had gone blind: the same defect this repository already
     recorded once, under BUNDLED_SCORER_FINGERPRINT.
     """
-    return [
-        node.name
-        for node in ast.walk(_parse(path))
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.endswith(_FUNC_SUFFIX)
-    ]
+    found: list[str] = []
+    for node in ast.walk(_parse(path)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.endswith(_FUNC_SUFFIX):
+                found.append(node.name)
+            continue
+        # A `def` is not the only way to define a predicate. `NAME = lambda h:
+        # ...` binds the same name and was invisible to a FunctionDef-only
+        # walk -- and an assigned lambda is precisely what someone reaches for
+        # when moving a small function between modules.
+        for name in _assigned_names(node):
+            if name.endswith(_FUNC_SUFFIX):
+                found.append(name)
+    return found
 
 
 def _builders(path: Path) -> list[str]:
@@ -91,7 +110,7 @@ def _builders(path: Path) -> list[str]:
         name
         for node in ast.walk(_parse(path))
         for name in _assigned_names(node)
-        if name.endswith(_SET_SUFFIX)
+        if _normalised(name).endswith(_normalised(_SET_SUFFIX))
     ]
 
 
@@ -126,6 +145,42 @@ class TestThereIsExactlyOneDefinition:
     def test_all_known_call_sites_import_rather_than_redeclare(self):
         for name in _CONSUMERS:
             assert _imports_net_guard(_UTILS_DIR / name), f"{name} must import the shared guard"
+
+
+class TestShapesTheFirstGuardCouldNotSee:
+    """Closed by the maintainer after #625 merged, having left them open once."""
+
+    def test_an_assigned_lambda_is_a_definition(self, tmp_path) -> None:
+        rogue = tmp_path / "rogue_lambda.py"
+        rogue.write_text(
+            "_is_private_or_link_local = lambda host: False\n", encoding="utf-8"
+        )
+
+        assert _definers(rogue) == ["_is_private_or_link_local"]
+
+    def test_a_de_underscored_constant_is_a_builder(self, tmp_path) -> None:
+        rogue = tmp_path / "rogue_renamed.py"
+        rogue.write_text(
+            '_LOOPBACKHOSTS = frozenset({"localhost"})\n', encoding="utf-8"
+        )
+
+        assert _builders(rogue) == ["_LOOPBACKHOSTS"]
+
+    def test_the_widening_does_not_fire_on_the_real_tree(self) -> None:
+        """The control. A guard that flags correct code is one people delete."""
+        definers = [
+            f"{path.relative_to(_SRC_ROOT)}::{name}"
+            for path in sorted(_SRC_ROOT.rglob("*.py"))
+            for name in _definers(path)
+        ]
+        builders = [
+            f"{path.relative_to(_SRC_ROOT)}::{name}"
+            for path in sorted(_SRC_ROOT.rglob("*.py"))
+            for name in _builders(path)
+        ]
+
+        assert definers == [f"{_HOME.relative_to(_SRC_ROOT)}::{_FUNC_SUFFIX}"]
+        assert builders == [f"{_HOME.relative_to(_SRC_ROOT)}::{_SET_SUFFIX}"]
 
 
 class TestMutationsThatUsedToSurvive:

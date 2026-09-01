@@ -872,7 +872,7 @@ class TestInstantiateTrainerPlugins:
 # ----- #103 /v1/tools/{python,bash,web_search} live ---------------------
 
 
-def _create_test_app():
+def _create_test_app(host: str = "127.0.0.1", auth_token: str | None = None, **kwargs):
     """Build a test FastAPI app via _create_app (lazy fastapi import)."""
     try:
         import fastapi  # noqa: F401
@@ -887,6 +887,9 @@ def _create_test_app():
         device="cpu",
         model_name="test-model",
         max_tokens_default=128,
+        host=host,
+        auth_token=auth_token,
+        **kwargs,
     )
 
 
@@ -935,32 +938,264 @@ class TestToolEndpointsLive:
         resp = client.post("/v1/tools/python", json={"code": ""})
         assert resp.status_code == 400
 
-    def test_bash_tool_returns_501_review_fix_c1(self):
-        """v0.53.7 C1 review fix: bash reverted to 501.
+    def test_bash_tool_executes_simple_command(self, monkeypatch):
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox not supported on Windows")
+        from fastapi.testclient import TestClient
 
-        ``/bin/sh -c`` spawns a child outside the RLVR sandbox's OS-level
-        isolation (``unshare(CLONE_NEWNET)`` / macOS ``sandbox-exec`` /
-        socket patch); a caller could reach the cloud-metadata service
-        from the child shell. Reverted until container/namespace work
-        lands in v0.53.8.
-        """
+        from soup_cli.trainer.rewards import SandboxProcessResult
+
+        app = _create_test_app()
+        client = TestClient(app)
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "namespaces"
+        )
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._run_bash_sandbox",
+            lambda cmd: SandboxProcessResult(returncode=0, stdout="hello\n", stderr=""),
+        )
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["stdout"] == "hello\n"
+        assert data["exit_code"] == 0
+        assert not data["timed_out"]
+
+    def test_bash_tool_rejects_missing_command(self):
         from fastapi.testclient import TestClient
         app = _create_test_app()
         client = TestClient(app)
+        resp = client.post("/v1/tools/bash", json={})
+        assert resp.status_code == 400
+
+    def test_bash_tool_rejects_oversize_command(self):
+        from fastapi.testclient import TestClient
+        app = _create_test_app()
+        client = TestClient(app)
+        oversize = "x" * (64 * 1024 + 1)
+        resp = client.post("/v1/tools/bash", json={"command": oversize})
+        assert resp.status_code == 400
+
+    def test_bash_tool_times_out(self, monkeypatch):
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox not supported on Windows")
+        from fastapi.testclient import TestClient
+
+        from soup_cli.trainer.rewards import SandboxProcessResult
+
+        app = _create_test_app()
+        client = TestClient(app)
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "namespaces"
+        )
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._run_bash_sandbox",
+            lambda cmd: SandboxProcessResult(returncode=None, stdout="", stderr="", timed_out=True),
+        )
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "sleep 10"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["timed_out"] is True
+        assert data["exit_code"] == 124
+
+    def test_bash_tool_blocks_network_namespace(self):
+        if sys.platform != "linux":
+            pytest.skip("network namespace test only valid on Linux")
+        from soup_cli.trainer.rewards import _get_isolation_strategy, _run_bash_sandbox
+        if _get_isolation_strategy() != "namespaces":
+            pytest.skip("namespaces not available")
+
+        cmd = "curl -s --connect-timeout 1 http://169.254.169.254/ || echo 'BLOCKED'"
+        result = _run_bash_sandbox(cmd)
+        assert "BLOCKED" in result.stdout or result.returncode != 0
+
+    def test_bash_tool_windows_returns_501(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        app = _create_test_app()
+        client = TestClient(app)
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "best-effort"
+        )
         resp = client.post(
             "/v1/tools/bash",
             json={"command": "echo hello"},
         )
         assert resp.status_code == 501
-        assert "v0.53.9" in resp.text
+        assert "OS-level isolation" in resp.json()["detail"]
 
-    def test_bash_tool_returns_501_with_empty_body(self):
-        """The 501 stub does not parse the body — it always returns 501."""
+    def test_bash_tool_auth_required_on_non_loopback_host(self):
+        from fastapi.testclient import TestClient
+        app = _create_test_app(host="0.0.0.0")
+        client = TestClient(app)
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+        )
+        assert resp.status_code == 401
+        assert "Authentication required" in resp.json()["detail"]
+
+    def test_bash_tool_bearer_auth_validation(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from soup_cli.trainer.rewards import SandboxProcessResult
+
+        app = _create_test_app(host="0.0.0.0", auth_token="secret123")
+        client = TestClient(app)
+        # Invalid token -> 401
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert resp.status_code == 401
+
+        # Valid token -> 200 (mocked sandbox)
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "namespaces"
+        )
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._run_bash_sandbox",
+            lambda cmd: SandboxProcessResult(returncode=0, stdout="ok", stderr=""),
+        )
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+            headers={"Authorization": "Bearer secret123"},
+        )
+        assert resp.status_code == 200
+
+    def test_bash_tool_bounded_streaming_kills_massive_output(self):
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox not supported on Windows")
+        from soup_cli.trainer.rewards import _run_sandboxed_subprocess
+        # Generate >100KB of output, should be killed and output_exceeded set
+        argv = ["python3", "-c", "import sys; sys.stdout.write('A' * 200_000); sys.stdout.flush()"]
+        result = _run_sandboxed_subprocess(argv, max_output_bytes=10_000)
+        assert result.output_exceeded is True
+        assert "exceeded limit" in result.stderr
+
+    def test_bash_tool_environment_secret_isolation(self, monkeypatch):
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox not supported on Windows")
+        from soup_cli.trainer.rewards import _run_sandboxed_subprocess
+        monkeypatch.setenv("SECRET_TOKEN", "supersecret12345")
+        argv = ["python3", "-c", "import os; print(os.environ.get('SECRET_TOKEN', 'ISOLATED'))"]
+        result = _run_sandboxed_subprocess(argv)
+        assert result.stdout == "ISOLATED"
+
+    def test_bash_sandbox_raises_on_strict_namespace_failure(self, monkeypatch):
+        import os
+        import shutil
+        import subprocess
+        import sys
+
+        # Cross-platform mock: trick the sandbox into thinking it's Linux and has namespaces
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy",
+            lambda: "namespaces",
+        )
+
+        # Prevent preexec_fn from applying CPU/Memory limits to the pytest test runner!
+        try:
+            import resource
+            monkeypatch.setattr(resource, "setrlimit", lambda *args: None)
+        except ImportError:
+            pass
+
+        def mock_unshare(*args, **kwargs):
+            raise PermissionError("Operation not permitted")
+
+        monkeypatch.setattr(os, "unshare", mock_unshare, raising=False)
+
+        # Mock Popen to execute preexec_fn and mimic POSIX behavior by raising SubprocessError
+
+        def mock_popen(*args, **kwargs):
+            preexec = kwargs.get("preexec_fn")
+            if preexec:
+                try:
+                    preexec()
+                except Exception as e:
+                    raise subprocess.SubprocessError(f"Exception occurred in preexec_fn: {e}")
+            raise OSError("Mock prevents actual execution")
+
+        monkeypatch.setattr(subprocess, "Popen", mock_popen)
+        monkeypatch.setattr(shutil, "which", lambda x: "/bin/bash")
+
+        from soup_cli.trainer.rewards import _run_bash_sandbox
+
+        with pytest.raises(PermissionError, match="Operation not permitted"):
+            _run_bash_sandbox("echo hello")
+
+    def test_bash_sandbox_runs_on_strict_namespace_success(self, monkeypatch):
+        import os
+        import sys
+        if sys.platform == "win32":
+            pytest.skip("bash sandbox not supported on Windows")
+        if sys.platform != "linux":
+            pytest.skip("unshare is a Linux-only syscall")
+
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy",
+            lambda: "namespaces",
+        )
+        monkeypatch.setattr(os, "unshare", lambda *args, **kwargs: None, raising=False)
+
+        from soup_cli.trainer.rewards import _run_bash_sandbox
+
+        result = _run_bash_sandbox("echo hello")
+        assert result.returncode == 0
+        assert "hello" in result.stdout
+
+    def test_bash_tool_restricted_linux_fails_closed_501(self, monkeypatch):
         from fastapi.testclient import TestClient
         app = _create_test_app()
         client = TestClient(app)
-        resp = client.post("/v1/tools/bash", json={})
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "namespaces"
+        )
+        def _failing_bash(cmd):
+            raise PermissionError("unshare failed: Operation not permitted")
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._run_bash_sandbox",
+            _failing_bash,
+        )
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+        )
         assert resp.status_code == 501
+        assert "Operation not permitted" in resp.json()["detail"]
+
+    def test_bash_tool_subprocess_error_maps_to_501(self, monkeypatch):
+        import subprocess
+
+        from fastapi.testclient import TestClient
+        app = _create_test_app()
+        client = TestClient(app)
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._get_isolation_strategy", lambda: "namespaces"
+        )
+        def _failing_bash(cmd):
+            raise subprocess.SubprocessError(
+                "Exception occurred in preexec_fn: unshare namespace failed"
+            )
+        monkeypatch.setattr(
+            "soup_cli.trainer.rewards._run_bash_sandbox",
+            _failing_bash,
+        )
+        resp = client.post(
+            "/v1/tools/bash",
+            json={"command": "echo hello"},
+        )
+        assert resp.status_code == 501
+        assert "preexec_fn" in resp.json()["detail"]
 
     def test_web_search_default_deny_all(self):
         from fastapi.testclient import TestClient
@@ -1587,29 +1822,7 @@ class TestReviewFixesSSEHeaders:
             assert not line.startswith("data: {}")
 
 
-class TestReviewFixesC1BashStub:
-    """v0.53.7 C1: bash endpoint reverted to 501."""
-
-    def test_bash_returns_501_with_v0538_marker(self):
-        try:
-            import fastapi  # noqa: F401
-        except ImportError:
-            pytest.skip("FastAPI not installed")
-        from fastapi.testclient import TestClient
-
-        from soup_cli.commands.serve import _create_app
-
-        app = _create_app(
-            model_obj=MagicMock(),
-            tokenizer=MagicMock(),
-            device="cpu",
-            model_name="test-model",
-            max_tokens_default=128,
-        )
-        client = TestClient(app)
-        resp = client.post("/v1/tools/bash", json={"command": "ls"})
-        assert resp.status_code == 501
-        assert "v0.53.9" in resp.text
+# TestReviewFixesC1BashStub replaced by TestToolEndpointsLive with OS sandbox isolation
 
 
 class TestReviewFixesAuthToken:

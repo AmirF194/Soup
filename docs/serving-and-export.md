@@ -745,17 +745,23 @@ prompt-lookup decoding — no draft model required). Mutually exclusive with a r
 
 ## Server-Side Tool Endpoints
 
+v0.53.7 ships live server-side tool calling on `soup serve`.
 Three POST routes are now available on `soup serve`:
 
-- **`POST /v1/tools/python`** — Sandboxed Python execution. Requires Bearer token auth.
-  Wraps the RLVR sandbox with 5-second timeout and 64KB code cap. Returns 200 with
-  `stdout` / `stderr` / `return_value`; 400 on validation error; 401 on bad auth.
-
-- **`POST /v1/tools/web_search`** — Domain-allowlisted web search. Requires Bearer token
-  auth. Uses httpx backend with hard 5-second timeout and 5-result cap. Returns results
+- **`POST /v1/tools/python`** — runs caller-supplied Python code in an isolated
+  sub-process. Bounded by 512 MB memory, 5-second wall-clock timeout, and a
+  single-worker concurrency cap.
+- **`POST /v1/tools/web_search`** — searches the web and returns domain-filtered results
   as `[{url, title, snippet}]` with snippets sanitized (null bytes stripped).
   Deny-by-default via `WebSearchConfig.domain_allowlist`.
 
-- **`POST /v1/tools/bash`** — Deferred to v0.53.8. Current child-process isolation
-  insufficient for `/bin/sh -c` (subprocess escapes the RLVR sandbox). Returns 501 with
-  v0.53.8 marker pending container/namespace work.
+- **`POST /v1/tools/bash`** — runs a bash command with strict OS-level network
+  isolation (`unshare` on supported Linux runtimes, `sandbox-exec` on macOS).
+  Enforces mandatory Bearer token authentication when bound to a non-loopback host,
+  a 5-second wall-clock timeout, a minimal secret-scrubbed environment, and a combined
+  10KB stdout/stderr streaming kill limit. Returns the real stdout, stderr, exit code,
+  and timeout state. This is not a filesystem sandbox: the child retains the server
+  process's read access to world-readable system files. The endpoint fails closed with
+  HTTP 501 when strict OS isolation is unavailable (including on Windows or restricted
+  Linux containers).
+

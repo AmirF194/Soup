@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -305,19 +306,17 @@ def serve(
     ),
 ):
     """Start a local inference server with OpenAI-compatible API."""
-    # Security: the transformers backend exposes a best-effort code-exec tool
-    # endpoint (/v1/tools/python). Binding a non-loopback host without a tool
-    # auth token puts that endpoint on the network unauthenticated.
+    # Security: the server exposes code-exec tool endpoints (/v1/tools/python, /v1/tools/bash).
+    # Binding a non-loopback host without a tool auth token exposes unauthenticated code execution.
     if host not in {"127.0.0.1", "localhost", "::1"} and not tool_auth_token:
         from rich.markup import escape as _rich_escape
 
         console.print(
-            f"[bold yellow]Security warning:[/] binding non-loopback host "
-            f"'{_rich_escape(str(host))}' exposes the unauthenticated code-exec "
-            "tool endpoint (/v1/tools/python) to the network. Pass "
-            "[bold]--tool-auth-token <secret>[/] to require a bearer token, or "
-            "use [bold]--host 127.0.0.1[/] (the default)."
+            f"[red]Error:[/] binding non-loopback host '{_rich_escape(str(host))}' "
+            "requires [bold]--tool-auth-token <secret>[/] to protect code-execution "
+            "tool endpoints (/v1/tools/bash, /v1/tools/python)."
         )
+        raise typer.Exit(code=2)
     # v0.71.12 #221 — validate `--bank` up front (path containment + backend)
     # so a typo / bad path surfaces before backend init.
     if bank is not None:
@@ -1126,6 +1125,7 @@ def serve(
             reasoning_parser=resolved_reasoning_parser,
             record_thumbs_db=record_thumbs_db,
             auth_token=tool_auth_token,
+            host=host,
             loaded_bank=loaded_bank,
             mole_runtime=mole_runtime,
             kv_cache_generate_kwargs=(
@@ -1666,6 +1666,7 @@ def _create_app(
     web_search_config: Any = None,
     web_search_backend: Any = None,
     auth_token: Optional[str] = None,
+    host: str = "127.0.0.1",
     reasoning_parser: Optional[str] = None,
     record_thumbs_db: Optional[str] = None,
     loaded_bank: Any = None,
@@ -1691,7 +1692,12 @@ def _create_app(
     from pydantic import Field
 
     def _check_tool_auth(authorization: Optional[str]) -> None:
-        """v0.53.7 H-A: gate tool endpoints when ``auth_token`` is set."""
+        """v0.53.7 H-A: gate tool endpoints when host is exposed or auth_token is set."""
+        if host not in {"127.0.0.1", "localhost", "::1"} and not auth_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required on non-loopback host",
+            )
         if not auth_token:
             return
         expected = f"Bearer {auth_token}"
@@ -2114,20 +2120,54 @@ def _create_app(
         }
 
     @app.post("/v1/tools/bash")
-    def tool_bash(payload: dict) -> dict:  # noqa: ARG001 — payload unused on stub
-        # v0.53.7 review-fix C1: bash spawns ``/bin/sh -c`` which escapes
-        # the RLVR sandbox's OS-level isolation (``unshare(CLONE_NEWNET)``
-        # / macOS ``sandbox-exec``); a caller can reach
-        # ``http://169.254.169.254/...`` from the child shell. Reverted to
-        # 501 until container/namespace work lands in v0.53.9.
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "Server-side tool 'bash' live execution deferred to "
-                "v0.53.9 — sandbox isolation requires container/namespace "
-                "work."
-            ),
-        )
+    def tool_bash(
+        payload: dict,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        _check_tool_auth(authorization)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid request")
+        command = payload.get("command")
+        if not isinstance(command, str) or not command:
+            raise HTTPException(status_code=400, detail="Invalid request")
+        if len(command) > tool_max_code_len:
+            raise HTTPException(status_code=400, detail="Invalid request")
+        try:
+            from soup_cli.trainer.rewards import _get_isolation_strategy, _run_bash_sandbox
+
+            if _get_isolation_strategy() == "best-effort":
+                raise HTTPException(
+                    status_code=501,
+                    detail="bash sandbox requires OS-level isolation",
+                )
+
+            result = _run_bash_sandbox(command)
+        except (NotImplementedError, PermissionError, subprocess.SubprocessError) as exc:
+            raise HTTPException(
+                status_code=501,
+                detail=str(exc),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("/v1/tools/bash sandbox error: %s", exc)
+            raise HTTPException(status_code=500, detail="Internal server error")
+        if result.launch_failed:
+            raise HTTPException(
+                status_code=501,
+                detail="bash sandbox failed to initialize OS-level isolation",
+            )
+        exit_code = result.returncode if result.returncode is not None else 1
+        if result.timed_out:
+            exit_code = 124
+        elif result.output_exceeded:
+            exit_code = 1
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": exit_code,
+            "timed_out": result.timed_out,
+        }
 
     @app.post("/v1/tools/web_search")
     def tool_web_search(

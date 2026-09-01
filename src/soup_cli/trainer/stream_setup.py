@@ -39,6 +39,106 @@ console = Console()
 _PROBE_DEFERRAL_CEILING = 4.0
 
 
+def _validate_qwen4_streaming_mode(*, arch: str, task: str, quant: str) -> None:
+    """Keep unvalidated Qwen4 training modes outside the streamed path."""
+    if arch != "qwen4_exp":
+        return
+    if task != "sft":
+        raise ValueError(
+            "Qwen4-Exp layer streaming is initially validated for task='sft' "
+            f"only; got task={task!r}. Preference-loss parity is pending."
+        )
+    if quant != "none":
+        raise ValueError(
+            "Qwen4-Exp layer streaming currently requires quantization='none'. "
+            "Its exact PLE path is validated, but streamed NF4 parity is pending."
+        )
+
+
+def _validate_qwen4_ngram_disk(*, disk_kind: str, weights_dir: str) -> None:
+    """Refuse sparse PLE mmap on media outside the measured SSD classes."""
+    if disk_kind in ("nvme", "ssd"):
+        return
+    raise ValueError(
+        "training.stream_ngram_source='disk' needs an SSD or NVMe "
+        f"checkpoint volume; detected {disk_kind!r} at {weights_dir}. "
+        "Move the checkpoint or set an accurate training.stream_disk_kind override."
+    )
+
+
+def _resolve_qwen4_ngram_source(
+    *,
+    oq_ngram: bool,
+    requested: str,
+    store_total: int,
+    ngram_bytes: int,
+    free_ram: int,
+    stream_source: str,
+) -> str:
+    """Resolve Qwen4 PLE storage and refuse unsupported oQ materialisation."""
+    from soup_cli.utils.layer_stream import RAM_TIER_HEADROOM
+
+    if oq_ngram:
+        if requested == "ram":
+            raise ValueError(
+                "oQ PLE embeddings require "
+                "training.stream_ngram_source='disk' (or 'auto'): the packed "
+                "source stays read-only and only requested rows are dequantized."
+            )
+        return "disk"
+    if requested != "auto":
+        return requested
+    ram_budget = free_ram * RAM_TIER_HEADROOM
+    base_in_ram = (
+        store_total
+        if stream_source != "disk" and store_total < ram_budget
+        else 0
+    )
+    return "ram" if base_in_ram + ngram_bytes < ram_budget else "disk"
+
+
+def _validate_qwen4_ngram_ram_fit(
+    *,
+    stream_source: str,
+    ngram_source: str,
+    required_ram: int,
+    free_ram: int,
+) -> None:
+    """Refuse a RAM base or PLE before either source allocates its store."""
+    from soup_cli.utils.layer_stream import RAM_TIER_HEADROOM
+
+    ram_required = stream_source == "ram" or ngram_source == "ram"
+    if ram_required and required_ram >= free_ram * RAM_TIER_HEADROOM:
+        policy = (
+            "training.stream_ngram_source='ram'"
+            if ngram_source == "ram"
+            else "training.stream_source='ram'"
+        )
+        fallback = (
+            "stream_ngram_source='auto' to use read-only SSD streaming"
+            if ngram_source == "ram"
+            else "stream_source='auto' to allow the disk tier"
+        )
+        raise ValueError(
+            f"{policy} but the base plus selected PLE "
+            f"storage needs {required_ram / 1e9:.1f} GB and only "
+            f"{free_ram / 1e9:.1f} GB of RAM is free. Set {fallback}, free RAM, "
+            "or pick a smaller base."
+        )
+
+
+def _warn_if_ngram_source_unused(
+    *, arch: str, requested: str, ngram_bytes: int, notify
+) -> None:
+    """Make a user-supplied PLE policy visible when the checkpoint has no PLE."""
+    if arch == "qwen4_exp" and requested != "auto" and not ngram_bytes:
+        notify(
+            "[yellow]training.stream_ngram_source="
+            f"{requested!r} has no effect: this Qwen4 checkpoint has no PLE "
+            "N-gram table.[/]"
+        )
+
+
 @dataclass(frozen=True)
 class _ProbePlan:
     """What the post-build measured probe (#349) needs from the pre-flight.
@@ -288,6 +388,8 @@ class StreamingSetupMixin:
         from soup_cli.utils.layer_shard import (
             QUANT_NF4,
             QUANT_NONE,
+            checkpoint_source_components,
+            estimate_oq_stream_cache_bytes,
             fingerprint_source_files,
             inspect_shard_cache,
             resolve_shard_dir,
@@ -318,6 +420,7 @@ class StreamingSetupMixin:
             quantised_layer_suffixes,
         )
         from soup_cli.utils.moe import detect_moe_model, get_moe_target_modules
+        from soup_cli.utils.qwen4_ple import external_tensor_bytes
         from soup_cli.utils.spectrum_scan import resolve_model_weights
 
         console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
@@ -346,6 +449,9 @@ class StreamingSetupMixin:
         # an untied head stay at `dtype`, exactly as replace_with_bnb_linear
         # leaves them.
         quant = QUANT_NF4 if tcfg.quantization == "4bit" else QUANT_NONE
+        _validate_qwen4_streaming_mode(
+            arch=arch, task=getattr(cfg, "task", "sft"), quant=quant
+        )
         # #321 — the streamed skeleton and the shards must quantise with the
         # SAME double-quant setting or the streamed-vs-resident bit-exactness
         # claim breaks. Read the flag once here (resolving the tri-state unset to
@@ -363,16 +469,29 @@ class StreamingSetupMixin:
                 quant=quant,
                 double_quant=double_quant,
             )
+            oq_shard_estimate = estimate_oq_stream_cache_bytes(
+                weights_plan.weights_dir,
+                dtype=dtype,
+                arch=arch,
+            )
+            if oq_shard_estimate is not None:
+                shard_estimate = oq_shard_estimate
             cached = None
             if not weights_plan.needs_materialization:
+                source_components = checkpoint_source_components(
+                    weights_plan.weights_dir,
+                    weights_plan.source_files,
+                    include_config=arch == "qwen4_exp",
+                )
                 cached, _reason = inspect_shard_cache(
                     shard_dir,
                     dtype,
-                    fingerprint_source_files(weights_plan.source_files),
-                    weights_plan.source_files,
+                    fingerprint_source_files(source_components),
+                    source_components,
                     quant,
                     double_quant,
                     quant_device_kind,
+                    "qwen4_ple" if arch == "qwen4_exp" else "",
                 )
             _render_stream_disk_preflight(
                 source_bytes=weights_plan.source_bytes,
@@ -400,7 +519,15 @@ class StreamingSetupMixin:
             store_estimate = estimate_stream_store_bytes(
                 source_bytes, dtype=dtype, quant=quant, double_quant=double_quant
             )
-            if store_estimate >= early_free_ram * RAM_TIER_HEADROOM and tcfg.stream_source == "ram":
+            # Qwen4's source size includes the PLE table, which the sharder
+            # leaves external. Its exact RAM/disk decision is made from the
+            # safetensors header below; counting it here would reject the very
+            # `stream_ngram_source: disk` run this path enables.
+            if (
+                arch != "qwen4_exp"
+                and store_estimate >= early_free_ram * RAM_TIER_HEADROOM
+                and tcfg.stream_source == "ram"
+            ):
                 as_streamed = (
                     ""
                     if quant == QUANT_NONE
@@ -478,6 +605,9 @@ class StreamingSetupMixin:
         embed_bytes = extras_resident_bytes(shard_dir)
         large_store_bytes = large_layer_store_bytes(shard_dir, index)
         large_buffer_bytes = large_layer_buffer_bytes(shard_dir, index)
+        ngram_bytes = external_tensor_bytes(
+            getattr(index, "external_tensors", None) or {}
+        )
 
         free_ram = free_ram_bytes()
         if free_ram is None:
@@ -490,16 +620,56 @@ class StreamingSetupMixin:
             ) * 10
 
         store_total = layer_store_bytes + large_store_bytes + embed_bytes
+        ngram_source = "disk"
+        if ngram_bytes:
+            requested_ngram = tcfg.stream_ngram_source
+            oq_ngram = any(
+                hasattr(spec, "bits") for spec in index.external_tensors.values()
+            )
+            ngram_source = _resolve_qwen4_ngram_source(
+                oq_ngram=oq_ngram,
+                requested=requested_ngram,
+                store_total=store_total,
+                ngram_bytes=ngram_bytes,
+                free_ram=free_ram,
+                stream_source=tcfg.stream_source,
+            )
+            storage = "CPU RAM"
+            if ngram_source == "disk":
+                ngram_disk = resolve_disk_kind(
+                    weights_dir, tcfg.stream_disk_kind, notify=console.print
+                )
+                ngram_disk_kind = ngram_disk.kind
+                _validate_qwen4_ngram_disk(
+                    disk_kind=ngram_disk_kind, weights_dir=weights_dir
+                )
+                storage = f"read-only {ngram_disk_kind.upper()} mmap"
+            console.print(
+                f"[cyan]Qwen4 PLE:[/] {ngram_bytes / 1e9:.2f} GB via {storage} "
+                f"(stream_ngram_source={tcfg.stream_ngram_source!r})"
+            )
+        _warn_if_ngram_source_unused(
+            arch=arch,
+            requested=getattr(tcfg, "stream_ngram_source", "auto"),
+            ngram_bytes=ngram_bytes,
+            notify=console.print,
+        )
         # Checked BEFORE build_stream_plan so a `ram`-only run is refused with
         # the message about stream_source rather than choose_tier's generic
         # "needs NVMe or more RAM" — and without paying the ~9 s disk probe for
         # an answer that cannot change the outcome.
-        if tcfg.stream_source == "ram" and store_total >= free_ram * RAM_TIER_HEADROOM:
-            raise ValueError(
-                f"training.stream_source='ram' but the base is "
-                f"{store_total / 1e9:.1f} GB and only {free_ram / 1e9:.1f} GB of "
-                f"RAM is free. Set stream_source='auto' to fall back to the NVMe "
-                f"disk tier, free RAM, or pick a smaller base."
+        required_ram = store_total + (ngram_bytes if ngram_source == "ram" else 0)
+        _validate_qwen4_ngram_ram_fit(
+            stream_source=tcfg.stream_source,
+            ngram_source=ngram_source,
+            required_ram=required_ram,
+            free_ram=free_ram,
+        )
+        plan_free_ram = free_ram
+        if ngram_source == "ram":
+            plan_free_ram = max(
+                0,
+                free_ram - math.ceil(ngram_bytes / RAM_TIER_HEADROOM),
             )
         plan = build_stream_plan(
             arch=arch,
@@ -509,7 +679,7 @@ class StreamingSetupMixin:
             store_bytes=layer_store_bytes,
             large_store_bytes=large_store_bytes,
             large_buffer_bytes=large_buffer_bytes,
-            available_ram_bytes=free_ram,
+            available_ram_bytes=plan_free_ram,
             # The page-locked ceiling is a property of the box, not of free RAM;
             # rather than probe it destructively we attempt the pinned store and
             # fall back loudly (see layer_stream_runtime._build_source).
@@ -631,6 +801,8 @@ class StreamingSetupMixin:
             quant=quant,
             double_quant=double_quant,
             tier=tier,
+            weights_dir=weights_dir,
+            ngram_source=ngram_source,
         )
         self.model = model
         self._stream_runtime = runtime

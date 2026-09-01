@@ -70,20 +70,41 @@ _MAX_BLOCKSIZE = 4096
 #: Refuse absurd checkpoints rather than thrash (mirrors spectrum_scan caps).
 _MAX_LAYERS = 512
 _MAX_TENSOR_ELEMENTS = 2**31
+# Qwen4's production PLE table is intentionally much larger than an ordinary
+# decoder tensor (320,001,536 x 160 = 51.2B elements). Keep a separate bound so
+# routing it outside layer shards does not also route it around size validation.
+_MAX_EXTERNAL_TENSOR_ELEMENTS = 2**36
 _MAX_SHARD_FILES = 4096
 _MAX_TOTAL_TENSORS = 200_000
 
 _INDEX_NAME = "index.json"
 _EXTRAS_NAME = "extras.safetensors"
-_SHARD_FORMAT_VERSION = 3
+_SHARD_FORMAT_VERSION = 5
 _LARGE_EMBED_ROLE = "embed_tokens"
 _LARGE_HEAD_ROLE = "lm_head"
+QWEN4_PLE_WEIGHT_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight"
+_QWEN4_PLE_SHARD_RE = re.compile(
+    r"^(?P<prefix>.+\.ple\.ple_embedding\.ngram_embedding)\.shard_(?P<part>\d+)\.weight$"
+)
+_QWEN4_OQ_PLE_SHARD_RE = re.compile(
+    r"^(?P<prefix>.+\.ple\.ple_embedding\.ngram_embedding)\.shards\.(?P<part>\d+)\.weight$"
+)
+_QWEN4_EXPERT_RE = re.compile(
+    r"^(?P<prefix>model\.layers\.\d+\.mlp\.experts)\."
+    r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
+_QWEN4_OQ_EXPERT_RE = re.compile(
+    r"^(?P<prefix>model\.layers\.\d+\.mlp)\.switch_mlp\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def _canonical_stream_key(key: str) -> str:
     """Normalise wrapper prefixes that do not exist on the text decoder."""
     if key.startswith(_QWEN35_VLM_PREFIX):
         return "model." + key[len(_QWEN35_VLM_PREFIX) :]
+    if key.startswith("language_model."):
+        return key[len("language_model.") :]
     return key
 
 
@@ -205,6 +226,234 @@ class ShardIndex:
     quant_device: str = ""
     #: per-layer short key -> spec. Empty when ``quant == "none"``.
     quant_specs: Mapping[str, NF4WeightSpec] = field(default_factory=dict)
+    #: Frozen tensors intentionally left in the original checkpoint. Qwen4-Exp's
+    #: PLE table is too large for the decoder-layer buffer, but its forward only
+    #: gathers sparse rows, so the runtime can serve it directly from RAM or a
+    #: read-only safetensors mmap instead of copying it into the shard cache.
+    external_tensors: Mapping[str, Any] = field(default_factory=dict)
+    #: Cache-policy marker. It distinguishes a Qwen4 cache that intentionally
+    #: found no PLE table from an older cache that silently put one in a layer.
+    external_mode: str = ""
+
+
+@dataclass(frozen=True)
+class ExternalTensorSpec:
+    """Logical layout for a tensor retained in one or more source parts."""
+
+    parts: Tuple["ExternalTensorPart", ...]
+    shape: Tuple[int, ...]
+    dtype: str
+
+    def __post_init__(self) -> None:
+        if not self.parts:
+            raise ValueError("external tensor must contain at least one source part")
+        if len(self.shape) != 2 or any(dim <= 0 for dim in self.shape):
+            raise ValueError(
+                f"external tensor must be a positive 2-D matrix; got {self.shape}"
+            )
+        if math.prod(self.shape) > _MAX_EXTERNAL_TENSOR_ELEMENTS:
+            raise ValueError(
+                "external tensor exceeds the element cap: "
+                f"{math.prod(self.shape)} > {_MAX_EXTERNAL_TENSOR_ELEMENTS}"
+            )
+        if any(part.dtype != self.dtype for part in self.parts):
+            raise ValueError("external tensor parts must all have the same dtype")
+        if any(part.shape[1:] != self.shape[1:] for part in self.parts):
+            raise ValueError("external tensor parts must have the same trailing shape")
+        if sum(part.shape[0] for part in self.parts) != self.shape[0]:
+            raise ValueError("external tensor part rows do not add up to its shape")
+        _ = self.nbytes
+
+    @property
+    def nbytes(self) -> int:
+        sizes = {
+            "BF16": 2,
+            "F16": 2,
+            "F32": 4,
+        }
+        try:
+            itemsize = sizes[self.dtype]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported external tensor dtype {self.dtype!r}; supported: "
+                f"{', '.join(sorted(sizes))}"
+            ) from exc
+        return sum(math.prod(part.shape) * itemsize for part in self.parts)
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> "ExternalTensorSpec":
+        return cls(
+            parts=tuple(
+                ExternalTensorPart.from_json(part) for part in payload["parts"]
+            ),
+            shape=tuple(int(dim) for dim in payload["shape"]),
+            dtype=str(payload["dtype"]),
+        )
+
+
+@dataclass(frozen=True)
+class ExternalTensorPart:
+    """One row-contiguous source fragment of an external tensor."""
+
+    source_file: str
+    source_key: str
+    shape: Tuple[int, ...]
+    dtype: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.source_file != os.path.basename(self.source_file)
+            or self.source_file in ("", ".", "..")
+        ):
+            raise ValueError(
+                f"invalid external tensor source filename {self.source_file!r}"
+            )
+        if not self.source_key:
+            raise ValueError("external tensor source key must not be empty")
+        if len(self.shape) != 2 or any(dim <= 0 for dim in self.shape):
+            raise ValueError(
+                f"external tensor part must be a positive 2-D matrix; got {self.shape}"
+            )
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> "ExternalTensorPart":
+        return cls(
+            source_file=str(payload["source_file"]),
+            source_key=str(payload["source_key"]),
+            shape=tuple(int(dim) for dim in payload["shape"]),
+            dtype=str(payload["dtype"]),
+        )
+
+
+@dataclass(frozen=True)
+class OQExternalTensorPart:
+    """One row-contiguous oQ affine fragment retained in its source file."""
+
+    source_file: str
+    weight_key: str
+    scales_key: str
+    biases_key: str
+    packed_shape: Tuple[int, ...]
+    stats_shape: Tuple[int, ...]
+    packed_dtype: str
+    stats_dtype: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.source_file != os.path.basename(self.source_file)
+            or self.source_file in ("", ".", "..")
+        ):
+            raise ValueError(
+                f"invalid external oQ tensor source filename {self.source_file!r}"
+            )
+        if not all((self.weight_key, self.scales_key, self.biases_key)):
+            raise ValueError("external oQ tensor keys must not be empty")
+        if len(self.packed_shape) != 2 or any(dim <= 0 for dim in self.packed_shape):
+            raise ValueError(
+                f"external oQ packed tensor must be a positive 2-D matrix; "
+                f"got {self.packed_shape}"
+            )
+        if len(self.stats_shape) != 2 or any(dim <= 0 for dim in self.stats_shape):
+            raise ValueError(
+                f"external oQ stats tensor must be a positive 2-D matrix; "
+                f"got {self.stats_shape}"
+            )
+        if self.packed_shape[0] != self.stats_shape[0]:
+            raise ValueError("external oQ weight and statistics must have equal row counts")
+        if self.packed_dtype != "U32":
+            raise ValueError(
+                f"external oQ packed tensor must use U32; got {self.packed_dtype!r}"
+            )
+        if self.stats_dtype not in ("BF16", "F16", "F32"):
+            raise ValueError(
+                f"unsupported external oQ stats dtype {self.stats_dtype!r}"
+            )
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> "OQExternalTensorPart":
+        return cls(
+            source_file=str(payload["source_file"]),
+            weight_key=str(payload["weight_key"]),
+            scales_key=str(payload["scales_key"]),
+            biases_key=str(payload["biases_key"]),
+            packed_shape=tuple(int(dim) for dim in payload["packed_shape"]),
+            stats_shape=tuple(int(dim) for dim in payload["stats_shape"]),
+            packed_dtype=str(payload["packed_dtype"]),
+            stats_dtype=str(payload["stats_dtype"]),
+        )
+
+
+@dataclass(frozen=True)
+class OQExternalTensorSpec:
+    """Logical dense tensor served from packed read-only oQ fragments."""
+
+    parts: Tuple[OQExternalTensorPart, ...]
+    shape: Tuple[int, ...]
+    dtype: str
+    bits: int
+    group_size: int
+    mode: str
+
+    def __post_init__(self) -> None:
+        from soup_cli.utils.oq_affine import AffineQuantSpec, logical_width
+
+        _ = AffineQuantSpec(self.bits, self.group_size, self.mode)
+        if not self.parts:
+            raise ValueError("external oQ tensor must contain at least one source part")
+        if len(self.shape) != 2 or any(dim <= 0 for dim in self.shape):
+            raise ValueError(
+                f"external oQ logical tensor must be a positive 2-D matrix; got {self.shape}"
+            )
+        if math.prod(self.shape) > _MAX_EXTERNAL_TENSOR_ELEMENTS:
+            raise ValueError(
+                "external oQ tensor exceeds the element cap: "
+                f"{math.prod(self.shape)} > {_MAX_EXTERNAL_TENSOR_ELEMENTS}"
+            )
+        if self.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(f"unsupported external oQ output dtype {self.dtype!r}")
+        widths = {
+            logical_width(part.packed_shape[1], self.bits) for part in self.parts
+        }
+        if widths != {self.shape[1]}:
+            raise ValueError("external oQ parts disagree with the logical tensor width")
+        if sum(part.packed_shape[0] for part in self.parts) != self.shape[0]:
+            raise ValueError("external oQ part rows do not add up to its logical shape")
+        expected_stats_width = self.shape[1] // self.group_size
+        if any(part.stats_shape[1] != expected_stats_width for part in self.parts):
+            raise ValueError("external oQ statistics disagree with the affine group size")
+
+    @property
+    def nbytes(self) -> int:
+        itemsize = {"bfloat16": 2, "float16": 2, "float32": 4}[self.dtype]
+        return math.prod(self.shape) * itemsize
+
+    @property
+    def storage_nbytes(self) -> int:
+        stats_itemsize = {"BF16": 2, "F16": 2, "F32": 4}
+        return sum(
+            math.prod(part.packed_shape) * 4
+            + math.prod(part.stats_shape) * stats_itemsize[part.stats_dtype] * 2
+            for part in self.parts
+        )
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> "OQExternalTensorSpec":
+        return cls(
+            parts=tuple(
+                OQExternalTensorPart.from_json(part) for part in payload["parts"]
+            ),
+            shape=tuple(int(dim) for dim in payload["shape"]),
+            dtype=str(payload["dtype"]),
+            bits=int(payload["bits"]),
+            group_size=int(payload["group_size"]),
+            mode=str(payload["mode"]),
+        )
+
+
+def _external_spec_from_json(payload: Mapping[str, Any]) -> Any:
+    if "bits" in payload:
+        return OQExternalTensorSpec.from_json(payload)
+    return ExternalTensorSpec.from_json(payload)
 
 
 def layer_shard_path(out_dir: str, idx: int) -> str:
@@ -241,6 +490,9 @@ def read_shard_index(out_dir: str) -> ShardIndex:
     # `quant` defaults to "none" so a v0.72.0/.1 bf16 cache stays valid for a
     # bf16 request rather than forcing every existing user to re-shard.
     specs = payload.get("quant_specs") or {}
+    external = payload.get("external_tensors") or {}
+    if not isinstance(external, dict):
+        raise ValueError("external_tensors must be an object")
     return ShardIndex(
         n_layers=int(payload["n_layers"]),
         layer_keys=tuple(payload["layer_keys"]),
@@ -262,6 +514,11 @@ def read_shard_index(out_dir: str) -> ShardIndex:
         quant_specs={
             key: NF4WeightSpec.from_json(value) for key, value in specs.items()
         },
+        external_tensors={
+            str(key): _external_spec_from_json(value)
+            for key, value in external.items()
+        },
+        external_mode=str(payload.get("external_mode", "")),
     )
 
 
@@ -344,6 +601,67 @@ def _discover_safetensors(weights_dir: str) -> List[str]:
     return found
 
 
+def estimate_oq_stream_cache_bytes(
+    weights_dir: str, *, dtype: str, arch: str
+) -> Optional[int]:
+    """Estimate the dense shard-cache payload for an oQ Qwen4 checkpoint.
+
+    The packed source size is not a safe proxy: decoder weights expand to the
+    streamed dtype, while the much larger PLE table remains external.  Returns
+    ``None`` for non-oQ checkpoints so existing estimation stays unchanged.
+    """
+    if arch != "qwen4_exp" or dtype not in _SUPPORTED_DTYPES:
+        return None
+    if not os.path.isdir(os.path.realpath(os.path.expanduser(weights_dir))):
+        return None
+    from safetensors import safe_open
+
+    from soup_cli.utils.oq_affine import load_affine_quant_config, logical_width
+
+    shards = _discover_safetensors(weights_dir)
+    descriptors = {}
+    saw_companion = False
+    for path in shards:
+        with safe_open(path, framework="pt") as handle:
+            for source_key in handle.keys():
+                if not source_key.startswith("language_model."):
+                    continue
+                canonical = _canonical_stream_key(source_key)
+                tensor_slice = handle.get_slice(source_key)
+                descriptors[canonical] = (
+                    source_key,
+                    tuple(int(dim) for dim in tensor_slice.get_shape()),
+                )
+                saw_companion = saw_companion or source_key.endswith(
+                    (".scales", ".biases")
+                )
+    if not saw_companion:
+        return None
+    quant_config = load_affine_quant_config(weights_dir)
+    itemsize = {"bfloat16": 2, "float16": 2, "float32": 4}[dtype]
+    elements = 0
+    for key, (source_key, shape) in descriptors.items():
+        if key.endswith((".scales", ".biases")) or source_key.endswith(
+            ".ple.ple_embedding.ngram_embedding.weight_scale"
+        ):
+            continue
+        if _QWEN4_OQ_PLE_SHARD_RE.match(key):
+            continue
+        base = key.removesuffix(".weight")
+        if key.endswith(".weight") and {
+            base + ".scales",
+            base + ".biases",
+        }.issubset(descriptors):
+            spec = quant_config.for_module(source_key.removesuffix(".weight"))
+            elements += math.prod(shape[:-1]) * logical_width(shape[-1], spec.bits)
+        else:
+            elements += math.prod(shape)
+    # Safetensors headers, index JSON and atomic-write slack are tiny beside a
+    # production model, but reserve 256 MiB so the pre-flight never reports a
+    # byte-perfect payload as a byte-perfect filesystem requirement.
+    return elements * itemsize + 256 * 1024 * 1024
+
+
 def source_weight_bytes(weights_dir: str) -> int:
     """Total bytes of the source ``*.safetensors`` — a cheap size probe that
     lets a caller refuse an oversized base BEFORE spending minutes sharding."""
@@ -359,6 +677,26 @@ def _source_file_components(shards: List[str]) -> Tuple[Tuple[str, int, int], ..
             (os.path.basename(path), int(stat.st_size), int(stat.st_mtime_ns))
         )
     return tuple(components)
+
+
+def checkpoint_source_components(
+    weights_dir: str,
+    components: Tuple[Tuple[str, int, int], ...],
+    *,
+    include_config: bool,
+) -> Tuple[Tuple[str, int, int], ...]:
+    """Add numerical sidecar metadata to the cache identity when applicable."""
+    merged = {name: (name, size, mtime) for name, size, mtime in components}
+    if include_config:
+        config_path = os.path.join(os.path.realpath(weights_dir), "config.json")
+        if os.path.isfile(config_path) and not os.path.islink(config_path):
+            stat = os.stat(config_path)
+            merged["config.json"] = (
+                "config.json",
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+    return tuple(merged[name] for name in sorted(merged))
 
 
 def _fingerprint_components(components: Tuple[Tuple[str, int, int], ...]) -> str:
@@ -500,6 +838,7 @@ def inspect_shard_cache(
     quant: str,
     double_quant: bool,
     quant_device: str,
+    external_mode: str = "",
 ) -> Tuple[Optional[ShardIndex], str]:
     """Return a reusable index or the precise reason it must be rewritten.
 
@@ -529,6 +868,11 @@ def inspect_shard_cache(
         )
     if index.source_fingerprint != fingerprint:
         return None, _describe_source_change(index.source_files, source_files)
+    if index.external_mode != external_mode:
+        return None, (
+            f"external tensor policy changed ({index.external_mode!r} -> "
+            f"{external_mode!r})"
+        )
     if index.format_version != _SHARD_FORMAT_VERSION:
         return None, (
             f"shard format changed "
@@ -682,9 +1026,14 @@ def shard_checkpoint(
     # Only the KIND matters (cuda:0 and cuda:1 quantise identically); the
     # index stores that so the cache check below stays stable across ordinals.
     device_kind = str(device).split(":", 1)[0] if quantise else ""
+    external_mode = "qwen4_ple" if arch == "qwen4_exp" else ""
     shards = _discover_safetensors(weights_dir)
     resolved_out = _validate_out_dir(out_dir)
-    source_files = _source_file_components(shards)
+    source_files = checkpoint_source_components(
+        weights_dir,
+        _source_file_components(shards),
+        include_config=bool(external_mode),
+    )
     fingerprint = _fingerprint_components(source_files)
     if not force:
         cached, miss_reason = inspect_shard_cache(
@@ -695,6 +1044,7 @@ def shard_checkpoint(
             quant,
             double_quant,
             device_kind,
+            external_mode,
         )
         if cached is not None:
             return cached
@@ -705,10 +1055,16 @@ def shard_checkpoint(
 
     # pass 1 — build key -> shard without materialising a single tensor
     where: Dict[str, Tuple[str, str]] = {}
+    external_parts: Dict[str, List[Tuple[int, ExternalTensorPart]]] = {}
+    oq_external_keys: Dict[str, List[Tuple[int, str]]] = {}
+    external_source_keys = set()
+    saw_oq_companion = False
     layer_ids = set()
     for path in shards:
         with safe_open(path, framework="pt") as handle:
             for source_key in handle.keys():
+                if external_mode and source_key.endswith((".biases", ".scales")):
+                    saw_oq_companion = True
                 key = _canonical_stream_key(source_key)
                 prior = where.get(key)
                 if prior is not None and prior != (path, source_key):
@@ -719,6 +1075,33 @@ def shard_checkpoint(
                         f"safetensors key order."
                     )
                 where[key] = (path, source_key)
+                ple_match = _QWEN4_PLE_SHARD_RE.match(key) if external_mode else None
+                oq_ple_match = (
+                    _QWEN4_OQ_PLE_SHARD_RE.match(key) if external_mode else None
+                )
+                is_dense_ple = external_mode and key.endswith(QWEN4_PLE_WEIGHT_SUFFIX)
+                if oq_ple_match:
+                    logical_key = oq_ple_match.group("prefix") + ".weight"
+                    part_index = int(oq_ple_match.group("part"))
+                    oq_external_keys.setdefault(logical_key, []).append(
+                        (part_index, key)
+                    )
+                elif ple_match or is_dense_ple:
+                    tensor_slice = handle.get_slice(source_key)
+                    logical_key = (
+                        ple_match.group("prefix") + ".weight" if ple_match else key
+                    )
+                    part_index = int(ple_match.group("part")) if ple_match else 0
+                    part = ExternalTensorPart(
+                        source_file=os.path.basename(path),
+                        source_key=source_key,
+                        shape=tuple(int(dim) for dim in tensor_slice.get_shape()),
+                        dtype=str(tensor_slice.get_dtype()),
+                    )
+                    external_parts.setdefault(logical_key, []).append(
+                        (part_index, part)
+                    )
+                    external_source_keys.add(key)
                 if len(where) > _MAX_TOTAL_TENSORS:
                     raise ValueError(
                         f"checkpoint declares more than {_MAX_TOTAL_TENSORS} tensors"
@@ -727,6 +1110,124 @@ def shard_checkpoint(
                 if match:
                     layer_ids.add(int(match.group(1)))
 
+    oq_config = None
+    if saw_oq_companion:
+        from soup_cli.utils.oq_affine import load_affine_quant_config
+
+        oq_config = load_affine_quant_config(weights_dir)
+        # oQ conditional-generation bundles also carry vision and MTP weights.
+        # The streamed skeleton is the text-only CausalLM, so those components
+        # are deliberately not copied into its extras shard.
+        where = {
+            key: location
+            for key, location in where.items()
+            if location[1].startswith("language_model.")
+            and not location[1].endswith(
+                ".ple.ple_embedding.ngram_embedding.weight_scale"
+            )
+        }
+        layer_ids = {
+            int(match.group(1))
+            for key in where
+            if (match := _LAYER_RE.match(key)) is not None
+        }
+
+    external_tensors: Dict[str, Any] = {}
+    for logical_key, indexed_parts in external_parts.items():
+        indexed_parts.sort(key=lambda item: item[0])
+        indices = [part_index for part_index, _part in indexed_parts]
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                f"PLE shards for {logical_key!r} must be contiguous from zero; "
+                f"got {indices[:8]}"
+            )
+        parts = tuple(part for _part_index, part in indexed_parts)
+        dtype_names = {part.dtype for part in parts}
+        trailing_shapes = {part.shape[1:] for part in parts}
+        if len(dtype_names) != 1 or len(trailing_shapes) != 1:
+            raise ValueError(
+                f"PLE shards for {logical_key!r} disagree on dtype or width"
+            )
+        external_tensors[logical_key] = ExternalTensorSpec(
+            parts=parts,
+            shape=(sum(part.shape[0] for part in parts), *parts[0].shape[1:]),
+            dtype=parts[0].dtype,
+        )
+
+    for logical_key, indexed_keys in oq_external_keys.items():
+        if oq_config is None:
+            raise ValueError("oQ PLE shards require affine quantization metadata")
+        indexed_keys.sort(key=lambda item: item[0])
+        indices = [part_index for part_index, _key in indexed_keys]
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                f"oQ PLE shards for {logical_key!r} must be contiguous from zero; "
+                f"got {indices[:8]}"
+            )
+        parts = []
+        part_specs = set()
+        logical_widths = set()
+        for _part_index, weight_key in indexed_keys:
+            location = where.get(weight_key)
+            scales_location = where.get(weight_key.removesuffix(".weight") + ".scales")
+            biases_location = where.get(weight_key.removesuffix(".weight") + ".biases")
+            if location is None or scales_location is None or biases_location is None:
+                raise ValueError(f"oQ PLE part {weight_key!r} is missing affine companions")
+            paths = {location[0], scales_location[0], biases_location[0]}
+            if len(paths) != 1:
+                raise ValueError(
+                    f"oQ PLE part {weight_key!r} splits affine companions across files"
+                )
+            module_name = location[1].removesuffix(".weight")
+            quant_spec = oq_config.for_module(module_name)
+            part_specs.add(quant_spec)
+            path = location[0]
+            with safe_open(path, framework="pt") as handle:
+                weight_slice = handle.get_slice(location[1])
+                scales_slice = handle.get_slice(scales_location[1])
+                biases_slice = handle.get_slice(biases_location[1])
+                packed_shape = tuple(int(dim) for dim in weight_slice.get_shape())
+                scales_shape = tuple(int(dim) for dim in scales_slice.get_shape())
+                biases_shape = tuple(int(dim) for dim in biases_slice.get_shape())
+                if scales_shape != biases_shape:
+                    raise ValueError(
+                        f"oQ PLE part {weight_key!r} scales and biases disagree"
+                    )
+                from soup_cli.utils.oq_affine import logical_width
+
+                width = logical_width(packed_shape[-1], quant_spec.bits)
+                logical_widths.add(width)
+                parts.append(
+                    OQExternalTensorPart(
+                        source_file=os.path.basename(path),
+                        weight_key=location[1],
+                        scales_key=scales_location[1],
+                        biases_key=biases_location[1],
+                        packed_shape=packed_shape,
+                        stats_shape=scales_shape,
+                        packed_dtype=str(weight_slice.get_dtype()),
+                        stats_dtype=str(scales_slice.get_dtype()),
+                    )
+                )
+            external_source_keys.update(
+                {
+                    weight_key,
+                    weight_key.removesuffix(".weight") + ".scales",
+                    weight_key.removesuffix(".weight") + ".biases",
+                }
+            )
+        if len(part_specs) != 1 or len(logical_widths) != 1:
+            raise ValueError(f"oQ PLE shards for {logical_key!r} disagree on layout")
+        quant_spec = next(iter(part_specs))
+        width = next(iter(logical_widths))
+        external_tensors[logical_key] = OQExternalTensorSpec(
+            parts=tuple(parts),
+            shape=(sum(part.packed_shape[0] for part in parts), width),
+            dtype=dtype,
+            bits=quant_spec.bits,
+            group_size=quant_spec.group_size,
+            mode=quant_spec.mode,
+        )
     if not layer_ids:
         raise ValueError(
             f"no decoder layer weights (model.layers.N.*) found in {weights_dir} — "
@@ -767,12 +1268,35 @@ def shard_checkpoint(
         for idx in range(n_layers):
             prefix = f"model.layers.{idx}."
             blob = {}
+            qwen4_experts: Dict[str, Dict[int, Tuple[str, str]]] = {}
+            oq_experts: Dict[str, str] = {}
             for key, location in where.items():
                 if not key.startswith(prefix):
                     continue
+                if key in external_source_keys:
+                    continue
+                if saw_oq_companion and key.endswith((".scales", ".biases")):
+                    continue
+                oq_expert_match = (
+                    _QWEN4_OQ_EXPERT_RE.match(key) if saw_oq_companion else None
+                )
+                if oq_expert_match:
+                    oq_experts[oq_expert_match.group("projection")] = key
+                    continue
+                expert_match = _QWEN4_EXPERT_RE.match(key) if external_mode else None
+                if expert_match:
+                    projection = expert_match.group("projection")
+                    expert = int(expert_match.group("expert"))
+                    qwen4_experts.setdefault(projection, {})[expert] = location
+                    continue
                 path, source_key = location
                 short = key[len(prefix):]
-                tensor = _read_tensor(handles[path], source_key, dtype)
+                if saw_oq_companion and key.endswith(".weight"):
+                    tensor = _read_oq_tensor(
+                        handles, where, key, oq_config=oq_config, dtype=dtype
+                    )
+                else:
+                    tensor = _read_tensor(handles[path], source_key, dtype)
                 total_params += tensor.numel()
                 if quantise and short in suffixes:
                     sidecars, spec, code, nested_code = _quantize_nf4(
@@ -795,6 +1319,85 @@ def shard_checkpoint(
                 else:
                     blob[short] = tensor
                 del tensor
+            for logical_key, spec in external_tensors.items():
+                if logical_key.startswith(prefix):
+                    total_params += math.prod(spec.shape)
+            if qwen4_experts:
+                import torch
+
+                expected_projections = {"gate_proj", "up_proj", "down_proj"}
+                if set(qwen4_experts) != expected_projections:
+                    raise ValueError(
+                        f"Qwen4 layer {idx} has incomplete expert projections: "
+                        f"{sorted(qwen4_experts)}"
+                    )
+                expert_ids = sorted(qwen4_experts["gate_proj"])
+                if expert_ids != list(range(len(expert_ids))) or any(
+                    sorted(qwen4_experts[name]) != expert_ids
+                    for name in expected_projections
+                ):
+                    raise ValueError(
+                        f"Qwen4 layer {idx} expert ids must be contiguous and "
+                        "identical across gate/up/down projections"
+                    )
+
+                def _expert_tensor(projection: str, expert: int):
+                    path, source_key = qwen4_experts[projection][expert]
+                    return _read_tensor(handles[path], source_key, dtype)
+
+                gate_up = []
+                down = []
+                for expert in expert_ids:
+                    gate = _expert_tensor("gate_proj", expert)
+                    up = _expert_tensor("up_proj", expert)
+                    down_tensor = _expert_tensor("down_proj", expert)
+                    gate_up.append(torch.cat((gate, up), dim=0))
+                    down.append(down_tensor)
+                    total_params += gate.numel() + up.numel() + down_tensor.numel()
+                if "mlp.experts.gate_up_proj" in blob or "mlp.experts.down_proj" in blob:
+                    raise ValueError(
+                        f"Qwen4 layer {idx} contains both packed and per-expert weights"
+                    )
+                blob["mlp.experts.gate_up_proj"] = torch.stack(gate_up, dim=0)
+                blob["mlp.experts.down_proj"] = torch.stack(down, dim=0)
+            if oq_experts:
+                import torch
+
+                expected_projections = {"gate_proj", "up_proj", "down_proj"}
+                if set(oq_experts) != expected_projections:
+                    raise ValueError(
+                        f"Qwen4 oQ layer {idx} has incomplete Switch-MLP projections: "
+                        f"{sorted(oq_experts)}"
+                    )
+                gate = _read_oq_tensor(
+                    handles,
+                    where,
+                    oq_experts["gate_proj"],
+                    oq_config=oq_config,
+                    dtype=dtype,
+                )
+                up = _read_oq_tensor(
+                    handles,
+                    where,
+                    oq_experts["up_proj"],
+                    oq_config=oq_config,
+                    dtype=dtype,
+                )
+                down = _read_oq_tensor(
+                    handles,
+                    where,
+                    oq_experts["down_proj"],
+                    oq_config=oq_config,
+                    dtype=dtype,
+                )
+                if gate.shape != up.shape:
+                    raise ValueError(
+                        f"Qwen4 oQ layer {idx} gate/up expert shapes disagree: "
+                        f"{tuple(gate.shape)} vs {tuple(up.shape)}"
+                    )
+                blob["mlp.experts.gate_up_proj"] = torch.cat((gate, up), dim=1)
+                blob["mlp.experts.down_proj"] = down
+                total_params += gate.numel() + up.numel() + down.numel()
             layer_keys.update(blob)
             layer_specs = {
                 name: (tuple(tensor.shape), str(tensor.dtype).replace("torch.", ""))
@@ -819,8 +1422,15 @@ def shard_checkpoint(
         for key, location in where.items():
             if _LAYER_RE.match(key):
                 continue
+            if saw_oq_companion and key.endswith((".scales", ".biases")):
+                continue
             path, source_key = location
-            tensor = _read_tensor(handles[path], source_key, dtype)
+            if saw_oq_companion and key.endswith(".weight"):
+                tensor = _read_oq_tensor(
+                    handles, where, key, oq_config=oq_config, dtype=dtype
+                )
+            else:
+                tensor = _read_tensor(handles[path], source_key, dtype)
             total_params += tensor.numel()
             role = large_weight_role(key) if stream_untied_pair else None
             if role is None:
@@ -859,6 +1469,8 @@ def shard_checkpoint(
         double_quant=bool(double_quant) if quantise else False,
         quant_device=device_kind,
         quant_specs=quant_specs,
+        external_tensors=external_tensors,
+        external_mode=external_mode,
     )
     _atomic_write_index(index, resolved_out)
     return index
@@ -892,3 +1504,63 @@ def _read_tensor(handle: Any, key: str, dtype: str) -> "Any":
         )
     target = getattr(torch, dtype)
     return handle.get_tensor(key).to(target).contiguous()
+
+
+def _read_raw_tensor(handle: Any, key: str) -> "Any":
+    """Materialise one tensor without destroying packed integer storage."""
+    shape = handle.get_slice(key).get_shape()
+    elements = math.prod(int(dim) for dim in shape)
+    if elements > _MAX_TENSOR_ELEMENTS:
+        raise ValueError(
+            f"tensor {key} is too large for layer streaming "
+            f"({elements} elements > {_MAX_TENSOR_ELEMENTS})"
+        )
+    return handle.get_tensor(key).contiguous()
+
+
+def _read_oq_tensor(
+    handles: Mapping[str, Any],
+    where: Mapping[str, Tuple[str, str]],
+    key: str,
+    *,
+    oq_config: Any,
+    dtype: str,
+) -> "Any":
+    """Read one oQ matrix, or an ordinary floating weight without companions."""
+    location = where[key]
+    base = key.removesuffix(".weight")
+    scales_location = where.get(base + ".scales")
+    biases_location = where.get(base + ".biases")
+    if scales_location is None and biases_location is None:
+        tensor = _read_tensor(handles[location[0]], location[1], dtype)
+        return _normalise_oq_layout(key, tensor)
+    if scales_location is None or biases_location is None:
+        raise ValueError(f"oQ affine weight {key!r} has only one companion tensor")
+    if oq_config is None:
+        raise ValueError(f"oQ affine weight {key!r} has no quantization metadata")
+
+    from soup_cli.utils.oq_affine import dequantize_affine
+
+    module_name = location[1].removesuffix(".weight")
+    spec = oq_config.for_module(module_name)
+    packed = _read_raw_tensor(handles[location[0]], location[1])
+    scales = _read_raw_tensor(handles[scales_location[0]], scales_location[1])
+    biases = _read_raw_tensor(handles[biases_location[0]], biases_location[1])
+    try:
+        tensor = dequantize_affine(
+            packed,
+            scales,
+            biases,
+            spec=spec,
+            dtype=dtype,
+        )
+        return _normalise_oq_layout(key, tensor)
+    finally:
+        del packed, scales, biases
+
+
+def _normalise_oq_layout(key: str, tensor: Any) -> Any:
+    """Convert MLX-only storage conventions to Transformers parameter layouts."""
+    if key.endswith(".conv1d.weight") and tensor.ndim == 3 and tensor.shape[-1] == 1:
+        return tensor.transpose(-1, -2).contiguous()
+    return tensor

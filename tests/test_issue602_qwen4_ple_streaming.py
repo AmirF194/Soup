@@ -1167,7 +1167,7 @@ def test_qwen4_gate_record_and_changelog_are_discoverable_and_credited():
     benchmark_index = (root / "benchmarks" / "README.md").read_text(encoding="utf-8")
 
     sources = [root / "CHANGELOG.md"] + sorted(
-        (root / "changelog.d").rglob("603.added.md")
+        (root / "changelog.d").rglob("603.*.md")
     )
     texts = [p.read_text(encoding="utf-8") for p in sources if p.is_file()]
     assert texts, "neither CHANGELOG.md nor a 603 fragment is readable"

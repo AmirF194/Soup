@@ -12,6 +12,20 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MLX SFT ignored `training.gradient_checkpointing` (#685).** The wrapper
+  built mlx-lm's `TrainingArgs` without a `grad_checkpoint` kwarg, so
+  mlx-lm's own dataclass default of `False` always applied regardless of
+  the configured value, silently giving up the memory savings a user
+  enabled checkpointing for. The written `adapter_config.json` also
+  hardcoded `grad_checkpoint: false`, so the drift could not be detected
+  from the output afterwards either. `gradient_checkpointing` accepts a
+  bool or one of the `selective`/`medium`/`full`/`auto` tiers; mlx-lm has
+  only a single on/off switch, so any non-`False` tier now resolves to
+  `True` there, the same `bool()` coercion already used for this field on
+  the other trainer backends.
+
 ## [0.74.0] - 2026-09-04
 
 ### Added

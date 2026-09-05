@@ -292,6 +292,12 @@ class MLXSFTTrainerWrapper:
         # Real eval cadence when a val split exists; otherwise the value is
         # irrelevant (val_dataset stays None and mlx-lm skips evaluation).
         steps_per_eval = max(1, iters // 4) if val_rows else max(1000, iters + 1)
+        # mlx-lm's TrainingArgs.grad_checkpoint is a single bool with no concept
+        # of a granularity tier; bool() is the same coercion commands/train.py's
+        # hardware-fit predictor and layer_stream.should_enable_hf_gradient_checkpointing
+        # already apply to this field on every other backend, so any non-empty
+        # tier string ("selective"/"medium"/"full"/"auto") resolves to True here too.
+        grad_checkpoint = bool(cfg.training.gradient_checkpointing)
         args = TrainingArgs(
             batch_size=batch_size,
             iters=iters,
@@ -300,6 +306,7 @@ class MLXSFTTrainerWrapper:
             steps_per_eval=steps_per_eval,
             steps_per_save=steps_per_save,
             adapter_file=str(output_dir / "adapters.safetensors"),
+            grad_checkpoint=grad_checkpoint,
         )
 
         train_dataset = CacheDataset(create_dataset(train_rows, self.tokenizer, args))
@@ -353,7 +360,7 @@ class MLXSFTTrainerWrapper:
                         lora_cfg, adapter_path=str(output_dir)
                     )["lora_parameters"],
                     "mask_prompt": False,
-                    "grad_checkpoint": False,
+                    "grad_checkpoint": grad_checkpoint,
                     "grad_accumulation_steps": 1,
                 },
                 indent=2,

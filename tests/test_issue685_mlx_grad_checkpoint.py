@@ -76,7 +76,10 @@ def _install_fake_mlx(monkeypatch):
 
     mlx_lm_tuner_trainer.TrainingArgs = _FakeTrainingArgs
 
+    captured_calls = []
+
     def _fake_train(**kwargs):
+        captured_calls.append(kwargs)
         callback = kwargs.get("training_callback")
         if callback is not None:
             callback.on_train_loss_report({"train_loss": 0.5})
@@ -99,6 +102,8 @@ def _install_fake_mlx(monkeypatch):
     }
     for name, module in fake_modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+
+    return captured_calls
 
 
 class _FakeMlxModel:
@@ -145,10 +150,48 @@ def _mlx_wrapper(tmp_path, **training):
 def test_grad_checkpoint_reaches_training_args(
     tmp_path, monkeypatch, requested, expected
 ):
-    """The value TrainingArgs actually receives, for every value the schema
-    accepts. Before the fix this is always False regardless of the
-    parametrized input: the args object never carried a grad_checkpoint
-    kwarg at all, so mlx-lm's own dataclass default applied every time."""
+    """The value mlx-lm's TrainingArgs actually receives, for every value the
+    schema accepts. Before the fix this kwarg was never passed at all, so
+    mlx-lm's own dataclass default (False) applied every time, and a test
+    that only inspects adapter_config.json cannot see that, since the
+    written metadata comes from the same local variable regardless of
+    whether it is threaded into the TrainingArgs(...) call. Deleting
+    grad_checkpoint=grad_checkpoint from that call must fail here even
+    though it changes nothing about the JSON write."""
+    captured_calls = _install_fake_mlx(monkeypatch)
+    wrapper = _mlx_wrapper(
+        tmp_path, epochs=1, lr=1e-4, batch_size=1, gradient_checkpointing=requested
+    )
+
+    wrapper.train()
+
+    args = captured_calls[0]["args"]
+    assert args.grad_checkpoint is expected, (
+        f"gradient_checkpointing={requested!r} must resolve to "
+        f"grad_checkpoint={expected} on the TrainingArgs mlx-lm receives"
+    )
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        (True, True),
+        (False, False),
+        ("selective", True),
+        ("medium", True),
+        ("full", True),
+        ("auto", True),
+    ],
+)
+def test_grad_checkpoint_is_recorded_in_adapter_config(
+    tmp_path, monkeypatch, requested, expected
+):
+    """The value recorded in adapter_config.json, for every value the schema
+    accepts. Kept separate from the TrainingArgs assertion above so the two
+    halves have distinct kill-sets: reverting only the metadata write while
+    keeping the TrainingArgs kwarg fails only this test, and deleting the
+    TrainingArgs kwarg while keeping the metadata write fails only the
+    other one."""
     _install_fake_mlx(monkeypatch)
     wrapper = _mlx_wrapper(
         tmp_path, epochs=1, lr=1e-4, batch_size=1, gradient_checkpointing=requested
@@ -164,11 +207,57 @@ def test_grad_checkpoint_reaches_training_args(
 
 
 def test_default_is_unchanged(tmp_path, monkeypatch):
-    """No explicit setting keeps the schema default (False) end to end."""
-    _install_fake_mlx(monkeypatch)
+    """No explicit setting keeps the schema default (False) end to end,
+    on both the TrainingArgs kwarg and the written metadata."""
+    captured_calls = _install_fake_mlx(monkeypatch)
     wrapper = _mlx_wrapper(tmp_path, epochs=1, lr=1e-4, batch_size=1)
 
     wrapper.train()
 
+    assert captured_calls[0]["args"].grad_checkpoint is False
     written = json.loads((tmp_path / "adapter_config.json").read_text())
     assert written["grad_checkpoint"] is False
+
+
+class TestTierFlatteningIsAnnounced:
+    """The bool()-flattening from a tier string to a single on/off switch is
+    silent otherwise: a user asking for 'selective' gets 'full' with no
+    indication anything was collapsed. Same warning mechanism and same
+    _warnings_for-style harness as test_issue353_mlx_seed_warning.py."""
+
+    @staticmethod
+    def _warnings_for(monkeypatch, **training):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from soup_cli.config.schema import DataConfig, SoupConfig, TrainingConfig
+        from soup_cli.trainer import mlx_sft
+
+        buffer = StringIO()
+        monkeypatch.setattr(mlx_sft, "console", Console(file=buffer, width=200))
+        cfg = SoupConfig(
+            base="mlx-community/Llama-3.1-8B-Instruct-4bit",
+            task="sft",
+            backend="mlx",
+            data=DataConfig(train="./data/train.jsonl", format="chatml"),
+            training=TrainingConfig(**training),
+            output="./out",
+        )
+        mlx_sft.MLXSFTTrainerWrapper(cfg)._check_unsupported()
+        return buffer.getvalue()
+
+    def test_a_tier_string_is_named(self, monkeypatch):
+        out = self._warnings_for(
+            monkeypatch, epochs=1, lr=1e-4, batch_size=1, gradient_checkpointing="selective"
+        )
+        assert "gradient_checkpointing" in out
+        assert "selective" in out
+
+    def test_a_plain_bool_says_nothing(self, monkeypatch):
+        """CONTROL. A bool is not a tier; flattening a bool to itself has
+        nothing to announce."""
+        out = self._warnings_for(
+            monkeypatch, epochs=1, lr=1e-4, batch_size=1, gradient_checkpointing=True
+        )
+        assert "gradient_checkpointing" not in out

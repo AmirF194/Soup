@@ -149,6 +149,11 @@ class MLXSFTTrainerWrapper:
             unsupported.append("training.seed (MLX seeds through mx.random)")
         if tcfg.data_seed is not None:
             unsupported.append("training.data_seed (MLX seeds through mx.random)")
+        if isinstance(tcfg.gradient_checkpointing, str):
+            unsupported.append(
+                f"gradient_checkpointing tier {tcfg.gradient_checkpointing!r} "
+                "(MLX has a single on/off switch; enabling it)"
+            )
         if unsupported:
             console.print(
                 "[yellow]MLX backend ignores: " + ", ".join(unsupported) + "[/]"

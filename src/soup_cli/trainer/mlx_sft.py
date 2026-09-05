@@ -292,6 +292,7 @@ class MLXSFTTrainerWrapper:
         # Real eval cadence when a val split exists; otherwise the value is
         # irrelevant (val_dataset stays None and mlx-lm skips evaluation).
         steps_per_eval = max(1, iters // 4) if val_rows else max(1000, iters + 1)
+        grad_accumulation_steps = int(cfg.training.gradient_accumulation_steps)
         args = TrainingArgs(
             batch_size=batch_size,
             iters=iters,
@@ -300,6 +301,7 @@ class MLXSFTTrainerWrapper:
             steps_per_eval=steps_per_eval,
             steps_per_save=steps_per_save,
             adapter_file=str(output_dir / "adapters.safetensors"),
+            grad_accumulation_steps=grad_accumulation_steps,
         )
 
         train_dataset = CacheDataset(create_dataset(train_rows, self.tokenizer, args))
@@ -354,7 +356,7 @@ class MLXSFTTrainerWrapper:
                     )["lora_parameters"],
                     "mask_prompt": False,
                     "grad_checkpoint": False,
-                    "grad_accumulation_steps": 1,
+                    "grad_accumulation_steps": grad_accumulation_steps,
                 },
                 indent=2,
             )

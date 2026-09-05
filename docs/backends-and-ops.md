@@ -1054,3 +1054,14 @@ soup license-advisor --target b2c --license llama-3 --monthly-active-users 80000
 ```
 
 The Llama-family allowlist is tight (no `.startswith` over-match), so a hypothetical future `llama-permissive-2030` won't false-trigger the 700M-MAU gate. Composes with v0.60 `soup adapters merge --license <id>` for the merge-time conflict gate.
+
+## Troubleshooting
+
+```bash
+soup doctor    # GPU, system resources, dependencies, and version in one place
+```
+
+- **`ImportError: DLL load failed while importing _C` (Windows).** PyPI's torch
+  wheel is CPU-only. Reinstall a CUDA build; `soup doctor` prints the
+  `pip install` command for the wheel your driver can run.
+- **`soup version` ≠ `pip show soup-cli`** — multiple Python installs; use a virtualenv.

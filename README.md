@@ -371,10 +371,7 @@ All training tasks run on CPU for testing (quantization auto-disabled). Optional
 soup doctor    # GPU, system resources, dependencies, and version in one place
 ```
 
-- **`ImportError: DLL load failed while importing _C` (Windows).** PyPI's torch
-  wheel is CPU-only. Reinstall a CUDA build; `soup doctor` prints the
-  `pip install` command for the wheel your driver can run.
-- **`soup version` ≠ `pip show soup-cli`** — multiple Python installs; use a virtualenv.
+CUDA wheels, version mismatches: [`docs/backends-and-ops.md`](docs/backends-and-ops.md#troubleshooting).
 
 ## Development
 

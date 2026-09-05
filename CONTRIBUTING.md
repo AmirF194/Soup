@@ -59,7 +59,7 @@ pytest tests/ -v --tb=short
 Run the linter:
 
 ```bash
-ruff check src/soup_cli/ scripts/ tests/
+ruff check src/soup_cli/ scripts/ tests/ benchmarks/
 ```
 
 If both pass — you're ready to contribute!
@@ -70,7 +70,7 @@ We use **ruff** for all code style and linting. Before committing, run:
 
 ```bash
 # Check for issues
-ruff check src/soup_cli/ scripts/ tests/
+ruff check src/soup_cli/ scripts/ tests/ benchmarks/
 
 # Auto-fix issues
 ruff check --fix src/soup_cli/ scripts/ tests/
@@ -394,7 +394,7 @@ Then open a pull request on GitHub with:
 
 When you open a PR, the GitHub template will show this checklist:
 
-- [ ] `ruff check src/soup_cli/ scripts/ tests/` passes
+- [ ] `ruff check src/soup_cli/ scripts/ tests/ benchmarks/` passes
 - [ ] `pytest tests/ -v` passes
 - [ ] Updated relevant docs (`README.md` and the matching page under `docs/`) if needed
 - [ ] New tests added for new functionality

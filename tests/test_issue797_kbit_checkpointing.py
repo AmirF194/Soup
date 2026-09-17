@@ -50,17 +50,33 @@ def _make_config(**overrides):
     return SoupConfig(**base)
 
 
+# (task, module, class name): covers the base-model default trainer (sft),
+# the DPO-family HF-checkpointing branch this issue was first reported against,
+# and one non-streaming trainer (grpo) that never touches layer streaming at
+# all, so the same should_enable_hf_gradient_checkpointing resolution has to
+# hold with stream_layers structurally unset.
+_KBIT_PREP_TRAINERS = [
+    ("sft", "soup_cli.trainer.sft", "SFTTrainerWrapper"),
+    ("dpo", "soup_cli.trainer.dpo", "DPOTrainerWrapper"),
+    ("grpo", "soup_cli.trainer.grpo", "GRPOTrainerWrapper"),
+]
+
+
 class TestKbitPrepThreadsCheckpointingFlag:
-    """DPOTrainerWrapper is the simplest transformers-backend trainer that
-    hits the kbit-prep branch; DPO/KTO/ORPO/SIMPO/SFT all share the same
-    should_enable_hf_gradient_checkpointing resolution.
+    """Every transformers-backend trainer with a kbit-prep call site shares
+    the same should_enable_hf_gradient_checkpointing resolution; parametrized
+    over the default trainer (sft), the DPO family, and a non-streaming
+    trainer (grpo) so the behavioral case isn't pinned to DPO alone.
     """
 
-    def _run(self, monkeypatch, *, gradient_checkpointing: bool):
-        from soup_cli.trainer.dpo import DPOTrainerWrapper
+    def _run(self, monkeypatch, *, task: str, module: str, cls_name: str,
+              gradient_checkpointing: bool):
+        import importlib
+
+        wrapper_cls = getattr(importlib.import_module(module), cls_name)
 
         cfg = _make_config(
-            task="dpo",
+            task=task,
             training={
                 "quantization": "4bit",
                 "gradient_checkpointing": gradient_checkpointing,
@@ -84,6 +100,7 @@ class TestKbitPrepThreadsCheckpointingFlag:
         fake_transformers = types.SimpleNamespace(
             AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: _Tokenizer()),
             AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=lambda *a, **k: model),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: SimpleNamespace()),
         )
 
         def _fake_kbit_prep(model_obj, **kwargs):
@@ -104,7 +121,7 @@ class TestKbitPrepThreadsCheckpointingFlag:
             lambda **kwargs: None,
         )
 
-        wrapper = object.__new__(DPOTrainerWrapper)
+        wrapper = object.__new__(wrapper_cls)
         wrapper.config = cfg
         wrapper.device = "cpu"
         wrapper._trust_remote_code = False
@@ -115,15 +132,27 @@ class TestKbitPrepThreadsCheckpointingFlag:
 
         return captured_kwargs
 
-    def test_gradient_checkpointing_false_reaches_kbit_prep(self, monkeypatch):
+    @pytest.mark.parametrize("task,module,cls_name", _KBIT_PREP_TRAINERS)
+    def test_gradient_checkpointing_false_reaches_kbit_prep(
+        self, monkeypatch, task, module, cls_name
+    ):
         # This is the exact bug: on main, kbit-prep is called with no kwarg
         # at all and peft defaults use_gradient_checkpointing to True, so a
         # config that explicitly asks for it off never gets it off.
-        captured = self._run(monkeypatch, gradient_checkpointing=False)
+        captured = self._run(
+            monkeypatch, task=task, module=module, cls_name=cls_name,
+            gradient_checkpointing=False,
+        )
         assert captured.get("use_gradient_checkpointing") is False
 
-    def test_gradient_checkpointing_true_still_reaches_kbit_prep(self, monkeypatch):
-        captured = self._run(monkeypatch, gradient_checkpointing=True)
+    @pytest.mark.parametrize("task,module,cls_name", _KBIT_PREP_TRAINERS)
+    def test_gradient_checkpointing_true_still_reaches_kbit_prep(
+        self, monkeypatch, task, module, cls_name
+    ):
+        captured = self._run(
+            monkeypatch, task=task, module=module, cls_name=cls_name,
+            gradient_checkpointing=True,
+        )
         assert captured.get("use_gradient_checkpointing") is True
 
 

@@ -932,8 +932,7 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         if hf_grad_ckpt:
             from soup_cli.utils.gpu import get_gpu_info
             from soup_cli.utils.gradient_ckpt import (
-                describe_tier,
-                resolve_gradient_checkpointing,
+                plan_gradient_checkpointing,
             )
 
             gpu_memory_gb: Optional[float] = None
@@ -944,14 +943,16 @@ class SFTTrainerWrapper(StreamingSetupMixin):
             except (KeyError, TypeError, ZeroDivisionError):
                 gpu_memory_gb = None
 
-            ckpt_kwargs = resolve_gradient_checkpointing(
-                tcfg.gradient_checkpointing, gpu_memory_gb=gpu_memory_gb,
+            ckpt_plan = plan_gradient_checkpointing(
+                self.model,
+                tcfg.gradient_checkpointing,
+                gpu_memory_gb=gpu_memory_gb,
             )
-            training_kwargs.update(ckpt_kwargs)
-            if ckpt_kwargs:
+            training_kwargs.update(ckpt_plan.kwargs)
+            if ckpt_plan.kwargs:
                 console.print(
                     f"[green]Gradient checkpointing:[/] "
-                    f"{describe_tier(tcfg.gradient_checkpointing, gpu_memory_gb)}"
+                    f"{ckpt_plan.description}"
                 )
 
         # NEFTune — noisy embeddings for better fine-tuning quality
@@ -2028,36 +2029,24 @@ class SFTTrainerWrapper(StreamingSetupMixin):
 
         # Add callback for live display and experiment tracking
         if display:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
 
             tcfg_local = self.config.training
             self.trainer.add_callback(
                 SoupTrainerCallback(
-                    display, tracker=tracker, run_id=run_id,
-                    output_dir=self._output_dir,
-                    loss_watchdog=tcfg_local.loss_watchdog,
-                    loss_watchdog_threshold=tcfg_local.loss_watchdog_threshold,
-                    loss_watchdog_patience=tcfg_local.loss_watchdog_patience,
-                    spike_recovery=getattr(
-                        tcfg_local, "loss_spike_recovery", False,
-                    ),
-                    spike_recovery_max_attempts=getattr(
-                        tcfg_local, "loss_spike_recovery_max_attempts", 3,
-                    ),
-                    spike_recovery_lr_decay=getattr(
-                        tcfg_local, "loss_spike_recovery_lr_decay", 0.5,
-                    ),
-                    grad_accum_auto_tune=getattr(
-                        tcfg_local, "grad_accum_auto_tune", False,
-                    ),
-                    grad_accum_pressure_threshold=getattr(
-                        tcfg_local, "grad_accum_pressure_threshold", 0.9,
-                    ),
-                    grad_accum_current_steps=getattr(
-                        tcfg_local, "gradient_accumulation_steps", 1,
-                    ),
-                    grad_accum_current_batch=self._batch_size,
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
                     eval_gate_config=tcfg_local.eval_gate,
+                    **soup_callback_kwargs(
+                        tcfg_local,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
                 )
             )
 

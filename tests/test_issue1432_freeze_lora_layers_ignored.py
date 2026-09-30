@@ -291,6 +291,59 @@ class TestFreezeLayersRestrictsLoraAdapter:
         with pytest.raises(ValueError, match="use_vera"):
             wrapper.setup(dataset)
 
+    def test_freeze_with_expand_layers_keeps_appended_blocks_adapted(self, tmp_path, monkeypatch):
+        """#1494 review: lora_layers_to_transform's range was measured from
+        the layer count BEFORE apply_block_expansion_if_configured (LLaMA
+        Pro) runs, so blocks it appends land outside the range and get no
+        adapter even though freeze_model_layers never froze them."""
+        _requires_train_extra()
+        wrapper, dataset = _wrapper(
+            tmp_path, monkeypatch, n_layers=4,
+            freeze_layers=1, expand_layers=2, freeze_trainable_layers=-1,
+        )
+        wrapper.setup(dataset)
+        names = _lora_param_names(wrapper.model)
+        assert not any(".layers.0." in name for name in names)
+        for idx in (1, 2, 3, 4, 5):
+            assert any(f".layers.{idx}." in name for name in names), (
+                f"layer {idx} lost its adapter"
+            )
+
+    def test_freeze_with_embed_tokens_target_is_not_silently_dropped(self, tmp_path, monkeypatch):
+        """#1494 review: peft only restricts layers_to_transform to a list
+        target that lives inside a numbered decoder layer, so embed_tokens
+        (module path model.embed_tokens, no layer index) silently lost its
+        adapter as soon as any freeze option was set."""
+        _requires_train_extra()
+        wrapper, dataset = _wrapper(
+            tmp_path, monkeypatch, n_layers=4, freeze_layers=2,
+            lora={"target_modules": ["q_proj", "v_proj", "embed_tokens"]},
+        )
+        try:
+            wrapper.setup(dataset)
+        except ValueError as exc:
+            assert "embed_tokens" in str(exc)
+            return
+        names = _lora_param_names(wrapper.model)
+        assert any("embed_tokens" in name for name in names), (
+            "embed_tokens adapter silently dropped"
+        )
+
+    def test_freeze_ratio_cutoff_zero_does_not_restrict_layers(self, tmp_path, monkeypatch):
+        """#1494 review: freeze_ratio=0.1 on a 4-layer model resolves to
+        cutoff=0 (nothing frozen), but the pre-fix code still built a
+        non-None layers_to_transform=[0..4), which silently drops a target
+        outside a numbered layer even though nothing was frozen."""
+        _requires_train_extra()
+        wrapper, dataset = _wrapper(
+            tmp_path, monkeypatch, n_layers=4, freeze_ratio=0.1,
+            lora={"target_modules": ["q_proj", "v_proj", "embed_tokens"]},
+        )
+        wrapper.setup(dataset)
+        names = _lora_param_names(wrapper.model)
+        assert any(".layers.0." in name for name in names)
+        assert any("embed_tokens" in name for name in names)
+
 
 class TestLayersToTransformIsWhatFixesIt:
     """MECHANISM control: reproduces #1432 directly against peft, without
